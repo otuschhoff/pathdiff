@@ -28,7 +28,7 @@ func TestParseScreenRequest(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if event.Path != "/cache/entry" || event.Operation != "NFS_WR" {
+	if event.Path != "/cache/entry" || event.Operation != "NFS_WR" || event.VolumeMSID != "2163258291" {
 		t.Fatalf("unexpected screen event: %#v", event)
 	}
 	if want := time.UnixMicro(1_788_009_794_015_352).UTC(); !event.Timestamp.Equal(want) {

@@ -33,11 +33,13 @@ const (
 var captureSequence atomic.Uint64
 
 type controlRequest struct {
-	Command string    `json:"command"`
-	Since   time.Time `json:"since,omitempty"`
-	Path    string    `json:"path,omitempty"`
-	Start   time.Time `json:"start,omitempty"`
-	End     time.Time `json:"end,omitempty"`
+	Command    string    `json:"command"`
+	Since      time.Time `json:"since,omitempty"`
+	Path       string    `json:"path,omitempty"`
+	Start      time.Time `json:"start,omitempty"`
+	End        time.Time `json:"end,omitempty"`
+	VolumeMSID string    `json:"volume_msid,omitempty"`
+	VolumeName string    `json:"volume_name,omitempty"`
 }
 
 type controlResponse struct {
@@ -54,7 +56,7 @@ func main() {
 
 func newRootCommand() *cobra.Command {
 	root := &cobra.Command{Use: "pathdiff", Short: "Store and inspect FPolicy path changes", SilenceUsage: true}
-	root.AddCommand(newDaemonCommand(), newEventsCommand(), newMonitorCommand(), newControlCommand("status"), newControlCommand("stop"))
+	root.AddCommand(newDaemonCommand(), newEventsCommand(), newMonitorCommand(), newVolumeCommand(), newControlCommand("status"), newControlCommand("stop"))
 	return root
 }
 
@@ -510,6 +512,11 @@ func handleControl(connection net.Conn, db *store.DB, stop context.CancelFunc) {
 			response.Events, err = db.EventsByPath(request.Path, request.Start, request.End)
 		case "recent":
 			response.Events, err = db.EventsSince(request.Since)
+		case "volume-set":
+			err = db.SetVolumeName(request.VolumeMSID, request.VolumeName)
+			if err == nil {
+				response.Status = "updated"
+			}
 		default:
 			response.Error = "unknown command"
 		}
@@ -518,6 +525,25 @@ func handleControl(connection net.Conn, db *store.DB, stop context.CancelFunc) {
 		}
 	}
 	_ = json.NewEncoder(connection).Encode(response)
+}
+
+func newVolumeCommand() *cobra.Command {
+	volume := &cobra.Command{Use: "volume", Short: "Manage volume MSID mappings"}
+	var controlPath, msid, name string
+	set := &cobra.Command{Use: "set", Short: "Map a volume MSID to a volume name", RunE: func(*cobra.Command, []string) error {
+		response, err := callControl(controlPath, controlRequest{Command: "volume-set", VolumeMSID: msid, VolumeName: name})
+		if err != nil {
+			return err
+		}
+		return printResponse(response)
+	}}
+	set.Flags().StringVar(&controlPath, "control", defaultControl, "Unix control socket")
+	set.Flags().StringVar(&msid, "msid", "", "ONTAP volume MSID")
+	set.Flags().StringVar(&name, "name", "", "volume name")
+	_ = set.MarkFlagRequired("msid")
+	_ = set.MarkFlagRequired("name")
+	volume.AddCommand(set)
+	return volume
 }
 
 func newEventsCommand() *cobra.Command {

@@ -49,6 +49,14 @@ XML notifications extract path, operation, and timestamp fields. Unknown connect
 
 Native synchronous `SCREEN_REQ` messages are also stored as audit events using their request type, generation time, and UNIX access path. `pathdiff` does not issue access allow/deny decisions for screen requests.
 
+`SCREEN_REQ` payloads also include the numeric `VolMsid`. Persisted query results retain it as `volume_msid`; configure a human-readable name through the daemon with:
+
+```sh
+bin/pathdiff volume set --msid 2163258291 --name asic_user
+```
+
+Subsequent query and monitor output resolves that ID as `volume_name` without rewriting historic event records.
+
 ## Tasks
 
 ### build
