@@ -2,6 +2,8 @@ package fpolicy
 
 import (
 	"bytes"
+	"encoding/binary"
+	"fmt"
 	"testing"
 	"time"
 
@@ -73,9 +75,7 @@ func TestNegotiateResponse(t *testing.T) {
 func TestONTAPXMLHandshakeFrames(t *testing.T) {
 	request := []byte(`<?xml version="1.0"?><Handshake><VsUUID>5b701784-7459-11e8-8e95-00a098bc5a13</VsUUID><PolicyName>track_inode_changes</PolicyName><SessionId>bef098d2-a3a6-11f1-8e8e-d039ea524d0f</SessionId><ProtVersion><Vers>1.0</Vers><Vers>1.1</Vers></ProtVersion></Handshake>`)
 	var wire bytes.Buffer
-	if err := WriteONTAPXMLFrame(&wire, "NEGO_REQ", request); err != nil {
-		t.Fatal(err)
-	}
+	writeCapturedONTAPFrame(&wire, "NEGO_REQ", request)
 	message, err := ReadONTAPXMLFrame(&wire)
 	if err != nil {
 		t.Fatal(err)
@@ -91,11 +91,33 @@ func TestONTAPXMLHandshakeFrames(t *testing.T) {
 	if err := WriteONTAPXMLFrame(&wire, "NEGO_RESP", response); err != nil {
 		t.Fatal(err)
 	}
-	message, err = ReadONTAPXMLFrame(&wire)
+	responseWire := wire.Bytes()
+	if responseWire[0] != ontapXMLMessageType || responseWire[5] != ontapXMLMessageType || int(binary.BigEndian.Uint32(responseWire[1:5])) != len(responseWire)-6 || !bytes.Contains(responseWire, []byte(`<?xml version="1.0"?>`)) || !bytes.Contains(responseWire, []byte("<HandshakeResp><VsUUID>5b701784-7459-11e8-8e95-00a098bc5a13</VsUUID><PolicyName>track_inode_changes</PolicyName><SessionId>bef098d2-a3a6-11f1-8e8e-d039ea524d0f</SessionId><ProtVersion>1.2</ProtVersion></HandshakeResp>")) {
+		t.Fatalf("unexpected negotiation response: %q", responseWire)
+	}
+}
+
+func TestONTAPKeepAliveFrame(t *testing.T) {
+	var wire bytes.Buffer
+	writeCapturedONTAPFrame(&wire, "KEEP_ALIVE", nil)
+	message, err := ReadONTAPXMLFrame(&wire)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if message.Type != "NEGO_RESP" || !bytes.Contains(message.Payload, []byte("<VsUUID>5b701784-7459-11e8-8e95-00a098bc5a13</VsUUID>")) || !bytes.Contains(message.Payload, []byte("<PolicyName>track_inode_changes</PolicyName>")) || !bytes.Contains(message.Payload, []byte("<Status>SUCCESS</Status>")) || !bytes.Contains(message.Payload, []byte("<Vers>1.0</Vers>")) {
-		t.Fatalf("unexpected negotiation response: %#v", message)
+	if message.Type != "KEEP_ALIVE" || len(message.Payload) != 0 {
+		t.Fatalf("unexpected keep-alive message: %#v", message)
 	}
+}
+
+func writeCapturedONTAPFrame(writer *bytes.Buffer, notificationType string, payload []byte) {
+	header := fmt.Sprintf(`<?xml version="1.0"?><Header><NotfType>%s</NotfType><ContentLen>%d</ContentLen><DataFormat>XML</DataFormat></Header>`, notificationType, len(payload))
+	framePayload := append([]byte{ontapXMLMessageType}, header...)
+	framePayload = append(framePayload, '\n', '\n')
+	framePayload = append(framePayload, payload...)
+	_ = writer.WriteByte(ontapXMLMessageType)
+	var length [4]byte
+	binary.BigEndian.PutUint32(length[:], uint32(len(framePayload)))
+	_, _ = writer.Write(length[:])
+	_, _ = writer.Write(framePayload)
+	_ = writer.WriteByte(0)
 }
