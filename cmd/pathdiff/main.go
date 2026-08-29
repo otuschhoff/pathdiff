@@ -60,7 +60,7 @@ func main() {
 
 func newRootCommand() *cobra.Command {
 	root := &cobra.Command{Use: "pathdiff", Short: "Store and inspect FPolicy path changes", SilenceUsage: true}
-	root.AddCommand(newDaemonCommand(), newEventsCommand(), newPathCommand(), newMonitorCommand(), newVolumeCommand(), newControlCommand("status"), newControlCommand("stop"))
+	root.AddCommand(newDaemonCommand(), newEventsCommand(), newPathCommand(), newMonitorCommand(), newVolumeCommand(), newDBCommand(), newControlCommand("status"), newControlCommand("stop"))
 	return root
 }
 
@@ -521,6 +521,11 @@ func handleControl(connection net.Conn, db *store.DB, stop context.CancelFunc) {
 			if err == nil {
 				response.Status = "updated"
 			}
+		case "events-reset":
+			err = db.ResetEvents()
+			if err == nil {
+				response.Status = "reset"
+			}
 		default:
 			response.Error = "unknown command"
 		}
@@ -529,6 +534,23 @@ func handleControl(connection net.Conn, db *store.DB, stop context.CancelFunc) {
 		}
 	}
 	_ = json.NewEncoder(connection).Encode(response)
+}
+
+func newDBCommand() *cobra.Command {
+	database := &cobra.Command{Use: "db", Short: "Manage persisted data"}
+	event := &cobra.Command{Use: "event", Short: "Manage stored events"}
+	var controlPath string
+	reset := &cobra.Command{Use: "reset", Short: "Remove all stored event records", RunE: func(*cobra.Command, []string) error {
+		response, err := callControl(controlPath, controlRequest{Command: "events-reset"})
+		if err != nil {
+			return err
+		}
+		return printResponse(response)
+	}}
+	reset.Flags().StringVar(&controlPath, "control", defaultControl, "Unix control socket")
+	event.AddCommand(reset)
+	database.AddCommand(event)
+	return database
 }
 
 func newVolumeCommand() *cobra.Command {
