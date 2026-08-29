@@ -156,3 +156,42 @@ func TestPrintEventsLimitsResults(t *testing.T) {
 		t.Fatalf("unexpected limit output: %s", got)
 	}
 }
+
+func TestPrintPathsCoalescesAndSorts(t *testing.T) {
+	base := time.Date(2026, 8, 29, 12, 0, 0, 0, time.UTC)
+	events := []store.Event{
+		{Path: "/vol/z", Operation: "NFS_WR", Timestamp: base, VolumeName: "beta"},
+		{Path: "/vol/a", Operation: "NFS_WR", Timestamp: base.Add(time.Minute), VolumeName: "alpha"},
+		{Path: "/vol/a", Operation: "NFS_SET_ATTR", Timestamp: base.Add(2 * time.Minute), VolumeName: "alpha"},
+	}
+	var output bytes.Buffer
+	if err := printPaths(&output, events, "*", 100, "path"); err != nil {
+		t.Fatal(err)
+	}
+	got := output.String()
+	if strings.Count(got, "/vol/a") != 1 || !strings.Contains(got, "2026-08-29T12:02:00Z") {
+		t.Fatalf("paths were not coalesced to latest change: %s", got)
+	}
+	if strings.Index(got, "alpha") > strings.Index(got, "beta") {
+		t.Fatalf("paths were not sorted by volume: %s", got)
+	}
+
+	output.Reset()
+	if err := printPaths(&output, events, "*", 100, "timestamp"); err != nil {
+		t.Fatal(err)
+	}
+	if strings.Index(output.String(), "/vol/a") > strings.Index(output.String(), "/vol/z") {
+		t.Fatalf("paths were not sorted newest first: %s", output.String())
+	}
+}
+
+func TestPrintPathsLimitsCoalescedResults(t *testing.T) {
+	var output bytes.Buffer
+	events := []store.Event{{Path: "/vol/a", VolumeName: "one"}, {Path: "/vol/a", VolumeName: "one"}, {Path: "/vol/b", VolumeName: "one"}}
+	if err := printPaths(&output, events, "*", 1, "path"); err != nil {
+		t.Fatal(err)
+	}
+	if got := output.String(); !strings.Contains(got, "2 changed paths match") {
+		t.Fatalf("unexpected path limit output: %s", got)
+	}
+}

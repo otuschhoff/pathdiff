@@ -13,6 +13,7 @@ import (
 	"os/signal"
 	"path/filepath"
 	"regexp"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -59,7 +60,7 @@ func main() {
 
 func newRootCommand() *cobra.Command {
 	root := &cobra.Command{Use: "pathdiff", Short: "Store and inspect FPolicy path changes", SilenceUsage: true}
-	root.AddCommand(newDaemonCommand(), newEventsCommand(), newMonitorCommand(), newVolumeCommand(), newControlCommand("status"), newControlCommand("stop"))
+	root.AddCommand(newDaemonCommand(), newEventsCommand(), newPathCommand(), newMonitorCommand(), newVolumeCommand(), newControlCommand("status"), newControlCommand("stop"))
 	return root
 }
 
@@ -581,6 +582,105 @@ func newEventsCommand() *cobra.Command {
 	command.Flags().StringVar(&endValue, "end", "", "inclusive time; RFC3339, YYYY-MM-DD, or relative duration (default now)")
 	command.Flags().IntVar(&maxResults, "max", 100, "maximum results to display")
 	return command
+}
+
+func newPathCommand() *cobra.Command {
+	var controlPath, pathPrefix, startValue, endValue, sortBy string
+	var maxResults int
+	command := &cobra.Command{Use: "path [path-search]", Args: cobra.MaximumNArgs(1), Short: "List paths changed during a time range", RunE: func(command *cobra.Command, arguments []string) error {
+		start, end, err := eventRange(startValue, endValue, time.Now().UTC())
+		if err != nil {
+			return err
+		}
+		response, err := callControl(controlPath, controlRequest{Command: "events", Path: pathPrefix, Start: start, End: end})
+		if err != nil {
+			return err
+		}
+		search := "*"
+		if len(arguments) == 1 {
+			search = normalizePathSearch(arguments[0])
+		}
+		return printPaths(command.OutOrStdout(), response.Events, search, maxResults, sortBy)
+	}}
+	command.Flags().StringVar(&controlPath, "control", defaultControl, "Unix control socket")
+	command.Flags().StringVar(&pathPrefix, "path", "", "path prefix")
+	command.Flags().StringVar(&startValue, "start", "", "inclusive time; RFC3339, YYYY-MM-DD, or relative duration (default 24h ago)")
+	command.Flags().StringVar(&endValue, "end", "", "inclusive time; RFC3339, YYYY-MM-DD, or relative duration (default now)")
+	command.Flags().IntVar(&maxResults, "max", 100, "maximum paths to display")
+	command.Flags().StringVar(&sortBy, "sort", "path", "sort by path or timestamp")
+	return command
+}
+
+func eventRange(startValue, endValue string, now time.Time) (time.Time, time.Time, error) {
+	start, err := parseTimeExpression("start", startValue, now, -24*time.Hour)
+	if err != nil {
+		return time.Time{}, time.Time{}, err
+	}
+	end, err := parseTimeExpression("end", endValue, now, 0)
+	if err != nil {
+		return time.Time{}, time.Time{}, err
+	}
+	if end.Before(start) {
+		return time.Time{}, time.Time{}, errors.New("end must not be before start")
+	}
+	return start, end, nil
+}
+
+func printPaths(writer io.Writer, events []store.Event, wildcard string, maxResults int, sortBy string) error {
+	if maxResults < 1 {
+		return errors.New("max must be greater than zero")
+	}
+	if sortBy != "path" && sortBy != "timestamp" {
+		return fmt.Errorf("unsupported sort %q; use path or timestamp", sortBy)
+	}
+	paths := make(map[string]store.Event)
+	for _, event := range events {
+		matched, err := wildcardMatch(wildcard, event.Path)
+		if err != nil {
+			return fmt.Errorf("invalid path wildcard %q: %w", wildcard, err)
+		}
+		if !matched {
+			continue
+		}
+		key := eventVolume(event) + "\x00" + event.Path
+		if existing, found := paths[key]; !found || event.Timestamp.After(existing.Timestamp) {
+			paths[key] = event
+		}
+	}
+	results := make([]store.Event, 0, len(paths))
+	for _, event := range paths {
+		results = append(results, event)
+	}
+	if len(results) > maxResults {
+		_, err := fmt.Fprintf(writer, "%d changed paths match; increase --max and/or tighten the path search, --path prefix, or time range.\n", len(results))
+		return err
+	}
+	sort.Slice(results, func(left, right int) bool {
+		if sortBy == "timestamp" {
+			return results[left].Timestamp.After(results[right].Timestamp)
+		}
+		leftVolume, rightVolume := eventVolume(results[left]), eventVolume(results[right])
+		if leftVolume == rightVolume {
+			return results[left].Path < results[right].Path
+		}
+		return leftVolume < rightVolume
+	})
+
+	tableWriter := table.NewWriter()
+	tableWriter.SetOutputMirror(writer)
+	tableWriter.AppendHeader(table.Row{"Last Change", "Volume", "Path"})
+	for _, event := range results {
+		tableWriter.AppendRow(table.Row{event.Timestamp.UTC().Format(time.RFC3339Nano), eventVolume(event), event.Path})
+	}
+	tableWriter.Render()
+	return nil
+}
+
+func eventVolume(event store.Event) string {
+	if event.VolumeName != "" {
+		return event.VolumeName
+	}
+	return event.VolumeMSID
 }
 
 func printEvents(writer io.Writer, events []store.Event, wildcard string, maxResults int) error {
