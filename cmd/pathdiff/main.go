@@ -245,6 +245,7 @@ type senderStats struct {
 	localPort      string
 	nodeID         string
 	svmID          string
+	lastSeen       time.Time
 }
 
 type engineInfo struct {
@@ -255,7 +256,11 @@ type engineInfo struct {
 	LIFHostname string    `json:"lif_hostname,omitempty"`
 	NodeID      string    `json:"node_id,omitempty"`
 	SVMID       string    `json:"svm_id,omitempty"`
+	NodeName    string    `json:"node_name,omitempty"`
+	SVMName     string    `json:"svm_name,omitempty"`
+	FPolicy     string    `json:"fpolicy_status,omitempty"`
 	LocalPort   string    `json:"local_port"`
+	LastSeen    time.Time `json:"last_seen"`
 }
 
 func newSenderTracker(verbose bool) *senderTracker {
@@ -310,6 +315,7 @@ func (t *senderTracker) eventStored(sender string) {
 	stats := t.sender(sender)
 	stats.intervalEvents++
 	stats.totalEvents++
+	stats.lastSeen = time.Now().UTC()
 	t.mu.Unlock()
 }
 
@@ -351,7 +357,7 @@ func (t *senderTracker) engines() []engineInfo {
 		if elapsed > 0 {
 			average = float64(stats.totalEvents) / elapsed
 		}
-		engines = append(engines, engineInfo{Since: stats.connectedSince, TotalEvents: stats.totalEvents, AverageRate: average, LIFIPv4: lifIPv4, NodeID: stats.nodeID, SVMID: stats.svmID, LocalPort: stats.localPort})
+		engines = append(engines, engineInfo{Since: stats.connectedSince, TotalEvents: stats.totalEvents, AverageRate: average, LIFIPv4: lifIPv4, NodeID: stats.nodeID, SVMID: stats.svmID, LocalPort: stats.localPort, LastSeen: stats.lastSeen})
 	}
 	return engines
 }
@@ -694,17 +700,94 @@ func newDBCommand() *cobra.Command {
 
 func newEngineCommand() *cobra.Command {
 	engine := &cobra.Command{Use: "engine", Short: "Inspect connected FPolicy engines"}
-	var controlPath string
+	var controlPath, keyFile, knownHostsFile, host, user string
+	var acceptNewHostKey, debugSSHExec bool
 	list := &cobra.Command{Use: "list", Short: "List active FPolicy engines", RunE: func(command *cobra.Command, _ []string) error {
 		response, err := callControl(controlPath, controlRequest{Command: "engines"})
 		if err != nil {
 			return err
 		}
+		if host != "" {
+			keyPath, err := cdotKeyFile(keyFile)
+			if err != nil {
+				return err
+			}
+			if knownHostsFile == "" {
+				knownHostsFile, err = cdotKnownHostsFile()
+				if err != nil {
+					return err
+				}
+			}
+			var debugWriter io.Writer
+			if debugSSHExec {
+				debugWriter = command.ErrOrStderr()
+			}
+			client, err := openCDOTClient(host, user, keyPath, knownHostsFile, acceptNewHostKey)
+			if err != nil {
+				return err
+			}
+			defer client.Close()
+			if err := enrichEngines(client, response.Engines, debugWriter); err != nil {
+				return err
+			}
+		}
 		return printEngines(command.OutOrStdout(), response.Engines)
 	}}
 	list.Flags().StringVar(&controlPath, "control", defaultControl, "Unix control socket")
+	list.Flags().StringVar(&host, "host", defaultCDOTCluster(), "cDOT cluster hostname or address")
+	list.Flags().StringVar(&user, "user", "pathdiff", "SSH user for cDOT connections")
+	list.Flags().StringVar(&keyFile, "key", "", "private key path; defaults to the XDG path")
+	list.Flags().StringVar(&knownHostsFile, "known-hosts", "", "known_hosts file; defaults to the XDG path")
+	list.Flags().BoolVar(&acceptNewHostKey, "accept-new-host-key", false, "trust and save the host key when known_hosts is absent")
+	list.Flags().BoolVar(&debugSSHExec, "debug-ssh-exec", false, "print SSH commands and their results to stderr")
 	engine.AddCommand(list)
 	return engine
+}
+
+func enrichEngines(client *ssh.Client, engines []engineInfo, debugWriter io.Writer) error {
+	lifOutput, err := runSSHCommand(client, "network interface show -instance", debugWriter)
+	if err != nil {
+		return fmt.Errorf("query cDOT LIFs: %w", err)
+	}
+	svmOutput, err := runSSHCommand(client, "vserver show -instance", debugWriter)
+	if err != nil {
+		return fmt.Errorf("query cDOT SVMs: %w", err)
+	}
+	lifs := make(map[string]map[string]string)
+	for _, record := range parseONTAPInstances(string(lifOutput)) {
+		if address := instanceField(record, "Network Address"); address != "" {
+			lifs[address] = record
+		}
+	}
+	svms := make(map[string]string)
+	for _, record := range parseONTAPInstances(string(svmOutput)) {
+		svms[instanceField(record, "Vserver UUID")] = instanceField(record, "Vserver")
+	}
+	for index := range engines {
+		if lif := lifs[engines[index].LIFIPv4]; lif != nil {
+			engines[index].NodeName = instanceField(lif, "Current Node")
+			if engines[index].SVMID == "" {
+				engines[index].SVMID = instanceField(lif, "Vserver UUID")
+			}
+		}
+		engines[index].SVMName = svms[engines[index].SVMID]
+		engines[index].FPolicy = "unavailable"
+	}
+	fpolicyOutput, err := runSSHCommand(client, "vserver fpolicy show -instance", debugWriter)
+	if err != nil {
+		return nil
+	}
+	statuses := make(map[string]string)
+	for _, record := range parseONTAPInstances(string(fpolicyOutput)) {
+		key := instanceField(record, "Vserver") + "\x00" + instanceField(record, "Node")
+		statuses[key] = instanceField(record, "Status")
+	}
+	for index := range engines {
+		if status := statuses[engines[index].SVMName+"\x00"+engines[index].NodeName]; status != "" {
+			engines[index].FPolicy = status
+		}
+	}
+	return nil
 }
 
 func newCDOTCommand() *cobra.Command {
@@ -740,7 +823,7 @@ func newCDOTCommand() *cobra.Command {
 	}}
 	show.Flags().StringVar(&showFile, "file", "", "private key path; defaults to the XDG path")
 	pubkey.AddCommand(generate, show)
-	cdot.AddCommand(pubkey, newVolumeCommand(), newSVMCommand(), newCDOTCheckCommand(), newCDOTSetClusterCommand())
+	cdot.AddCommand(pubkey, newVolumeCommand(), newSVMCommand(), newNodeCommand(), newLIFCommand(), newCDOTCheckCommand(), newCDOTSetClusterCommand())
 	return cdot
 }
 
@@ -804,25 +887,10 @@ type cdotCheckResult struct {
 }
 
 func checkCDOT(host, user, keyFile, knownHostsFile string, acceptNewHostKey bool, debugWriter io.Writer) (cdotCheckResult, error) {
-	signer, err := readSSHSigner(keyFile)
+	client, err := openCDOTClient(host, user, keyFile, knownHostsFile, acceptNewHostKey)
 	if err != nil {
 		return cdotCheckResult{}, err
 	}
-	hostKeyCallback, err := cdotHostKeyCallback(knownHostsFile, sshAddress(host), acceptNewHostKey)
-	if err != nil {
-		return cdotCheckResult{}, fmt.Errorf("load cDOT known hosts: %w", err)
-	}
-	address := sshAddress(host)
-	connection, err := net.DialTimeout("tcp", address, 10*time.Second)
-	if err != nil {
-		return cdotCheckResult{}, fmt.Errorf("connect to cDOT %s: %w", address, err)
-	}
-	defer connection.Close()
-	clientConnection, channels, requests, err := ssh.NewClientConn(connection, address, &ssh.ClientConfig{User: user, Auth: []ssh.AuthMethod{ssh.PublicKeys(signer)}, HostKeyCallback: hostKeyCallback, Timeout: 10 * time.Second})
-	if err != nil {
-		return cdotCheckResult{}, fmt.Errorf("authenticate to cDOT %s: %w", address, err)
-	}
-	client := ssh.NewClient(clientConnection, channels, requests)
 	defer client.Close()
 	output, err := runSSHCommand(client, fpolicyPolicyShowCommand, debugWriter)
 	if err != nil {
@@ -841,6 +909,28 @@ func checkCDOT(host, user, keyFile, knownHostsFile string, acceptNewHostKey bool
 		endpoint = "configured for this host"
 	}
 	return cdotCheckResult{Host: host, User: user, FPolicyPolicy: policy, FPolicyEndpoint: endpoint}, nil
+}
+
+func openCDOTClient(host, user, keyFile, knownHostsFile string, acceptNewHostKey bool) (*ssh.Client, error) {
+	signer, err := readSSHSigner(keyFile)
+	if err != nil {
+		return nil, err
+	}
+	address := sshAddress(host)
+	hostKeyCallback, err := cdotHostKeyCallback(knownHostsFile, address, acceptNewHostKey)
+	if err != nil {
+		return nil, fmt.Errorf("load cDOT known hosts: %w", err)
+	}
+	connection, err := net.DialTimeout("tcp", address, 10*time.Second)
+	if err != nil {
+		return nil, fmt.Errorf("connect to cDOT %s: %w", address, err)
+	}
+	clientConnection, channels, requests, err := ssh.NewClientConn(connection, address, &ssh.ClientConfig{User: user, Auth: []ssh.AuthMethod{ssh.PublicKeys(signer)}, HostKeyCallback: hostKeyCallback, Timeout: 10 * time.Second})
+	if err != nil {
+		_ = connection.Close()
+		return nil, fmt.Errorf("authenticate to cDOT %s: %w", address, err)
+	}
+	return ssh.NewClient(clientConnection, channels, requests), nil
 }
 
 func runSSHCommand(client *ssh.Client, command string, debugWriter io.Writer) ([]byte, error) {
@@ -1101,13 +1191,34 @@ func generateCDOTKey(keyFile string) error {
 func printEngines(writer io.Writer, engines []engineInfo) error {
 	sort.Slice(engines, func(left, right int) bool { return engines[left].LIFIPv4 < engines[right].LIFIPv4 })
 	tableWriter := newTableWriter(writer)
-	tableWriter.AppendHeader(table.Row{"Since", "Total Events", "Avg Event/s", "LIF IPv4", "LIF Hostname", "Node ID", "SVM ID", "Local Port"})
+	tableWriter.AppendHeader(table.Row{"SVM", "Node", "LIF", "Port", "State", "Last Seen", "Since", "Avg Event/s", "Total Events"})
 	for _, engine := range engines {
-		engine.LIFHostname = resolveHostname(engine.LIFIPv4)
-		tableWriter.AppendRow(table.Row{engine.Since.UTC().Format(time.RFC3339), formatCount(engine.TotalEvents), fmt.Sprintf("%.2f", engine.AverageRate), engine.LIFIPv4, engine.LIFHostname, engine.NodeID, engine.SVMID, engine.LocalPort})
+		engine.LIFHostname = shortHostname(resolveHostname(engine.LIFIPv4))
+		node, svm := engine.NodeName, engine.SVMName
+		if node == "" {
+			node = engine.NodeID
+		}
+		if svm == "" {
+			svm = engine.SVMID
+		}
+		tableWriter.AppendRow(table.Row{svm, node, engine.LIFHostname, engine.LocalPort, formatFPolicyState(engine.FPolicy), formatLastSeen(engine.LastSeen), engine.Since.UTC().Format(time.RFC3339), fmt.Sprintf("%.2f", engine.AverageRate), formatEventCount(engine.TotalEvents)})
 	}
 	tableWriter.Render()
 	return nil
+}
+
+func formatLastSeen(lastSeen time.Time) string {
+	if lastSeen.IsZero() {
+		return text.FgYellow.Sprint("never")
+	}
+	return time.Since(lastSeen).Round(time.Second).String() + " ago"
+}
+
+func formatFPolicyState(state string) string {
+	if state == "" || state == "unavailable" {
+		return text.FgRed.Sprint("off")
+	}
+	return state
 }
 
 func resolveHostname(address string) string {
@@ -1116,6 +1227,10 @@ func resolveHostname(address string) string {
 		return ""
 	}
 	return strings.TrimSuffix(names[0], ".")
+}
+
+func shortHostname(hostname string) string {
+	return strings.SplitN(hostname, ".", 2)[0]
 }
 
 func printDBStatus(writer io.Writer, response controlResponse) error {
@@ -1127,60 +1242,233 @@ func printDBStatus(writer io.Writer, response controlResponse) error {
 }
 
 func newVolumeCommand() *cobra.Command {
-	volume := &cobra.Command{Use: "volume", Short: "Manage volume MSID mappings"}
-	var controlPath, msid, name string
-	set := &cobra.Command{Use: "set", Short: "Map a volume MSID to a volume name", RunE: func(*cobra.Command, []string) error {
-		response, err := callControl(controlPath, controlRequest{Command: "volume-set", VolumeMSID: msid, VolumeName: name})
-		if err != nil {
-			return err
-		}
-		return printResponse(response)
-	}}
-	set.Flags().StringVar(&controlPath, "control", defaultControl, "Unix control socket")
-	set.Flags().StringVar(&msid, "msid", "", "ONTAP volume MSID")
-	set.Flags().StringVar(&name, "name", "", "volume name")
-	_ = set.MarkFlagRequired("msid")
-	_ = set.MarkFlagRequired("name")
-	var listControlPath string
-	list := &cobra.Command{Use: "list", Short: "List volume MSID mappings", RunE: func(command *cobra.Command, _ []string) error {
-		response, err := callControl(listControlPath, controlRequest{Command: "volume-list"})
-		if err != nil {
-			return err
-		}
-		return printMappings(command.OutOrStdout(), "Volume", "MSID", response.Mappings)
-	}}
-	list.Flags().StringVar(&listControlPath, "control", defaultControl, "Unix control socket")
-	volume.AddCommand(set)
-	volume.AddCommand(list)
-	return volume
+	return newCDOTListCommand("volume", "MSID", "List live cDOT volumes", "volume show -fields vserver,volume,msid", "Volume", "MSID")
 }
 
 func newSVMCommand() *cobra.Command {
-	svm := &cobra.Command{Use: "svm", Short: "Manage SVM ID mappings"}
-	var setControlPath, id, name string
-	set := &cobra.Command{Use: "set", Short: "Map an SVM ID to an SVM name", RunE: func(command *cobra.Command, _ []string) error {
-		response, err := callControl(setControlPath, controlRequest{Command: "svm-set", SVMID: id, SVMName: name})
+	return newCDOTListCommand("svm", "UUID", "List live cDOT SVMs", "vserver show -instance", "Vserver", "Vserver UUID")
+}
+
+func newNodeCommand() *cobra.Command {
+	return newCDOTInventoryCommand("node", "List live cDOT nodes", "node show -instance", []string{"Node"})
+}
+
+func newLIFCommand() *cobra.Command {
+	return newCDOTInventoryCommand("lif", "List live cDOT LIFs", "network interface show -instance", []string{"Network Address", "Current Node", "Vserver"})
+}
+
+func newCDOTInventoryCommand(name, summary, remoteCommand string, fields []string) *cobra.Command {
+	group := &cobra.Command{Use: name, Short: summary}
+	var keyFile, knownHostsFile string
+	var acceptNewHostKey, debugSSHExec bool
+	list := &cobra.Command{Use: "list", Short: summary, RunE: func(command *cobra.Command, _ []string) error {
+		host, _ := command.Flags().GetString("host")
+		user, _ := command.Flags().GetString("user")
+		if host == "" {
+			return errors.New("host is required")
+		}
+		keyPath, err := cdotKeyFile(keyFile)
 		if err != nil {
 			return err
 		}
-		return printResponse(response)
-	}}
-	set.Flags().StringVar(&setControlPath, "control", defaultControl, "Unix control socket")
-	set.Flags().StringVar(&id, "id", "", "ONTAP SVM ID")
-	set.Flags().StringVar(&name, "name", "", "SVM name")
-	_ = set.MarkFlagRequired("id")
-	_ = set.MarkFlagRequired("name")
-	var listControlPath string
-	list := &cobra.Command{Use: "list", Short: "List SVM ID mappings", RunE: func(command *cobra.Command, _ []string) error {
-		response, err := callControl(listControlPath, controlRequest{Command: "svm-list"})
+		if knownHostsFile == "" {
+			knownHostsFile, err = cdotKnownHostsFile()
+			if err != nil {
+				return err
+			}
+		}
+		var debugWriter io.Writer
+		if debugSSHExec {
+			debugWriter = command.ErrOrStderr()
+		}
+		client, err := openCDOTClient(host, user, keyPath, knownHostsFile, acceptNewHostKey)
 		if err != nil {
 			return err
 		}
-		return printMappings(command.OutOrStdout(), "SVM", "ID", response.Mappings)
+		defer client.Close()
+		output, err := runSSHCommand(client, remoteCommand, debugWriter)
+		if err != nil {
+			return fmt.Errorf("query cDOT %s: %w: %s", name, err, strings.TrimSpace(string(output)))
+		}
+		return printONTAPInventory(command.OutOrStdout(), fields, parseONTAPInstances(string(output)))
 	}}
-	list.Flags().StringVar(&listControlPath, "control", defaultControl, "Unix control socket")
-	svm.AddCommand(set, list)
-	return svm
+	list.Flags().StringVar(&keyFile, "key", "", "private key path; defaults to the XDG path")
+	list.Flags().StringVar(&knownHostsFile, "known-hosts", "", "known_hosts file; defaults to the XDG path")
+	list.Flags().BoolVar(&acceptNewHostKey, "accept-new-host-key", false, "trust and save the host key when known_hosts is absent")
+	list.Flags().BoolVar(&debugSSHExec, "debug-ssh-exec", false, "print SSH commands and their results to stderr")
+	group.AddCommand(list)
+	return group
+}
+
+func printONTAPInventory(writer io.Writer, fields []string, records []map[string]string) error {
+	tableWriter := newTableWriter(writer)
+	header := make(table.Row, len(fields))
+	for index, field := range fields {
+		header[index] = field
+	}
+	tableWriter.AppendHeader(header)
+	for _, record := range records {
+		row := make(table.Row, len(fields))
+		for index, field := range fields {
+			row[index] = instanceField(record, field)
+		}
+		tableWriter.AppendRow(row)
+	}
+	tableWriter.Render()
+	return nil
+}
+
+func newCDOTListCommand(name, idColumn, summary, remoteCommand, nameField, idField string) *cobra.Command {
+	group := &cobra.Command{Use: name, Short: summary}
+	var keyFile, knownHostsFile string
+	var acceptNewHostKey, debugSSHExec bool
+	list := &cobra.Command{Use: "list", Short: summary, RunE: func(command *cobra.Command, _ []string) error {
+		host, _ := command.Flags().GetString("host")
+		user, _ := command.Flags().GetString("user")
+		if host == "" {
+			return errors.New("host is required")
+		}
+		keyPath, err := cdotKeyFile(keyFile)
+		if err != nil {
+			return err
+		}
+		if knownHostsFile == "" {
+			knownHostsFile, err = cdotKnownHostsFile()
+			if err != nil {
+				return err
+			}
+		}
+		var debugWriter io.Writer
+		if debugSSHExec {
+			debugWriter = command.ErrOrStderr()
+		}
+		client, err := openCDOTClient(host, user, keyPath, knownHostsFile, acceptNewHostKey)
+		if err != nil {
+			return err
+		}
+		defer client.Close()
+		mappings, err := queryCDOTMappings(client, remoteCommand, nameField, idField, debugWriter)
+		if err != nil {
+			return err
+		}
+		return printLiveMappings(command.OutOrStdout(), name, idColumn, mappings)
+	}}
+	list.Flags().StringVar(&keyFile, "key", "", "private key path; defaults to the XDG path")
+	list.Flags().StringVar(&knownHostsFile, "known-hosts", "", "known_hosts file; defaults to the XDG path")
+	list.Flags().BoolVar(&acceptNewHostKey, "accept-new-host-key", false, "trust and save the host key when known_hosts is absent")
+	list.Flags().BoolVar(&debugSSHExec, "debug-ssh-exec", false, "print SSH commands and their results to stderr")
+	group.AddCommand(list)
+	return group
+}
+
+type cdotMapping struct {
+	Name    string
+	ID      string
+	Vserver string
+	FPolicy bool
+}
+
+func queryCDOTMappings(client *ssh.Client, command, nameField, idField string, debugWriter io.Writer) ([]cdotMapping, error) {
+	output, err := runSSHCommand(client, command, debugWriter)
+	if err != nil {
+		return nil, fmt.Errorf("query cDOT mappings: %w: %s", err, strings.TrimSpace(string(output)))
+	}
+	var mappings []cdotMapping
+	if strings.HasPrefix(command, "volume show -fields") {
+		mappings = parseONTAPVolumeTable(string(output))
+	} else {
+		for _, record := range parseONTAPInstances(string(output)) {
+			name, id := instanceField(record, nameField), instanceField(record, idField)
+			if name != "" && id != "" {
+				mappings = append(mappings, cdotMapping{Name: name, ID: id, Vserver: instanceField(record, "Vserver")})
+			}
+		}
+	}
+	policyOutput, err := runSSHCommand(client, fpolicyPolicyShowCommand+" -instance", debugWriter)
+	if err != nil {
+		return nil, fmt.Errorf("query cDOT FPolicy policies: %w: %s", err, strings.TrimSpace(string(policyOutput)))
+	}
+	covered := make(map[string]struct{})
+	for _, policy := range parseONTAPInstances(string(policyOutput)) {
+		if vserver := instanceField(policy, "Vserver"); vserver != "" {
+			covered[vserver] = struct{}{}
+		}
+	}
+	for index := range mappings {
+		vserver := mappings[index].Vserver
+		if vserver == "" {
+			vserver = mappings[index].Name
+		}
+		if _, found := covered[vserver]; found {
+			mappings[index].FPolicy = true
+		}
+	}
+	return mappings, nil
+}
+
+func parseONTAPVolumeTable(output string) []cdotMapping {
+	var mappings []cdotMapping
+	for _, line := range strings.Split(output, "\n") {
+		fields := strings.Fields(line)
+		if len(fields) != 3 || fields[0] == "vserver" || fields[2] == "-" {
+			continue
+		}
+		if _, err := strconv.ParseUint(fields[2], 10, 64); err != nil {
+			continue
+		}
+		mappings = append(mappings, cdotMapping{Vserver: fields[0], Name: fields[1], ID: fields[2]})
+	}
+	return mappings
+}
+
+func instanceField(record map[string]string, field string) string {
+	if value := record[field]; value != "" {
+		return value
+	}
+	for name, value := range record {
+		if strings.EqualFold(name, field) {
+			return value
+		}
+	}
+	return ""
+}
+
+func parseONTAPInstances(output string) []map[string]string {
+	var records []map[string]string
+	current := map[string]string{}
+	for _, line := range strings.Split(output, "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" {
+			if len(current) > 0 {
+				records = append(records, current)
+				current = map[string]string{}
+			}
+			continue
+		}
+		field, value, found := strings.Cut(line, ":")
+		if found && strings.TrimSpace(field) != "" {
+			current[strings.TrimSpace(field)] = strings.TrimSpace(value)
+		}
+	}
+	if len(current) > 0 {
+		records = append(records, current)
+	}
+	return records
+}
+
+func printLiveMappings(writer io.Writer, nameColumn, idColumn string, mappings []cdotMapping) error {
+	sort.Slice(mappings, func(left, right int) bool { return mappings[left].Name < mappings[right].Name })
+	tableWriter := newTableWriter(writer)
+	tableWriter.AppendHeader(table.Row{nameColumn, idColumn, "FPolicy"})
+	for _, mapping := range mappings {
+		covered := "no"
+		if mapping.FPolicy {
+			covered = "yes"
+		}
+		tableWriter.AppendRow(table.Row{mapping.Name, mapping.ID, covered})
+	}
+	tableWriter.Render()
+	return nil
 }
 
 func printMappings(writer io.Writer, nameColumn, idColumn string, mappings []store.Mapping) error {
@@ -1336,6 +1624,20 @@ func formatCount(value uint64) string {
 		text = text[:index] + "," + text[index:]
 	}
 	return text
+}
+
+func formatEventCount(value uint64) string {
+	if value < 1000 {
+		return strconv.FormatUint(value, 10)
+	}
+	units := []string{"", "k", "M", "G", "T"}
+	amount := float64(value)
+	unit := 0
+	for amount >= 1000 && unit < len(units)-1 {
+		amount /= 1000
+		unit++
+	}
+	return strings.TrimSuffix(strings.TrimSuffix(fmt.Sprintf("%.1f", amount), "0"), ".") + units[unit]
 }
 
 func formatBytes(value uint64) string {

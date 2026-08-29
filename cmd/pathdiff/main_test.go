@@ -15,6 +15,7 @@ import (
 
 	"pathdiff/internal/store"
 
+	"github.com/jedib0t/go-pretty/v6/text"
 	"golang.org/x/crypto/ssh"
 )
 
@@ -248,21 +249,43 @@ func TestEngineSnapshotAndFormatting(t *testing.T) {
 	tracker.senders["192.0.2.10"] = &senderStats{
 		active:         1,
 		connectedSince: time.Now().UTC().Add(-time.Minute),
-		totalEvents:    120,
+		totalEvents:    43120,
 		localPort:      "9911",
+		lastSeen:       time.Now().UTC().Add(-time.Minute),
 		nodeID:         "node-1",
 		svmID:          "svm-1",
 	}
 	engines := tracker.engines()
-	if len(engines) != 1 || engines[0].LIFIPv4 != "192.0.2.10" || engines[0].TotalEvents != 120 || engines[0].LocalPort != "9911" || engines[0].SVMID != "svm-1" || engines[0].AverageRate <= 0 {
+	if len(engines) != 1 || engines[0].LIFIPv4 != "192.0.2.10" || engines[0].TotalEvents != 43120 || engines[0].LocalPort != "9911" || engines[0].SVMID != "svm-1" || engines[0].AverageRate <= 0 {
 		t.Fatalf("unexpected engine snapshot: %#v", engines)
 	}
+	engines[0].NodeName = "ncl1-1-ps-07"
+	engines[0].SVMName = "ncl1-1-vs-50"
+	engines[0].FPolicy = "connected"
 	var output bytes.Buffer
 	if err := printEngines(&output, engines); err != nil {
 		t.Fatal(err)
 	}
-	if got := output.String(); !strings.Contains(got, "TOTAL EVENTS") || !strings.Contains(got, "192.0.2.10") || !strings.Contains(got, "node-1") {
+	if got := output.String(); !strings.Contains(got, "SVM") || !strings.Contains(got, "TOTAL EVENTS") || strings.Index(got, "SVM") > strings.Index(got, "NODE") || !strings.Contains(got, "43.1k") || !strings.Contains(got, "connected") || strings.Contains(got, "192.0.2.10") || !strings.Contains(got, "ncl1-1-ps-07") {
 		t.Fatalf("unexpected engine table: %s", got)
+	}
+}
+
+func TestEngineStatusFormatting(t *testing.T) {
+	if got := formatFPolicyState("unavailable"); got != text.FgRed.Sprint("off") {
+		t.Fatalf("formatFPolicyState(unavailable) = %q", got)
+	}
+	if got := formatLastSeen(time.Time{}); got != text.FgYellow.Sprint("never") {
+		t.Fatalf("formatLastSeen(zero) = %q", got)
+	}
+}
+
+func TestFormatEventCount(t *testing.T) {
+	if got := formatEventCount(43120); got != "43.1k" {
+		t.Fatalf("formatEventCount(43120) = %q", got)
+	}
+	if got := formatEventCount(1000); got != "1k" {
+		t.Fatalf("formatEventCount(1000) = %q", got)
 	}
 }
 
@@ -335,6 +358,20 @@ func TestCDOTCheckHelpers(t *testing.T) {
 	}
 	if fpolicyServerMatches("primary-servers: 192.0.2.10", []string{"192.0.2.11"}) {
 		t.Fatal("unexpected FPolicy endpoint match")
+	}
+}
+
+func TestParseONTAPInstances(t *testing.T) {
+	records := parseONTAPInstances("Vserver: finance\nVserver UUID: svm-1\n\nVserver: engineering\nVserver UUID: svm-2\n")
+	if len(records) != 2 || instanceField(records[0], "Vserver") != "finance" || instanceField(records[0], "Vserver UUID") != "svm-1" {
+		t.Fatalf("unexpected ONTAP records: %#v", records)
+	}
+}
+
+func TestParseONTAPVolumeTable(t *testing.T) {
+	mappings := parseONTAPVolumeTable("vserver volume msid\n-------- ------ ----\nfinance data 2163258291\nengineering vol0 -\n")
+	if len(mappings) != 1 || mappings[0] != (cdotMapping{Vserver: "finance", Name: "data", ID: "2163258291"}) {
+		t.Fatalf("unexpected volume mappings: %#v", mappings)
 	}
 }
 
