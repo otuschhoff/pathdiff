@@ -48,6 +48,8 @@ The receiver accepts JSON lines from adapters, raw XML notifications, and native
 
 XML notifications extract inode, path, operation, timestamp, Vserver, and volume UUID fields. Unknown connection prefixes are rejected rather than guessed as another protocol.
 
+Native synchronous `SCREEN_REQ` messages are also stored as audit events. Their captured NFS payloads provide `ReqId`, `ReqType`, `GenerationTime`, a UNIX access path, and `VolMsid`, but no file inode; these events retain `inode` as `0` and include `request_id` and `volume_msid` in their JSON payload. `pathdiff` does not issue access allow/deny decisions for screen requests.
+
 ## Tasks
 
 ### build

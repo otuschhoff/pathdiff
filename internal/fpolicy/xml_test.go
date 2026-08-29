@@ -22,6 +22,20 @@ func TestParseXMLNotification(t *testing.T) {
 	}
 }
 
+func TestParseScreenRequest(t *testing.T) {
+	payload := []byte(`<FscreenReq><ReqId>211090950</ReqId><ReqType>NFS_WR</ReqType><NotfInfo><NfsWrReq><CommonInfo><ProtCommonInfo><GenerationTime>1788009794015352</GenerationTime><AccessPath><Path><PathNameType>WIN_NAME</PathNameType><PathName>\cache\entry</PathName></Path><Path><PathNameType>UNIX_NAME</PathNameType><PathName>/cache/entry</PathName></Path></AccessPath><VolMsid>2163258291</VolMsid></ProtCommonInfo></CommonInfo></NfsWrReq></NotfInfo></FscreenReq>`)
+	event, err := ParseScreenRequest(payload)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if event.Inode != 0 || event.RequestID != 211090950 || event.VolumeMSID != "2163258291" || event.Path != "/cache/entry" || event.Operation != "NFS_WR" {
+		t.Fatalf("unexpected screen event: %#v", event)
+	}
+	if want := time.UnixMicro(1_788_009_794_015_352).UTC(); !event.Timestamp.Equal(want) {
+		t.Fatalf("timestamp = %s, want %s", event.Timestamp, want)
+	}
+}
+
 func TestNegotiateResponse(t *testing.T) {
 	payload, err := NegotiateResponse("sess-998811")
 	if err != nil {

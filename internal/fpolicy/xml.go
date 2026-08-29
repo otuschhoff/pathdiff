@@ -142,6 +142,75 @@ func ParseXMLNotification(payload []byte) (store.Event, error) {
 	return *message.Notification, nil
 }
 
+// ParseScreenRequest extracts the audit fields available in an FPolicy screen
+// request. NFS screen requests do not include a file inode.
+func ParseScreenRequest(payload []byte) (store.Event, error) {
+	var root xmlNode
+	if err := xml.Unmarshal(payload, &root); err != nil {
+		return store.Event{}, err
+	}
+	if root.XMLName.Local != "FscreenReq" {
+		return store.Event{}, fmt.Errorf("expected FscreenReq, got %s", root.XMLName.Local)
+	}
+	requestID, err := parseUintField(&root, "ReqId")
+	if err != nil {
+		return store.Event{}, fmt.Errorf("parse request ID: %w", err)
+	}
+	generationTime, err := parseIntField(&root, "GenerationTime")
+	if err != nil {
+		return store.Event{}, fmt.Errorf("parse generation time: %w", err)
+	}
+	path := unixAccessPath(&root)
+	if path == "" {
+		return store.Event{}, fmt.Errorf("screen request has no UNIX_NAME access path")
+	}
+	return store.Event{
+		Path:       path,
+		Operation:  textField(&root, "ReqType"),
+		Timestamp:  time.UnixMicro(generationTime).UTC(),
+		RequestID:  requestID,
+		VolumeMSID: textField(&root, "VolMsid"),
+	}, nil
+}
+
+type xmlNode struct {
+	XMLName  xml.Name
+	Text     string    `xml:",chardata"`
+	Children []xmlNode `xml:",any"`
+}
+
+func textField(node *xmlNode, name string) string {
+	if node.XMLName.Local == name {
+		return strings.TrimSpace(node.Text)
+	}
+	for index := range node.Children {
+		if value := textField(&node.Children[index], name); value != "" {
+			return value
+		}
+	}
+	return ""
+}
+
+func parseUintField(node *xmlNode, name string) (uint64, error) {
+	return strconv.ParseUint(textField(node, name), 10, 64)
+}
+
+func parseIntField(node *xmlNode, name string) (int64, error) {
+	return strconv.ParseInt(textField(node, name), 10, 64)
+}
+
+func unixAccessPath(node *xmlNode) string {
+	if node.XMLName.Local == "Path" && textField(node, "PathNameType") == "UNIX_NAME" {
+		return textField(node, "PathName")
+	}
+	for index := range node.Children {
+		if path := unixAccessPath(&node.Children[index]); path != "" {
+			return path
+		}
+	}
+	return ""
+}
+
 type XMLMessage struct {
 	SessionID    string
 	Negotiate    bool
