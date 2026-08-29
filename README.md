@@ -35,6 +35,8 @@ bin/pathdiff events --path /vol/finance/ --start 2026-08-29T00:00:00Z --end 2026
 bin/pathdiff events firefox --start 10d --max 250
 bin/pathdiff events --path /vol/finance/ --start 10d
 bin/pathdiff events --path /vol/finance/ --start 1M4d --end 2026-08-28
+bin/pathdiff path firefox --start 10d
+bin/pathdiff path --path /vol/finance/ --sort timestamp --max 250
 bin/pathdiff monitor --path /vol/finance/ --interval 2s
 bin/pathdiff status
 bin/pathdiff stop
@@ -45,6 +47,8 @@ bin/pathdiff stop
 `events --start` and `--end` accept RFC3339 timestamps, dates such as `2026-08-28`, or relative expressions: `10d`, `1m`, `5h10m`, and `1M4d` mean ten days, one minute, five hours ten minutes, and one month four days ago. Use uppercase `M` for calendar months; lowercase `m` always means minutes. Omit `--start` for the last 24 hours or `--end` for now.
 
 `events` renders matches as a table. Its optional first argument is a case-insensitive path search: `firefox` matches any path containing `firefox`. Include `*` or `?` for an explicit wildcard, where `*` matches across directories and `?` matches one character. `--max` defaults to `100`; when more matches exist, it prints the count instead of a partial table. Increase `--max` or tighten the wildcard, `--path`, or time range.
+
+`path` accepts the same optional path search and `--path`, `--start`, `--end`, `--max`, and `--control` flags as `events`. It coalesces repeated changes to each volume/path pair and renders `Last Change`, `Volume`, and `Path`. It sorts by volume then path by default; pass `--sort timestamp` to list newest changes first.
 
 ## Implementation
 
