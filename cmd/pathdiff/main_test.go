@@ -259,3 +259,13 @@ func TestEngineSnapshotAndFormatting(t *testing.T) {
 		t.Fatalf("unexpected engine table: %s", got)
 	}
 }
+
+func TestPrintMappings(t *testing.T) {
+	var output bytes.Buffer
+	if err := printMappings(&output, "Volume", "MSID", []store.Mapping{{ID: "2163258291", Name: "asic_user"}}); err != nil {
+		t.Fatal(err)
+	}
+	if got := output.String(); !strings.Contains(got, "VOLUME") || !strings.Contains(got, "asic_user") || !strings.Contains(got, "2163258291") {
+		t.Fatalf("unexpected mapping table: %s", got)
+	}
+}

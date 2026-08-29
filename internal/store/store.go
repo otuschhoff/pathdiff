@@ -146,6 +146,11 @@ type Stats struct {
 	Size uint64
 }
 
+type Mapping struct {
+	ID   string
+	Name string
+}
+
 func (d *DB) Stats() (Stats, error) {
 	var size uint64
 	err := filepath.Walk(d.path, func(_ string, info os.FileInfo, err error) error {
@@ -161,6 +166,38 @@ func (d *DB) Stats() (Stats, error) {
 		return Stats{}, err
 	}
 	return Stats{Path: d.path, Size: size}, nil
+}
+
+func (d *DB) ListVolumeMappings() ([]Mapping, error) {
+	return d.listMappings("v:")
+}
+
+func (d *DB) SetSVMName(id, name string) error {
+	if id == "" {
+		return fmt.Errorf("SVM ID is required")
+	}
+	if name == "" {
+		return fmt.Errorf("SVM name is required")
+	}
+	return d.db.Set(append([]byte("s:"), id...), []byte(name), pebble.NoSync)
+}
+
+func (d *DB) ListSVMMappings() ([]Mapping, error) {
+	return d.listMappings("s:")
+}
+
+func (d *DB) listMappings(prefix string) ([]Mapping, error) {
+	prefixBytes := []byte(prefix)
+	iter, err := d.db.NewIter(&pebble.IterOptions{LowerBound: prefixBytes, UpperBound: prefixEnd(prefixBytes)})
+	if err != nil {
+		return nil, err
+	}
+	defer iter.Close()
+	var mappings []Mapping
+	for iter.First(); iter.Valid() && bytes.HasPrefix(iter.Key(), prefixBytes); iter.Next() {
+		mappings = append(mappings, Mapping{ID: string(iter.Key()[len(prefixBytes):]), Name: string(iter.Value())})
+	}
+	return mappings, iter.Error()
 }
 
 func (d *DB) EventsSince(since time.Time) ([]Event, error) {

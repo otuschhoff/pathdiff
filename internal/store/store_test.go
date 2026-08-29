@@ -148,3 +148,34 @@ func TestStats(t *testing.T) {
 		t.Fatalf("stats = %#v", stats)
 	}
 }
+
+func TestListMappings(t *testing.T) {
+	db, err := Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = db.Close() })
+	if err := db.SetVolumeName("2", "beta"); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.SetVolumeName("1", "alpha"); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.SetSVMName("svm-1", "finance"); err != nil {
+		t.Fatal(err)
+	}
+	volumes, err := db.ListVolumeMappings()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(volumes) != 2 || volumes[0] != (Mapping{ID: "1", Name: "alpha"}) || volumes[1] != (Mapping{ID: "2", Name: "beta"}) {
+		t.Fatalf("volume mappings = %#v", volumes)
+	}
+	svms, err := db.ListSVMMappings()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(svms) != 1 || svms[0] != (Mapping{ID: "svm-1", Name: "finance"}) {
+		t.Fatalf("SVM mappings = %#v", svms)
+	}
+}
