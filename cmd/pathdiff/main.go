@@ -26,6 +26,7 @@ import (
 	"pathdiff/internal/store"
 
 	"github.com/jedib0t/go-pretty/v6/table"
+	"github.com/jedib0t/go-pretty/v6/text"
 	"github.com/spf13/cobra"
 )
 
@@ -52,6 +53,8 @@ type controlResponse struct {
 	Status      string        `json:"status,omitempty"`
 	Connections int           `json:"connections,omitempty"`
 	EventCount  uint64        `json:"event_count,omitempty"`
+	DBPath      string        `json:"db_path,omitempty"`
+	DBSize      uint64        `json:"db_size,omitempty"`
 	Events      []store.Event `json:"events,omitempty"`
 }
 
@@ -560,6 +563,11 @@ func handleControl(connection net.Conn, db *store.DB, stop context.CancelFunc, t
 			if err == nil {
 				response.Status = "reset"
 			}
+		case "db-status":
+			var stats store.Stats
+			stats, err = db.Stats()
+			response.DBPath = stats.Path
+			response.DBSize = stats.Size
 		default:
 			response.Error = "unknown command"
 		}
@@ -572,6 +580,15 @@ func handleControl(connection net.Conn, db *store.DB, stop context.CancelFunc, t
 
 func newDBCommand() *cobra.Command {
 	database := &cobra.Command{Use: "db", Short: "Manage persisted data"}
+	var statusControlPath string
+	status := &cobra.Command{Use: "status", Short: "Show Pebble database status", RunE: func(command *cobra.Command, _ []string) error {
+		response, err := callControl(statusControlPath, controlRequest{Command: "db-status"})
+		if err != nil {
+			return err
+		}
+		return printDBStatus(command.OutOrStdout(), response)
+	}}
+	status.Flags().StringVar(&statusControlPath, "control", defaultControl, "Unix control socket")
 	event := &cobra.Command{Use: "event", Short: "Manage stored events"}
 	var controlPath string
 	reset := &cobra.Command{Use: "reset", Short: "Remove all stored event records", RunE: func(*cobra.Command, []string) error {
@@ -583,8 +600,17 @@ func newDBCommand() *cobra.Command {
 	}}
 	reset.Flags().StringVar(&controlPath, "control", defaultControl, "Unix control socket")
 	event.AddCommand(reset)
+	database.AddCommand(status)
 	database.AddCommand(event)
 	return database
+}
+
+func printDBStatus(writer io.Writer, response controlResponse) error {
+	tableWriter := newTableWriter(writer)
+	tableWriter.AppendHeader(table.Row{"Path", "Size"})
+	tableWriter.AppendRow(table.Row{response.DBPath, formatBytes(response.DBSize)})
+	tableWriter.Render()
+	return nil
 }
 
 func newVolumeCommand() *cobra.Command {
@@ -656,8 +682,7 @@ func newServiceStatusCommand() *cobra.Command {
 				state += " (control unavailable)"
 			}
 		}
-		tableWriter := table.NewWriter()
-		tableWriter.SetOutputMirror(command.OutOrStdout())
+		tableWriter := newTableWriter(command.OutOrStdout())
 		tableWriter.AppendHeader(table.Row{"Service", "State", "FPolicy Connections", "Registered Events"})
 		tableWriter.AppendRow(table.Row{"pathdiff", state, connections, events})
 		tableWriter.Render()
@@ -749,6 +774,20 @@ func formatCount(value uint64) string {
 		text = text[:index] + "," + text[index:]
 	}
 	return text
+}
+
+func formatBytes(value uint64) string {
+	units := []string{"B", "KiB", "MiB", "GiB", "TiB"}
+	amount := float64(value)
+	unit := 0
+	for amount >= 1024 && unit < len(units)-1 {
+		amount /= 1024
+		unit++
+	}
+	if unit == 0 {
+		return fmt.Sprintf("%d %s", value, units[unit])
+	}
+	return fmt.Sprintf("%.1f %s", amount, units[unit])
 }
 
 func newEventsCommand() *cobra.Command {
@@ -899,8 +938,7 @@ func printParentPaths(writer io.Writer, events []store.Event, wildcard string, m
 		return leftVolume < rightVolume
 	})
 
-	tableWriter := table.NewWriter()
-	tableWriter.SetOutputMirror(writer)
+	tableWriter := newTableWriter(writer)
 	tableWriter.AppendHeader(table.Row{"Last Change", "Volume", "CNT", "Parent"})
 	for _, row := range rows {
 		tableWriter.AppendRow(table.Row{row.event.Timestamp.UTC().Format(time.RFC3339Nano), eventVolume(row.event), len(row.children), row.event.Path})
@@ -951,8 +989,7 @@ func printPathRows(writer io.Writer, events []store.Event, wildcard string, maxR
 		return leftVolume < rightVolume
 	})
 
-	tableWriter := table.NewWriter()
-	tableWriter.SetOutputMirror(writer)
+	tableWriter := newTableWriter(writer)
 	tableWriter.AppendHeader(table.Row{"Last Change", "Volume", column})
 	for _, event := range results {
 		tableWriter.AppendRow(table.Row{event.Timestamp.UTC().Format(time.RFC3339Nano), eventVolume(event), event.Path})
@@ -987,14 +1024,21 @@ func printEvents(writer io.Writer, events []store.Event, wildcard string, maxRes
 		return err
 	}
 
-	tableWriter := table.NewWriter()
-	tableWriter.SetOutputMirror(writer)
+	tableWriter := newTableWriter(writer)
 	tableWriter.AppendHeader(table.Row{"Timestamp", "Operation", "Path", "Volume MSID", "Volume Name"})
 	for _, event := range matches {
 		tableWriter.AppendRow(table.Row{event.Timestamp.UTC().Format(time.RFC3339Nano), event.Operation, event.Path, event.VolumeMSID, event.VolumeName})
 	}
 	tableWriter.Render()
 	return nil
+}
+
+func newTableWriter(writer io.Writer) table.Writer {
+	tableWriter := table.NewWriter()
+	tableWriter.SetOutputMirror(writer)
+	tableWriter.SetStyle(table.StyleRounded)
+	tableWriter.Style().Color.Border = text.Colors{text.FgHiBlack}
+	return tableWriter
 }
 
 func wildcardMatch(pattern, value string) (bool, error) {

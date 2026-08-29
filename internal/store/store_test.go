@@ -129,3 +129,22 @@ func TestResetEventsPreservesVolumeMappings(t *testing.T) {
 		t.Fatalf("volume mapping was not preserved: %#v", events)
 	}
 }
+
+func TestStats(t *testing.T) {
+	path := t.TempDir()
+	db, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = db.Close() })
+	if err := db.Store(Event{Path: "/vol/data/a", Operation: "NFS_WR"}); err != nil {
+		t.Fatal(err)
+	}
+	stats, err := db.Stats()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stats.Path != path || stats.Size == 0 {
+		t.Fatalf("stats = %#v", stats)
+	}
+}
