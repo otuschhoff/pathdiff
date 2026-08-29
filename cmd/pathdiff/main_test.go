@@ -5,6 +5,7 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 )
 
 func TestTrafficRecorder(t *testing.T) {
@@ -59,5 +60,28 @@ func TestTrafficRecorder(t *testing.T) {
 	out, err := os.ReadFile(outFiles[0])
 	if err != nil || string(out) != "response" {
 		t.Fatalf("out capture = %q, err = %v", out, err)
+	}
+}
+
+func TestConnectionRegistryCloseAll(t *testing.T) {
+	server, client := net.Pipe()
+	t.Cleanup(func() { _ = client.Close() })
+	registry := newConnectionRegistry()
+	registry.Add(server)
+	done := make(chan error, 1)
+	go func() {
+		buffer := make([]byte, 1)
+		_, err := server.Read(buffer)
+		done <- err
+	}()
+
+	registry.CloseAll()
+	select {
+	case err := <-done:
+		if err == nil {
+			t.Fatal("reader returned no error after registry shutdown")
+		}
+	case <-time.After(time.Second):
+		t.Fatal("registry shutdown did not unblock the connection reader")
 	}
 }
