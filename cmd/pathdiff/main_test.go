@@ -85,3 +85,34 @@ func TestConnectionRegistryCloseAll(t *testing.T) {
 		t.Fatal("registry shutdown did not unblock the connection reader")
 	}
 }
+
+func TestParseTimeExpression(t *testing.T) {
+	now := time.Date(2026, 8, 29, 12, 30, 0, 0, time.UTC)
+	for _, test := range []struct {
+		value  string
+		offset time.Duration
+		want   time.Time
+	}{
+		{value: "", offset: -24 * time.Hour, want: now.Add(-24 * time.Hour)},
+		{value: "2026-08-28", want: time.Date(2026, 8, 28, 0, 0, 0, 0, time.UTC)},
+		{value: "10d", want: now.AddDate(0, 0, -10)},
+		{value: "5h10m", want: now.Add(-(5*time.Hour + 10*time.Minute))},
+		{value: "1m4d", want: now.AddDate(0, -1, -4)},
+		{value: "2026-08-29T10:30:00Z", want: time.Date(2026, 8, 29, 10, 30, 0, 0, time.UTC)},
+	} {
+		got, err := parseTimeExpression("time", test.value, now, test.offset)
+		if err != nil {
+			t.Fatalf("parseTimeExpression(%q) returned error: %v", test.value, err)
+		}
+		if !got.Equal(test.want) {
+			t.Fatalf("parseTimeExpression(%q) = %s, want %s", test.value, got, test.want)
+		}
+	}
+}
+
+func TestParseTimeExpressionRejectsInvalidValue(t *testing.T) {
+	_, err := parseTimeExpression("start", "tomorrow", time.Now(), 0)
+	if err == nil {
+		t.Fatal("parseTimeExpression accepted an invalid value")
+	}
+}
