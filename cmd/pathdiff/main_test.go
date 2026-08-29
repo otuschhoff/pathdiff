@@ -2,6 +2,8 @@ package main
 
 import (
 	"bytes"
+	"crypto/x509"
+	"encoding/pem"
 	"net"
 	"os"
 	"path/filepath"
@@ -10,6 +12,8 @@ import (
 	"time"
 
 	"pathdiff/internal/store"
+
+	"golang.org/x/crypto/ssh"
 )
 
 func TestTrafficRecorder(t *testing.T) {
@@ -260,6 +264,16 @@ func TestEngineSnapshotAndFormatting(t *testing.T) {
 	}
 }
 
+func TestSenderTrackerRequestRate(t *testing.T) {
+	tracker := newSenderTracker(false)
+	tracker.startedAt = time.Date(2026, 8, 29, 12, 0, 0, 0, time.UTC)
+	tracker.senders["192.0.2.10"] = &senderStats{totalEvents: 90}
+	tracker.senders["192.0.2.11"] = &senderStats{totalEvents: 30}
+	if got := tracker.requestRate(tracker.startedAt.Add(2 * time.Minute)); got != 1 {
+		t.Fatalf("requestRate() = %f, want 1", got)
+	}
+}
+
 func TestPrintMappings(t *testing.T) {
 	var output bytes.Buffer
 	if err := printMappings(&output, "Volume", "MSID", []store.Mapping{{ID: "2163258291", Name: "asic_user"}}); err != nil {
@@ -267,5 +281,36 @@ func TestPrintMappings(t *testing.T) {
 	}
 	if got := output.String(); !strings.Contains(got, "VOLUME") || !strings.Contains(got, "asic_user") || !strings.Contains(got, "2163258291") {
 		t.Fatalf("unexpected mapping table: %s", got)
+	}
+}
+
+func TestGenerateCDOTKey(t *testing.T) {
+	keyFile := filepath.Join(t.TempDir(), "keys", "cdot_ed25519")
+	if err := generateCDOTKey(keyFile); err != nil {
+		t.Fatal(err)
+	}
+	publicKey, err := os.ReadFile(keyFile + ".pub")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.HasPrefix(string(publicKey), "ssh-ed25519 ") {
+		t.Fatalf("unexpected public key: %s", publicKey)
+	}
+	if _, _, _, _, err := ssh.ParseAuthorizedKey(publicKey); err != nil {
+		t.Fatalf("parse public key: %v", err)
+	}
+	privateKey, err := os.ReadFile(keyFile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	block, _ := pem.Decode(privateKey)
+	if block == nil {
+		t.Fatal("private key is not PEM")
+	}
+	if _, err := x509.ParsePKCS8PrivateKey(block.Bytes); err != nil {
+		t.Fatalf("parse private key: %v", err)
+	}
+	if err := generateCDOTKey(keyFile); err == nil {
+		t.Fatal("generateCDOTKey overwrote an existing key")
 	}
 }

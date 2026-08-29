@@ -6,6 +6,7 @@ require (
 	github.com/cockroachdb/pebble v1.1.5
 	github.com/jedib0t/go-pretty/v6 v6.6.4
 	github.com/spf13/cobra v1.8.1
+	golang.org/x/crypto v0.31.0
 )
 
 require (
@@ -36,7 +37,7 @@ require (
 	github.com/rogpeppe/go-internal v1.9.0 // indirect
 	github.com/spf13/pflag v1.0.5 // indirect
 	golang.org/x/exp v0.0.0-20230626212559-97b1e661b5df // indirect
-	golang.org/x/sys v0.18.0 // indirect
-	golang.org/x/text v0.14.0 // indirect
+	golang.org/x/sys v0.28.0 // indirect
+	golang.org/x/text v0.21.0 // indirect
 	google.golang.org/protobuf v1.33.0 // indirect
 )
