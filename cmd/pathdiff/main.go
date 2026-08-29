@@ -240,7 +240,7 @@ func readONTAPXMLEvents(reader *bufio.Reader, connection net.Conn, db *store.DB)
 		fmt.Fprintf(os.Stderr, "reject ONTAP XML session from %s: expected NEGO_REQ, got %s\n", connection.RemoteAddr(), message.Type)
 		return
 	}
-	response, err := fpolicy.ONTAPNegotiateResponse(message.Session)
+	response, err := fpolicy.ONTAPNegotiateResponse(message.Session, message.VserverUUID, message.PolicyName)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "encode ONTAP XML handshake response:", err)
 		return

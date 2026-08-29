@@ -80,11 +80,11 @@ func TestONTAPXMLHandshakeFrames(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if message.Type != "NEGO_REQ" || message.Session != "bef098d2-a3a6-11f1-8e8e-d039ea524d0f" {
+	if message.Type != "NEGO_REQ" || message.Session != "bef098d2-a3a6-11f1-8e8e-d039ea524d0f" || message.VserverUUID != "5b701784-7459-11e8-8e95-00a098bc5a13" || message.PolicyName != "track_inode_changes" {
 		t.Fatalf("unexpected handshake: %#v", message)
 	}
 
-	response, err := ONTAPNegotiateResponse(message.Session)
+	response, err := ONTAPNegotiateResponse(message.Session, message.VserverUUID, message.PolicyName)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -95,7 +95,7 @@ func TestONTAPXMLHandshakeFrames(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if message.Type != "NEGO_RESP" || !bytes.Contains(message.Payload, []byte("<Status>SUCCESS</Status>")) || !bytes.Contains(message.Payload, []byte("<Vers>1.0</Vers>")) {
+	if message.Type != "NEGO_RESP" || !bytes.Contains(message.Payload, []byte("<VsUUID>5b701784-7459-11e8-8e95-00a098bc5a13</VsUUID>")) || !bytes.Contains(message.Payload, []byte("<PolicyName>track_inode_changes</PolicyName>")) || !bytes.Contains(message.Payload, []byte("<Status>SUCCESS</Status>")) || !bytes.Contains(message.Payload, []byte("<Vers>1.0</Vers>")) {
 		t.Fatalf("unexpected negotiation response: %#v", message)
 	}
 }

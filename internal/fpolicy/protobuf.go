@@ -58,9 +58,11 @@ func WriteFrame(writer io.Writer, payload []byte) error {
 }
 
 type ONTAPMessage struct {
-	Type    string
-	Session string
-	Payload []byte
+	Type        string
+	Session     string
+	VserverUUID string
+	PolicyName  string
+	Payload     []byte
 }
 
 // ReadONTAPXMLFrame reads the FPolicy frame seen on the ONTAP wire: a one-byte
@@ -94,12 +96,16 @@ func ReadONTAPXMLFrame(reader io.Reader) (ONTAPMessage, error) {
 	message := ONTAPMessage{Type: header.NotificationType, Payload: bytes.TrimSpace(parts[1])}
 	if message.Type == "NEGO_REQ" {
 		var handshake struct {
-			Session string `xml:"SessionId"`
+			VserverUUID string `xml:"VsUUID"`
+			PolicyName  string `xml:"PolicyName"`
+			Session     string `xml:"SessionId"`
 		}
 		if err := xml.Unmarshal(message.Payload, &handshake); err != nil {
 			return ONTAPMessage{}, fmt.Errorf("decode ONTAP handshake: %w", err)
 		}
 		message.Session = handshake.Session
+		message.VserverUUID = handshake.VserverUUID
+		message.PolicyName = handshake.PolicyName
 	}
 	return message, nil
 }
@@ -122,15 +128,17 @@ func WriteONTAPXMLFrame(writer io.Writer, notificationType string, payload []byt
 	return err
 }
 
-func ONTAPNegotiateResponse(session string) ([]byte, error) {
+func ONTAPNegotiateResponse(session, vserverUUID, policyName string) ([]byte, error) {
 	response := struct {
-		XMLName xml.Name `xml:"Handshake"`
-		Session string   `xml:"SessionId"`
-		Version struct {
+		XMLName     xml.Name `xml:"Handshake"`
+		VserverUUID string   `xml:"VsUUID"`
+		PolicyName  string   `xml:"PolicyName"`
+		Session     string   `xml:"SessionId"`
+		Version     struct {
 			Value string `xml:"Vers"`
 		} `xml:"ProtVersion"`
 		Status string `xml:"Status"`
-	}{Session: session, Status: "SUCCESS"}
+	}{VserverUUID: vserverUUID, PolicyName: policyName, Session: session, Status: "SUCCESS"}
 	response.Version.Value = "1.0"
 	payload, err := xml.Marshal(response)
 	if err != nil {
