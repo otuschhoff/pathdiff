@@ -2,8 +2,10 @@ package main
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"encoding/json"
+	"encoding/xml"
 	"errors"
 	"fmt"
 	"io"
@@ -16,6 +18,7 @@ import (
 	"syscall"
 	"time"
 
+	"pathdiff/internal/fpolicy"
 	"pathdiff/internal/store"
 
 	"github.com/spf13/cobra"
@@ -127,7 +130,24 @@ func acceptEvents(context context.Context, listener net.Listener, db *store.DB, 
 }
 
 func readEvents(connection net.Conn, db *store.DB) {
-	scanner := bufio.NewScanner(connection)
+	reader := bufio.NewReader(connection)
+	first, err := reader.Peek(1)
+	if err != nil {
+		if !errors.Is(err, io.EOF) {
+			fmt.Fprintln(os.Stderr, "read event stream:", err)
+		}
+		return
+	}
+	if first[0] == '<' {
+		readXMLEvents(reader, connection, db)
+		return
+	}
+	if first[0] != '{' {
+		readFramedEvents(reader, connection, db)
+		return
+	}
+
+	scanner := bufio.NewScanner(reader)
 	scanner.Buffer(make([]byte, 4096), 1024*1024)
 	for scanner.Scan() {
 		var event store.Event
@@ -145,6 +165,86 @@ func readEvents(connection net.Conn, db *store.DB) {
 	}
 	if err := scanner.Err(); err != nil {
 		fmt.Fprintln(os.Stderr, "read event stream:", err)
+	}
+}
+
+func readFramedEvents(reader *bufio.Reader, connection net.Conn, db *store.DB) {
+	handshake, err := fpolicy.ReadFrame(reader)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "read framed handshake from %s: %v\n", connection.RemoteAddr(), err)
+		return
+	}
+	if err := fpolicy.WriteFrame(connection, nil); err != nil {
+		fmt.Fprintf(os.Stderr, "write framed handshake response to %s: %v\n", connection.RemoteAddr(), err)
+		return
+	}
+	if bytes.HasPrefix(bytes.TrimSpace(handshake), []byte("<")) {
+		readFramedXMLEvents(reader, connection, db)
+		return
+	}
+	readProtobufEvents(reader, connection, db)
+}
+
+func readProtobufEvents(reader *bufio.Reader, connection net.Conn, db *store.DB) {
+	for {
+		payload, err := fpolicy.ReadFrame(reader)
+		if errors.Is(err, io.EOF) {
+			return
+		}
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "read protobuf event from %s: %v\n", connection.RemoteAddr(), err)
+			return
+		}
+		event, err := fpolicy.ParseNotification(payload)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "decode protobuf event from %s: %v\n", connection.RemoteAddr(), err)
+			continue
+		}
+		if err := db.Store(event); err != nil {
+			fmt.Fprintln(os.Stderr, "store protobuf event:", err)
+		}
+	}
+}
+
+func readFramedXMLEvents(reader *bufio.Reader, connection net.Conn, db *store.DB) {
+	for {
+		payload, err := fpolicy.ReadFrame(reader)
+		if errors.Is(err, io.EOF) {
+			return
+		}
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "read framed XML event from %s: %v\n", connection.RemoteAddr(), err)
+			return
+		}
+		storeXMLEvent(payload, connection, db)
+	}
+}
+
+func readXMLEvents(reader *bufio.Reader, connection net.Conn, db *store.DB) {
+	decoder := xml.NewDecoder(reader)
+	for {
+		event, err := fpolicy.DecodeXMLNotification(decoder)
+		if errors.Is(err, io.EOF) {
+			return
+		}
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "read XML event from %s: %v\n", connection.RemoteAddr(), err)
+			return
+		}
+		if err := db.Store(event); err != nil {
+			fmt.Fprintln(os.Stderr, "store XML event:", err)
+		}
+	}
+}
+
+func storeXMLEvent(payload []byte, connection net.Conn, db *store.DB) {
+	event, err := fpolicy.ParseXMLNotification(payload)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "decode XML event from %s: %v\n", connection.RemoteAddr(), err)
+		return
+	}
+	if err := db.Store(event); err != nil {
+		fmt.Fprintln(os.Stderr, "store XML event:", err)
 	}
 }
 
