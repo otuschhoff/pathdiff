@@ -1038,6 +1038,7 @@ func newTableWriter(writer io.Writer) table.Writer {
 	tableWriter.SetOutputMirror(writer)
 	tableWriter.SetStyle(table.StyleRounded)
 	tableWriter.Style().Color.Border = text.Colors{text.FgHiBlack}
+	tableWriter.Style().Color.Separator = text.Colors{text.FgHiBlack}
 	return tableWriter
 }
 
