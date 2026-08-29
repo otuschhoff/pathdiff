@@ -18,6 +18,8 @@ bin/pathdiff service status
 bin/pathdiff service monitor --path /vol/finance/ --interval 2s
 bin/pathdiff service stop
 bin/pathdiff engine list
+bin/pathdiff cdot node list
+bin/pathdiff cdot lif list
 bin/pathdiff cdot pubkey generate
 bin/pathdiff cdot pubkey show
 bin/pathdiff cdot set-cluster cluster.example.test
@@ -28,7 +30,7 @@ On first start, `pathdiff` writes `~/.config/systemd/user/pathdiff.service`, rel
 
 `service status` renders the systemd state, active FPolicy connection count, registered event count, and average accepted FPolicy requests per second since daemon start. The internal `daemon run` entrypoint handles SIGINT and SIGTERM by stopping listeners, closing active sockets, waiting for workers, then closing Pebble.
 
-`engine list` renders active FPolicy engine connections with their connection time, total accepted events, average event rate, LIF IPv4 address, reverse-resolved hostname when available, local listener port, and `NodeId`/SVM ID when ONTAP supplies those fields during negotiation.
+`cdot node list` and `cdot lif list` render live ONTAP inventory over SSH. `engine list` uses that inventory to resolve each active sender's node and SVM names, hides raw LIF IPv4 by default, and renders connection time, human-readable time since the last accepted event, total events, average event rate, FPolicy connection status when ONTAP permits the status query, hostname, and local listener port.
 
 `cdot pubkey generate` creates a non-interactive Ed25519 keypair at `$XDG_DATA_HOME/pathdiff/cdot_ed25519`, or `~/.local/share/pathdiff/cdot_ed25519` when `XDG_DATA_HOME` is unset. It uses Go cryptography and SSH libraries rather than external SSH commands, prints the public-key path, and will not overwrite an existing key. Use `cdot pubkey show` to print the public key for adding to ONTAP. Future cDOT SSH operations default to user `pathdiff`; pass `cdot --user <user>` to override it.
 
@@ -54,7 +56,6 @@ bin/pathdiff path parent --path /vol/finance/ --sort timestamp --max 250
 bin/pathdiff db status
 bin/pathdiff db event reset
 bin/pathdiff cdot volume list
-bin/pathdiff cdot svm set --id 5b701784-7459-11e8-8e95-00a098bc5a13 --name finance
 bin/pathdiff cdot svm list
 ```
 
@@ -82,16 +83,9 @@ XML notifications extract path, operation, and timestamp fields. Unknown connect
 
 Native synchronous `SCREEN_REQ` messages are also stored as audit events using their request type, generation time, and UNIX access path. `pathdiff` does not issue access allow/deny decisions for screen requests.
 
-`SCREEN_REQ` payloads also include the numeric `VolMsid`. Persisted query results retain it as `volume_msid`; configure a human-readable name through the daemon with:
+`SCREEN_REQ` payloads also include the numeric `VolMsid`. Persisted query results retain it as `volume_msid`.
 
-```sh
-bin/pathdiff cdot volume set --msid 2163258291 --name asic_user
-bin/pathdiff cdot volume list
-```
-
-Subsequent query and monitor output resolves that ID as `volume_name` without rewriting historic event records.
-
-`cdot svm set --id <uuid> --name <name>` persists an SVM UUID-to-name mapping, and `cdot svm list` renders configured SVM mappings. Both SVM and volume mapping commands operate through the running daemon's control socket.
+`cdot volume list` and `cdot svm list` query current ONTAP data directly over SSH. Each table includes the live name and ID plus whether its SVM has an FPolicy policy configured. Local `set` mapping commands are not used.
 
 ## Tasks
 
