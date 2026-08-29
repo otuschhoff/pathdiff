@@ -12,6 +12,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"regexp"
 	"strconv"
 	"strings"
 	"sync"
@@ -22,6 +23,7 @@ import (
 	"pathdiff/internal/fpolicy"
 	"pathdiff/internal/store"
 
+	"github.com/jedib0t/go-pretty/v6/table"
 	"github.com/spf13/cobra"
 )
 
@@ -548,8 +550,9 @@ func newVolumeCommand() *cobra.Command {
 }
 
 func newEventsCommand() *cobra.Command {
-	var controlPath, path, startValue, endValue string
-	command := &cobra.Command{Use: "events", Short: "List changes below a path during a time range", RunE: func(*cobra.Command, []string) error {
+	var controlPath, pathPrefix, startValue, endValue string
+	var maxResults int
+	command := &cobra.Command{Use: "events [path-search]", Args: cobra.MaximumNArgs(1), Short: "List changes below a path during a time range", RunE: func(command *cobra.Command, arguments []string) error {
 		now := time.Now().UTC()
 		start, err := parseTimeExpression("start", startValue, now, -24*time.Hour)
 		if err != nil {
@@ -562,18 +565,79 @@ func newEventsCommand() *cobra.Command {
 		if end.Before(start) {
 			return errors.New("end must not be before start")
 		}
-		response, err := callControl(controlPath, controlRequest{Command: "events", Path: path, Start: start, End: end})
+		response, err := callControl(controlPath, controlRequest{Command: "events", Path: pathPrefix, Start: start, End: end})
 		if err != nil {
 			return err
 		}
-		return printResponse(response)
+		wildcard := "*"
+		if len(arguments) == 1 {
+			wildcard = normalizePathSearch(arguments[0])
+		}
+		return printEvents(command.OutOrStdout(), response.Events, wildcard, maxResults)
 	}}
 	command.Flags().StringVar(&controlPath, "control", defaultControl, "Unix control socket")
-	command.Flags().StringVar(&path, "path", "", "path prefix")
+	command.Flags().StringVar(&pathPrefix, "path", "", "path prefix")
 	command.Flags().StringVar(&startValue, "start", "", "inclusive time; RFC3339, YYYY-MM-DD, or relative duration (default 24h ago)")
 	command.Flags().StringVar(&endValue, "end", "", "inclusive time; RFC3339, YYYY-MM-DD, or relative duration (default now)")
-	_ = command.MarkFlagRequired("path")
+	command.Flags().IntVar(&maxResults, "max", 100, "maximum results to display")
 	return command
+}
+
+func printEvents(writer io.Writer, events []store.Event, wildcard string, maxResults int) error {
+	if maxResults < 1 {
+		return errors.New("max must be greater than zero")
+	}
+	var matches []store.Event
+	for _, event := range events {
+		matched, err := wildcardMatch(wildcard, event.Path)
+		if err != nil {
+			return fmt.Errorf("invalid path wildcard %q: %w", wildcard, err)
+		}
+		if matched {
+			matches = append(matches, event)
+		}
+	}
+	if len(matches) > maxResults {
+		_, err := fmt.Fprintf(writer, "%d results match; increase --max and/or tighten the path wildcard, --path prefix, or time range.\n", len(matches))
+		return err
+	}
+
+	tableWriter := table.NewWriter()
+	tableWriter.SetOutputMirror(writer)
+	tableWriter.AppendHeader(table.Row{"Timestamp", "Operation", "Path", "Volume MSID", "Volume Name"})
+	for _, event := range matches {
+		tableWriter.AppendRow(table.Row{event.Timestamp.UTC().Format(time.RFC3339Nano), event.Operation, event.Path, event.VolumeMSID, event.VolumeName})
+	}
+	tableWriter.Render()
+	return nil
+}
+
+func wildcardMatch(pattern, value string) (bool, error) {
+	var expression strings.Builder
+	expression.WriteString("(?i)^")
+	for _, character := range pattern {
+		switch character {
+		case '*':
+			expression.WriteString(".*")
+		case '?':
+			expression.WriteByte('.')
+		default:
+			expression.WriteString(regexp.QuoteMeta(string(character)))
+		}
+	}
+	expression.WriteString("$")
+	compiled, err := regexp.Compile(expression.String())
+	if err != nil {
+		return false, err
+	}
+	return compiled.MatchString(value), nil
+}
+
+func normalizePathSearch(search string) string {
+	if strings.ContainsAny(search, "*?") {
+		return search
+	}
+	return "*" + search + "*"
 }
 
 func newMonitorCommand() *cobra.Command {
@@ -693,7 +757,6 @@ func parseTimeExpression(name, value string, now time.Time, defaultOffset time.D
 	remaining := value
 	months, days := 0, 0
 	duration := time.Duration(0)
-	monthSeen := false
 	for remaining != "" {
 		index := 0
 		for index < len(remaining) && remaining[index] >= '0' && remaining[index] <= '9' {
@@ -706,20 +769,17 @@ func parseTimeExpression(name, value string, now time.Time, defaultOffset time.D
 		if err != nil {
 			return time.Time{}, fmt.Errorf("parse %s: %w", name, err)
 		}
-		unit := remaining[index]
+		unit := remaining[index : index+1]
 		remaining = remaining[index+1:]
 		switch unit {
-		case 'd':
+		case "d":
 			days += amount
-		case 'h':
+		case "h":
 			duration += time.Duration(amount) * time.Hour
-		case 'm':
-			if !monthSeen && duration == 0 && days == 0 {
-				months += amount
-				monthSeen = true
-			} else {
-				duration += time.Duration(amount) * time.Minute
-			}
+		case "m":
+			duration += time.Duration(amount) * time.Minute
+		case "M":
+			months += amount
 		default:
 			return time.Time{}, fmt.Errorf("parse %s: unsupported unit %q", name, unit)
 		}
