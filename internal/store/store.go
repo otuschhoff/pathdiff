@@ -118,6 +118,28 @@ func (d *DB) InodesSince(since time.Time) ([]uint64, error) {
 	return inodes, iter.Error()
 }
 
+func (d *DB) EventsSince(since time.Time) ([]Event, error) {
+	iter, err := d.db.NewIter(&pebble.IterOptions{
+		LowerBound: []byte("t:"),
+		UpperBound: []byte("u:"),
+	})
+	if err != nil {
+		return nil, err
+	}
+	defer iter.Close()
+
+	seek := timeKey(since, 0, "")
+	var events []Event
+	for iter.SeekGE(seek); iter.Valid(); iter.Next() {
+		var event Event
+		if err := json.Unmarshal(iter.Value(), &event); err != nil {
+			return nil, fmt.Errorf("decode stored event: %w", err)
+		}
+		events = append(events, event)
+	}
+	return events, iter.Error()
+}
+
 func (d *DB) EventsByPath(path string, start, end time.Time) ([]Event, error) {
 	prefix := pathPrefix(path)
 	iter, err := d.db.NewIter(&pebble.IterOptions{

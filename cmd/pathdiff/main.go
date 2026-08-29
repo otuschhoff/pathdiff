@@ -5,18 +5,20 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
-	"flag"
 	"fmt"
 	"io"
 	"net"
 	"os"
 	"os/signal"
 	"path/filepath"
+	"strings"
 	"sync"
 	"syscall"
 	"time"
 
 	"pathdiff/internal/store"
+
+	"github.com/spf13/cobra"
 )
 
 const (
@@ -41,47 +43,26 @@ type controlResponse struct {
 }
 
 func main() {
-	if len(os.Args) < 2 {
-		usage()
-		os.Exit(2)
-	}
-
-	switch os.Args[1] {
-	case "daemon":
-		daemonCommand(os.Args[2:])
-	case "inodes":
-		inodesCommand(os.Args[2:])
-	case "events":
-		eventsCommand(os.Args[2:])
-	case "status", "stop":
-		controlCommand(os.Args[1], os.Args[2:])
-	default:
-		usage()
-		os.Exit(2)
-	}
-}
-
-func usage() {
-	fmt.Fprint(os.Stderr, `Usage:
-  pathdiff daemon [-db DIR] [-listen ADDR] [-control SOCKET]
-  pathdiff inodes -since RFC3339 [-control SOCKET]
-  pathdiff events -path PREFIX -start RFC3339 -end RFC3339 [-control SOCKET]
-  pathdiff status [-control SOCKET]
-  pathdiff stop [-control SOCKET]
-`)
-}
-
-func daemonCommand(args []string) {
-	flags := flag.NewFlagSet("daemon", flag.ExitOnError)
-	dbPath := flags.String("db", defaultDB, "Pebble database directory")
-	listenAddr := flags.String("listen", defaultListen, "FPolicy event listener address")
-	controlPath := flags.String("control", defaultControl, "Unix control socket")
-	_ = flags.Parse(args)
-
-	if err := runDaemon(*dbPath, *listenAddr, *controlPath); err != nil {
-		fmt.Fprintln(os.Stderr, err)
+	if err := newRootCommand().Execute(); err != nil {
 		os.Exit(1)
 	}
+}
+
+func newRootCommand() *cobra.Command {
+	root := &cobra.Command{Use: "pathdiff", Short: "Store and inspect FPolicy inode path changes", SilenceUsage: true}
+	root.AddCommand(newDaemonCommand(), newInodesCommand(), newEventsCommand(), newMonitorCommand(), newControlCommand("status"), newControlCommand("stop"))
+	return root
+}
+
+func newDaemonCommand() *cobra.Command {
+	var dbPath, listenAddr, controlPath string
+	command := &cobra.Command{Use: "daemon", Short: "Run the event receiver and query service", RunE: func(*cobra.Command, []string) error {
+		return runDaemon(dbPath, listenAddr, controlPath)
+	}}
+	command.Flags().StringVar(&dbPath, "db", defaultDB, "Pebble database directory")
+	command.Flags().StringVar(&listenAddr, "listen", defaultListen, "FPolicy event listener address")
+	command.Flags().StringVar(&controlPath, "control", defaultControl, "Unix control socket")
+	return command
 }
 
 func runDaemon(dbPath, listenAddr, controlPath string) error {
@@ -202,6 +183,8 @@ func handleControl(connection net.Conn, db *store.DB, stop context.CancelFunc) {
 			response.Inodes, err = db.InodesSince(request.Since)
 		case "events":
 			response.Events, err = db.EventsByPath(request.Path, request.Start, request.End)
+		case "recent":
+			response.Events, err = db.EventsSince(request.Since)
 		default:
 			response.Error = "unknown command"
 		}
@@ -212,68 +195,145 @@ func handleControl(connection net.Conn, db *store.DB, stop context.CancelFunc) {
 	_ = json.NewEncoder(connection).Encode(response)
 }
 
-func inodesCommand(args []string) {
-	flags := flag.NewFlagSet("inodes", flag.ExitOnError)
-	controlPath := flags.String("control", defaultControl, "Unix control socket")
-	sinceValue := flags.String("since", "", "inclusive RFC3339 timestamp")
-	_ = flags.Parse(args)
-	since, err := parseTime("since", *sinceValue)
-	if err != nil {
-		fatal(err)
-	}
-	requestControl(*controlPath, controlRequest{Command: "inodes", Since: since})
+func newInodesCommand() *cobra.Command {
+	var controlPath, sinceValue string
+	command := &cobra.Command{Use: "inodes", Short: "List unique inodes changed since a timestamp", RunE: func(*cobra.Command, []string) error {
+		since, err := parseTime("since", sinceValue)
+		if err != nil {
+			return err
+		}
+		response, err := callControl(controlPath, controlRequest{Command: "inodes", Since: since})
+		if err != nil {
+			return err
+		}
+		return printResponse(response)
+	}}
+	command.Flags().StringVar(&controlPath, "control", defaultControl, "Unix control socket")
+	command.Flags().StringVar(&sinceValue, "since", "", "inclusive RFC3339 timestamp")
+	_ = command.MarkFlagRequired("since")
+	return command
 }
 
-func eventsCommand(args []string) {
-	flags := flag.NewFlagSet("events", flag.ExitOnError)
-	controlPath := flags.String("control", defaultControl, "Unix control socket")
-	path := flags.String("path", "", "path prefix")
-	startValue := flags.String("start", "", "inclusive RFC3339 timestamp")
-	endValue := flags.String("end", "", "inclusive RFC3339 timestamp")
-	_ = flags.Parse(args)
-	if *path == "" {
-		fatal(errors.New("path is required"))
-	}
-	start, err := parseTime("start", *startValue)
-	if err != nil {
-		fatal(err)
-	}
-	end, err := parseTime("end", *endValue)
-	if err != nil {
-		fatal(err)
-	}
-	if end.Before(start) {
-		fatal(errors.New("end must not be before start"))
-	}
-	requestControl(*controlPath, controlRequest{Command: "events", Path: *path, Start: start, End: end})
+func newEventsCommand() *cobra.Command {
+	var controlPath, path, startValue, endValue string
+	command := &cobra.Command{Use: "events", Short: "List changes below a path during a time range", RunE: func(*cobra.Command, []string) error {
+		start, err := parseTime("start", startValue)
+		if err != nil {
+			return err
+		}
+		end, err := parseTime("end", endValue)
+		if err != nil {
+			return err
+		}
+		if end.Before(start) {
+			return errors.New("end must not be before start")
+		}
+		response, err := callControl(controlPath, controlRequest{Command: "events", Path: path, Start: start, End: end})
+		if err != nil {
+			return err
+		}
+		return printResponse(response)
+	}}
+	command.Flags().StringVar(&controlPath, "control", defaultControl, "Unix control socket")
+	command.Flags().StringVar(&path, "path", "", "path prefix")
+	command.Flags().StringVar(&startValue, "start", "", "inclusive RFC3339 timestamp")
+	command.Flags().StringVar(&endValue, "end", "", "inclusive RFC3339 timestamp")
+	_ = command.MarkFlagRequired("path")
+	_ = command.MarkFlagRequired("start")
+	_ = command.MarkFlagRequired("end")
+	return command
 }
 
-func controlCommand(command string, args []string) {
-	flags := flag.NewFlagSet(command, flag.ExitOnError)
-	controlPath := flags.String("control", defaultControl, "Unix control socket")
-	_ = flags.Parse(args)
-	requestControl(*controlPath, controlRequest{Command: command})
+func newMonitorCommand() *cobra.Command {
+	var controlPath, sinceValue, path string
+	var interval time.Duration
+	command := &cobra.Command{Use: "monitor", Short: "Print newly observed inode path changes", RunE: func(command *cobra.Command, _ []string) error {
+		if interval <= 0 {
+			return errors.New("interval must be greater than zero")
+		}
+		since := time.Now().UTC()
+		var err error
+		if sinceValue != "" {
+			since, err = parseTime("since", sinceValue)
+			if err != nil {
+				return err
+			}
+		}
+		context, cancel := signal.NotifyContext(command.Context(), os.Interrupt, syscall.SIGTERM)
+		defer cancel()
+		ticker := time.NewTicker(interval)
+		defer ticker.Stop()
+		seen := make(map[string]struct{})
+		for {
+			response, err := callControl(controlPath, controlRequest{Command: "recent", Since: since})
+			if err != nil {
+				return err
+			}
+			for _, event := range response.Events {
+				if path != "" && !strings.HasPrefix(event.Path, path) {
+					continue
+				}
+				key := fmt.Sprintf("%d:%s:%s:%s", event.Inode, event.Path, event.Operation, event.Timestamp.UTC().Format(time.RFC3339Nano))
+				if event.Timestamp.After(since) {
+					since = event.Timestamp
+					seen = make(map[string]struct{})
+				}
+				if _, exists := seen[key]; exists {
+					continue
+				}
+				seen[key] = struct{}{}
+				if err := json.NewEncoder(command.OutOrStdout()).Encode(event); err != nil {
+					return err
+				}
+			}
+			select {
+			case <-context.Done():
+				return nil
+			case <-ticker.C:
+			}
+		}
+	}}
+	command.Flags().StringVar(&controlPath, "control", defaultControl, "Unix control socket")
+	command.Flags().StringVar(&sinceValue, "since", "", "RFC3339 timestamp; defaults to now")
+	command.Flags().StringVar(&path, "path", "", "optional path prefix")
+	command.Flags().DurationVar(&interval, "interval", time.Second, "poll interval")
+	return command
 }
 
-func requestControl(controlPath string, request controlRequest) {
+func newControlCommand(name string) *cobra.Command {
+	var controlPath string
+	command := &cobra.Command{Use: name, Short: name + " the daemon", RunE: func(*cobra.Command, []string) error {
+		response, err := callControl(controlPath, controlRequest{Command: name})
+		if err != nil {
+			return err
+		}
+		return printResponse(response)
+	}}
+	command.Flags().StringVar(&controlPath, "control", defaultControl, "Unix control socket")
+	return command
+}
+
+func callControl(controlPath string, request controlRequest) (controlResponse, error) {
 	connection, err := net.Dial("unix", controlPath)
 	if err != nil {
-		fatal(fmt.Errorf("connect to daemon: %w", err))
+		return controlResponse{}, fmt.Errorf("connect to daemon: %w", err)
 	}
 	defer connection.Close()
 	if err := json.NewEncoder(connection).Encode(request); err != nil {
-		fatal(err)
+		return controlResponse{}, err
 	}
 	var response controlResponse
 	if err := json.NewDecoder(connection).Decode(&response); err != nil {
-		fatal(err)
+		return controlResponse{}, err
 	}
 	if response.Error != "" {
-		fatal(errors.New(response.Error))
+		return controlResponse{}, errors.New(response.Error)
 	}
-	if err := json.NewEncoder(os.Stdout).Encode(response); err != nil {
-		fatal(err)
-	}
+	return response, nil
+}
+
+func printResponse(response controlResponse) error {
+	return json.NewEncoder(os.Stdout).Encode(response)
 }
 
 func parseTime(name, value string) (time.Time, error) {
@@ -285,9 +345,4 @@ func parseTime(name, value string) (time.Time, error) {
 		return time.Time{}, fmt.Errorf("parse %s: %w", name, err)
 	}
 	return timestamp, nil
-}
-
-func fatal(err error) {
-	fmt.Fprintln(os.Stderr, "pathdiff:", err)
-	os.Exit(1)
 }

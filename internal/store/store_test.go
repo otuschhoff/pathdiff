@@ -33,6 +33,17 @@ func TestQueries(t *testing.T) {
 		t.Fatalf("InodesSince() = %v, want %v", inodes, want)
 	}
 
+	recent, err := db.EventsSince(base.Add(2 * time.Minute))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, want := len(recent), 3; got != want {
+		t.Fatalf("EventsSince() returned %d events, want %d", got, want)
+	}
+	if recent[0].Timestamp.Before(base.Add(2 * time.Minute)) {
+		t.Fatalf("EventsSince() included an event before its boundary: %#v", recent[0])
+	}
+
 	events, err := db.EventsByPath("/vol/data/", base, base.Add(3*time.Minute))
 	if err != nil {
 		t.Fatal(err)
