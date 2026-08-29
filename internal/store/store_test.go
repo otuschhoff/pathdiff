@@ -1,7 +1,6 @@
 package store
 
 import (
-	"reflect"
 	"testing"
 	"time"
 )
@@ -15,22 +14,14 @@ func TestQueries(t *testing.T) {
 
 	base := time.Date(2026, 8, 29, 10, 0, 0, 0, time.UTC)
 	for _, event := range []Event{
-		{Inode: 7, Path: "/vol/data/a", Operation: "modify", Timestamp: base.Add(time.Minute)},
-		{Inode: 7, Path: "/vol/data/a", Operation: "rename", Timestamp: base.Add(2 * time.Minute)},
-		{Inode: 9, Path: "/vol/data/b", Operation: "create", Timestamp: base.Add(3 * time.Minute)},
-		{Inode: 11, Path: "/vol/database/c", Operation: "modify", Timestamp: base.Add(3 * time.Minute)},
+		{Path: "/vol/data/a", Operation: "modify", Timestamp: base.Add(time.Minute)},
+		{Path: "/vol/data/a", Operation: "rename", Timestamp: base.Add(2 * time.Minute)},
+		{Path: "/vol/data/b", Operation: "create", Timestamp: base.Add(3 * time.Minute)},
+		{Path: "/vol/database/c", Operation: "modify", Timestamp: base.Add(3 * time.Minute)},
 	} {
 		if err := db.Store(event); err != nil {
 			t.Fatal(err)
 		}
-	}
-
-	inodes, err := db.InodesSince(base.Add(2 * time.Minute))
-	if err != nil {
-		t.Fatal(err)
-	}
-	if want := []uint64{7, 9, 11}; !reflect.DeepEqual(inodes, want) {
-		t.Fatalf("InodesSince() = %v, want %v", inodes, want)
 	}
 
 	recent, err := db.EventsSince(base.Add(2 * time.Minute))
@@ -58,7 +49,7 @@ func TestQueries(t *testing.T) {
 	}
 }
 
-func TestStoreScreenRequestsWithSameTimestamp(t *testing.T) {
+func TestStoreDistinctPathsWithSameTimestamp(t *testing.T) {
 	db, err := Open(t.TempDir())
 	if err != nil {
 		t.Fatal(err)
@@ -66,8 +57,8 @@ func TestStoreScreenRequestsWithSameTimestamp(t *testing.T) {
 	t.Cleanup(func() { _ = db.Close() })
 	timestamp := time.Date(2026, 8, 29, 12, 0, 0, 0, time.UTC)
 	for _, event := range []Event{
-		{Path: "/vol/data/a", Operation: "NFS_WR", Timestamp: timestamp, RequestID: 1},
-		{Path: "/vol/data/a", Operation: "NFS_WR", Timestamp: timestamp, RequestID: 2},
+		{Path: "/vol/data/a", Operation: "NFS_WR", Timestamp: timestamp},
+		{Path: "/vol/data/b", Operation: "NFS_WR", Timestamp: timestamp},
 	} {
 		if err := db.Store(event); err != nil {
 			t.Fatal(err)

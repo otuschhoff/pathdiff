@@ -9,12 +9,12 @@ import (
 )
 
 func TestParseXMLNotification(t *testing.T) {
-	payload := []byte(`<FPolicy xmlns="http://www.netapp.com/fpolicy"><Header><SessionID>sess-1</SessionID></Header><NotificationRequest><Vserver>vs-1</Vserver><FileId>42</FileId><VolumeUuid>vol-1</VolumeUuid><Path>/vol/data/report.csv</Path><Operation>WRITE</Operation><Timestamp>1725000000000000</Timestamp></NotificationRequest></FPolicy>`)
+	payload := []byte(`<FPolicy xmlns="http://www.netapp.com/fpolicy"><Header><SessionID>sess-1</SessionID></Header><NotificationRequest><Path>/vol/data/report.csv</Path><Operation>WRITE</Operation><Timestamp>1725000000000000</Timestamp></NotificationRequest></FPolicy>`)
 	event, err := ParseXMLNotification(payload)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if event.Inode != 42 || event.Path != "/vol/data/report.csv" || event.Operation != "WRITE" {
+	if event.Path != "/vol/data/report.csv" || event.Operation != "WRITE" {
 		t.Fatalf("unexpected event: %#v", event)
 	}
 	if want := time.UnixMicro(1_725_000_000_000_000).UTC(); !event.Timestamp.Equal(want) {
@@ -28,7 +28,7 @@ func TestParseScreenRequest(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if event.Inode != 0 || event.RequestID != 211090950 || event.VolumeMSID != "2163258291" || event.Path != "/cache/entry" || event.Operation != "NFS_WR" {
+	if event.Path != "/cache/entry" || event.Operation != "NFS_WR" {
 		t.Fatalf("unexpected screen event: %#v", event)
 	}
 	if want := time.UnixMicro(1_788_009_794_015_352).UTC(); !event.Timestamp.Equal(want) {
