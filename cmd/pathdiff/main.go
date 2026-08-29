@@ -829,8 +829,157 @@ func newCDOTCommand() *cobra.Command {
 
 func newFPolicyCommand() *cobra.Command {
 	fpolicy := &cobra.Command{Use: "fpolicy", Short: "Inspect and manage cDOT FPolicy policies"}
-	fpolicy.AddCommand(newFPolicyListCommand(), newFPolicyScopeCommand(), newFPolicyStartCommand(), newFPolicyStopCommand())
+	fpolicy.AddCommand(newFPolicyListCommand(), newFPolicyScopeCommand(), newFPolicyCreateCommand(), newFPolicyStartCommand(), newFPolicyStopCommand())
 	return fpolicy
+}
+
+func newFPolicyCreateCommand() *cobra.Command {
+	var keyFile, knownHostsFile string
+	var acceptNewHostKey, debugSSHExec bool
+	command := &cobra.Command{Use: "create [<svmWildcardSearch>]", Args: cobra.MaximumNArgs(1), Short: "Print FPolicy setup commands for unconfigured SVMs", RunE: func(command *cobra.Command, arguments []string) error {
+		host, _ := command.Flags().GetString("host")
+		user, _ := command.Flags().GetString("user")
+		if host == "" {
+			return errors.New("host is required")
+		}
+		keyPath, err := cdotKeyFile(keyFile)
+		if err != nil {
+			return err
+		}
+		if knownHostsFile == "" {
+			knownHostsFile, err = cdotKnownHostsFile()
+			if err != nil {
+				return err
+			}
+		}
+		endpoint, err := pathdiffEndpoint()
+		if err != nil {
+			return err
+		}
+		client, err := openCDOTClient(host, user, keyPath, knownHostsFile, acceptNewHostKey)
+		if err != nil {
+			return err
+		}
+		defer client.Close()
+		var debugWriter io.Writer
+		if debugSSHExec {
+			debugWriter = command.ErrOrStderr()
+		}
+		policyOutput, err := runSSHCommand(client, fpolicyPolicyShowCommand+" -instance", debugWriter)
+		if err != nil {
+			return fmt.Errorf("query cDOT FPolicy policies: %w: %s", err, strings.TrimSpace(string(policyOutput)))
+		}
+		engineOutput, err := runSSHCommand(client, "vserver fpolicy policy external-engine show -instance", debugWriter)
+		if err != nil {
+			return fmt.Errorf("query cDOT FPolicy external engines: %w: %s", err, strings.TrimSpace(string(engineOutput)))
+		}
+		svmOutput, err := runSSHCommand(client, "vserver show -instance", debugWriter)
+		if err != nil {
+			return fmt.Errorf("query cDOT SVMs: %w: %s", err, strings.TrimSpace(string(svmOutput)))
+		}
+		sequenceOutput, err := runSSHCommand(client, "vserver fpolicy show -instance", debugWriter)
+		if err != nil {
+			sequenceOutput = nil
+		}
+		pattern := "*"
+		if len(arguments) == 1 {
+			pattern = arguments[0]
+		}
+		policies := parseFPolicyPolicies(string(policyOutput), string(engineOutput))
+		plans := fpolicyCreatePlans(parseONTAPInstances(string(svmOutput)), policies, parseONTAPInstances(string(sequenceOutput)), pattern, endpoint)
+		if len(plans) == 0 {
+			return errors.New("no unconfigured data SVMs matched")
+		}
+		return printFPolicyCreateCommands(command.OutOrStdout(), plans)
+	}}
+	addCDOTConnectionFlags(command, &keyFile, &knownHostsFile, &acceptNewHostKey, &debugSSHExec)
+	return command
+}
+
+type fpolicyCreatePlan struct {
+	SVM      string
+	TargetIP string
+	Port     string
+	Sequence int
+}
+
+func fpolicyCreatePlans(svms []map[string]string, policies []fpolicyPolicy, sequences []map[string]string, pattern string, endpoint *net.TCPAddr) []fpolicyCreatePlan {
+	configured := make(map[string]bool)
+	policyCount := make(map[string]int)
+	for _, policy := range policies {
+		policyCount[policy.SVM]++
+		if wildcardContains(policy.Name, "pathdiff*") || wildcardContains(policy.Engine, "pathdiff*") {
+			configured[policy.SVM] = true
+		}
+	}
+	nextSequence := make(map[string]int)
+	for _, record := range sequences {
+		svm := instanceField(record, "Vserver")
+		sequence, err := strconv.Atoi(firstInstanceField(record, "Sequence Number", "Sequence"))
+		if err == nil && sequence >= nextSequence[svm] {
+			nextSequence[svm] = sequence + 1
+		}
+	}
+	var plans []fpolicyCreatePlan
+	for _, record := range svms {
+		svm := instanceField(record, "Vserver")
+		if svm == "" || configured[svm] || !wildcardContains(svm, pattern) {
+			continue
+		}
+		if vserverType := strings.ToLower(firstInstanceField(record, "Vserver Type", "Type")); vserverType != "" && vserverType != "data" {
+			continue
+		}
+		sequence := nextSequence[svm]
+		if sequence == 0 {
+			sequence = policyCount[svm] + 1
+		}
+		plans = append(plans, fpolicyCreatePlan{SVM: svm, TargetIP: endpoint.IP.String(), Port: strconv.Itoa(endpoint.Port), Sequence: sequence})
+	}
+	sort.Slice(plans, func(left, right int) bool { return plans[left].SVM < plans[right].SVM })
+	return plans
+}
+
+func pathdiffEndpoint() (*net.TCPAddr, error) {
+	listenAddr := defaultListen
+	if unitPath, err := systemdUserUnitPath(); err == nil {
+		if unit, err := os.ReadFile(unitPath); err == nil {
+			if match := regexp.MustCompile(`--listen\s+("[^"]*"|\S+)`).FindStringSubmatch(string(unit)); len(match) == 2 {
+				if value, err := strconv.Unquote(match[1]); err == nil {
+					listenAddr = value
+				}
+			}
+		}
+	}
+	host, port, err := net.SplitHostPort(listenAddr)
+	if err != nil {
+		return nil, fmt.Errorf("parse pathdiff listener %q: %w", listenAddr, err)
+	}
+	if host == "" || host == "0.0.0.0" || host == "::" {
+		for _, address := range localAddresses() {
+			if ip := net.ParseIP(address); ip != nil && ip.To4() != nil {
+				host = ip.String()
+				break
+			}
+		}
+	}
+	if ip := net.ParseIP(host); ip == nil || ip.To4() == nil {
+		return nil, fmt.Errorf("resolve pathdiff listener IPv4 address from %q", listenAddr)
+	}
+	return net.ResolveTCPAddr("tcp4", net.JoinHostPort(host, port))
+}
+
+func printFPolicyCreateCommands(writer io.Writer, plans []fpolicyCreatePlan) error {
+	for index, plan := range plans {
+		if index > 0 {
+			_, _ = fmt.Fprintln(writer)
+		}
+		_, _ = fmt.Fprintf(writer, "vserver fpolicy policy external-engine create -vserver %s -engine-name pathdiff -primary-servers %s -port %s -ssl-option no-auth -extern-engine-type asynchronous -extern-engine-format xml\n", plan.SVM, plan.TargetIP, plan.Port)
+		_, _ = fmt.Fprintf(writer, "vserver fpolicy policy event create -vserver %s -event-name pathdiff_events -protocol nfsv3 -file-operations create,delete,write,rename,setattr -filters first-write,setattr-with-modify-time-change\n", plan.SVM)
+		_, _ = fmt.Fprintf(writer, "vserver fpolicy policy create -vserver %s -policy-name pathdiff_policy -events pathdiff_events -engine pathdiff -is-mandatory false\n", plan.SVM)
+		_, _ = fmt.Fprintf(writer, "vserver fpolicy policy scope create -vserver %s -policy-name pathdiff_policy -volumes-to-include *\n", plan.SVM)
+		_, _ = fmt.Fprintf(writer, "vserver fpolicy enable -vserver %s -policy-name pathdiff_policy -sequence-number %d\n", plan.SVM, plan.Sequence)
+	}
+	return nil
 }
 
 func newFPolicyListCommand() *cobra.Command {
@@ -977,10 +1126,17 @@ type fpolicyPolicy struct {
 }
 
 type fpolicyScope struct {
-	SVM    string
-	Engine string
-	Policy string
-	Scope  string
+	SVM           string
+	Engine        string
+	Policy        string
+	VolumeExcl    string
+	VolumeIncl    string
+	ShareExcl     string
+	ShareIncl     string
+	ExtensionExcl string
+	ExtensionIncl string
+	ExportExcl    string
+	ExportIncl    string
 }
 
 func addCDOTConnectionFlags(command *cobra.Command, keyFile, knownHostsFile *string, acceptNewHostKey, debugSSHExec *bool) {
@@ -1128,14 +1284,19 @@ func parseFPolicyScopes(output string, policies []fpolicyPolicy) []fpolicyScope 
 	for _, record := range parseONTAPInstances(output) {
 		svm := instanceField(record, "Vserver")
 		policy := firstInstanceField(record, "Policy", "Policy Name", "Name")
-		parts := make([]string, 0, len(record))
-		for name, value := range record {
-			if value != "" && !strings.EqualFold(name, "Vserver") && !strings.EqualFold(name, "Policy") && !strings.EqualFold(name, "Policy Name") && !strings.EqualFold(name, "Name") {
-				parts = append(parts, name+": "+value)
-			}
-		}
-		sort.Strings(parts)
-		scopes = append(scopes, fpolicyScope{SVM: svm, Engine: engines[svm+"\x00"+policy], Policy: policy, Scope: strings.Join(parts, "; ")})
+		scopes = append(scopes, fpolicyScope{
+			SVM:           svm,
+			Engine:        engines[svm+"\x00"+policy],
+			Policy:        policy,
+			VolumeExcl:    instanceField(record, "Volumes to Exclude"),
+			VolumeIncl:    instanceField(record, "Volumes to Include"),
+			ShareExcl:     instanceField(record, "Shares to Exclude"),
+			ShareIncl:     instanceField(record, "Shares to Include"),
+			ExtensionExcl: instanceField(record, "File Extensions to Exclude"),
+			ExtensionIncl: instanceField(record, "File Extensions to Include"),
+			ExportExcl:    instanceField(record, "Export Policies to Exclude"),
+			ExportIncl:    instanceField(record, "Export Policies to Include"),
+		})
 	}
 	return scopes
 }
@@ -1152,12 +1313,22 @@ func filterFPolicyScopes(scopes []fpolicyScope, svmPattern string, all bool) []f
 
 func printFPolicyScopes(writer io.Writer, scopes []fpolicyScope) error {
 	tableWriter := newTableWriter(writer)
-	tableWriter.AppendHeader(table.Row{"SVM", "Engine", "Policy Class", "Scope"})
+	tableWriter.AppendHeader(table.Row{"SVM", "Engine", "Policy Class", "Vol Excl", "Vol Incl", "Share Excl", "Share Incl", "Ext Excl", "Ext Incl", "Export Excl", "Export Incl"})
 	for _, scope := range scopes {
-		tableWriter.AppendRow(table.Row{scope.SVM, scope.Engine, scope.Policy, scope.Scope})
+		tableWriter.AppendRow(table.Row{scope.SVM, scope.Engine, scope.Policy, formatFPolicyScopeValue(scope.VolumeExcl, text.FgYellow, true), formatFPolicyScopeValue(scope.VolumeIncl, text.FgGreen, true), formatFPolicyScopeValue(scope.ShareExcl, text.FgBlack, false), formatFPolicyScopeValue(scope.ShareIncl, text.FgBlack, false), formatFPolicyScopeValue(scope.ExtensionExcl, text.FgBlack, false), formatFPolicyScopeValue(scope.ExtensionIncl, text.FgBlack, false), formatFPolicyScopeValue(scope.ExportExcl, text.FgBlack, false), formatFPolicyScopeValue(scope.ExportIncl, text.FgBlack, false)})
 	}
 	tableWriter.Render()
 	return nil
+}
+
+func formatFPolicyScopeValue(value string, color text.Color, highlight bool) string {
+	if value == "-" {
+		return text.FgHiBlack.Sprint(value)
+	}
+	if highlight {
+		return color.Sprint(value)
+	}
+	return value
 }
 
 func printFPolicyAction(writer io.Writer, policies []fpolicyPolicy, state string) error {
@@ -1899,11 +2070,10 @@ func newServiceMonitorCommand() *cobra.Command {
 }
 
 func ensureSystemdUnit(dbPath, listenAddr, controlPath, recordDir string, verbose bool) (string, bool, error) {
-	home, err := os.UserHomeDir()
+	unitPath, err := systemdUserUnitPath()
 	if err != nil {
 		return "", false, err
 	}
-	unitPath := filepath.Join(home, ".config", "systemd", "user", "pathdiff.service")
 	if _, err := os.Stat(unitPath); err == nil {
 		return unitPath, false, nil
 	} else if !errors.Is(err, os.ErrNotExist) {
@@ -1928,6 +2098,14 @@ func ensureSystemdUnit(dbPath, listenAddr, controlPath, recordDir string, verbos
 		return "", false, err
 	}
 	return unitPath, true, nil
+}
+
+func systemdUserUnitPath() (string, error) {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(home, ".config", "systemd", "user", "pathdiff.service"), nil
 }
 
 func runSystemctlUser(arguments ...string) error {

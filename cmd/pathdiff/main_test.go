@@ -389,6 +389,30 @@ func TestParseFPolicyPolicies(t *testing.T) {
 	}
 }
 
+func TestParseFPolicyScopes(t *testing.T) {
+	policies := []fpolicyPolicy{{SVM: "finance", Name: "track_inode_changes", Engine: "pathdiff"}}
+	scopes := parseFPolicyScopes("Vserver: finance\nPolicy: track_inode_changes\nVolumes to Exclude: temporary\nVolumes to Include: *\nShares to Exclude: -\nShares to Include: reports\nFile Extensions to Exclude: tmp\nFile Extensions to Include: csv\nExport Policies to Exclude: legacy\nExport Policies to Include: approved\n", policies)
+	if len(scopes) != 1 {
+		t.Fatalf("scopes = %#v", scopes)
+	}
+	scope := scopes[0]
+	if scope.Engine != "pathdiff" || scope.VolumeExcl != "temporary" || scope.VolumeIncl != "*" || scope.ShareExcl != "-" || scope.ShareIncl != "reports" || scope.ExtensionExcl != "tmp" || scope.ExtensionIncl != "csv" || scope.ExportExcl != "legacy" || scope.ExportIncl != "approved" {
+		t.Fatalf("unexpected scope: %#v", scope)
+	}
+}
+
+func TestFormatFPolicyScopeValue(t *testing.T) {
+	if got := formatFPolicyScopeValue("-", text.FgYellow, true); got != text.FgHiBlack.Sprint("-") {
+		t.Fatalf("formatFPolicyScopeValue(-) = %q", got)
+	}
+	if got := formatFPolicyScopeValue("*", text.FgGreen, true); got != text.FgGreen.Sprint("*") {
+		t.Fatalf("formatFPolicyScopeValue(*) = %q", got)
+	}
+	if got := formatFPolicyScopeValue("nfs_os", text.FgYellow, true); got != text.FgYellow.Sprint("nfs_os") {
+		t.Fatalf("formatFPolicyScopeValue(nfs_os) = %q", got)
+	}
+}
+
 func TestFPolicyActionCommands(t *testing.T) {
 	fpolicy := newFPolicyCommand()
 	for _, name := range []string{"start", "stop"} {
@@ -399,6 +423,31 @@ func TestFPolicyActionCommands(t *testing.T) {
 		if all, err := command.Flags().GetBool("all"); err != nil || all {
 			t.Fatalf("%s --all = %t, err = %v", name, all, err)
 		}
+	}
+}
+
+func TestFPolicyCreatePlans(t *testing.T) {
+	svms := []map[string]string{
+		{"Vserver": "finance", "Vserver Type": "data"},
+		{"Vserver": "engineering", "Vserver Type": "data"},
+		{"Vserver": "admin", "Vserver Type": "admin"},
+	}
+	policies := []fpolicyPolicy{{SVM: "finance", Name: "pathdiff_policy", Engine: "pathdiff"}, {SVM: "engineering", Name: "existing_policy", Engine: "other"}}
+	sequences := []map[string]string{{"Vserver": "engineering", "Sequence Number": "4"}}
+	plans := fpolicyCreatePlans(svms, policies, sequences, "*", &net.TCPAddr{IP: net.ParseIP("192.0.2.10"), Port: 9911})
+	if len(plans) != 1 || plans[0] != (fpolicyCreatePlan{SVM: "engineering", TargetIP: "192.0.2.10", Port: "9911", Sequence: 5}) {
+		t.Fatalf("plans = %#v", plans)
+	}
+	var output bytes.Buffer
+	if err := printFPolicyCreateCommands(&output, plans); err != nil {
+		t.Fatal(err)
+	}
+	if got := output.String(); !strings.Contains(got, "-primary-servers 192.0.2.10 -port 9911") || !strings.Contains(got, "-sequence-number 5") || strings.Contains(got, "finance") {
+		t.Fatalf("unexpected create commands: %s", got)
+	}
+	fallback := fpolicyCreatePlans(svms, policies, nil, "engineering", &net.TCPAddr{IP: net.ParseIP("192.0.2.10"), Port: 9911})
+	if len(fallback) != 1 || fallback[0].Sequence != 2 {
+		t.Fatalf("fallback sequence plans = %#v", fallback)
 	}
 }
 
