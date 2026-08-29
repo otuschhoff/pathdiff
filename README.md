@@ -45,6 +45,9 @@ bin/pathdiff path list firefox --start 10d
 bin/pathdiff path parent --path /vol/finance/ --sort timestamp --max 250
 bin/pathdiff db status
 bin/pathdiff db event reset
+bin/pathdiff volume list
+bin/pathdiff svm set --id 5b701784-7459-11e8-8e95-00a098bc5a13 --name finance
+bin/pathdiff svm list
 ```
 
 `monitor` prints newly observed events as JSON lines until interrupted. Add `--since RFC3339` to replay changes from a particular timestamp. The default control socket is `/tmp/pathdiff.sock`; set `--control` on both daemon and client to use another socket. The daemon commits both time and path indexes atomically to Pebble. Configure the FPolicy receiver or a protocol adapter to emit the line-delimited JSON above.
@@ -75,9 +78,12 @@ Native synchronous `SCREEN_REQ` messages are also stored as audit events using t
 
 ```sh
 bin/pathdiff volume set --msid 2163258291 --name asic_user
+bin/pathdiff volume list
 ```
 
 Subsequent query and monitor output resolves that ID as `volume_name` without rewriting historic event records.
+
+`svm set --id <uuid> --name <name>` persists an SVM UUID-to-name mapping, and `svm list` renders configured SVM mappings. Both SVM and volume mapping commands operate through the running daemon's control socket.
 
 ## Tasks
 

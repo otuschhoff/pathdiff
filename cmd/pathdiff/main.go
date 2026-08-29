@@ -46,17 +46,20 @@ type controlRequest struct {
 	End        time.Time `json:"end,omitempty"`
 	VolumeMSID string    `json:"volume_msid,omitempty"`
 	VolumeName string    `json:"volume_name,omitempty"`
+	SVMID      string    `json:"svm_id,omitempty"`
+	SVMName    string    `json:"svm_name,omitempty"`
 }
 
 type controlResponse struct {
-	Error       string        `json:"error,omitempty"`
-	Status      string        `json:"status,omitempty"`
-	Connections int           `json:"connections,omitempty"`
-	EventCount  uint64        `json:"event_count,omitempty"`
-	DBPath      string        `json:"db_path,omitempty"`
-	DBSize      uint64        `json:"db_size,omitempty"`
-	Events      []store.Event `json:"events,omitempty"`
-	Engines     []engineInfo  `json:"engines,omitempty"`
+	Error       string          `json:"error,omitempty"`
+	Status      string          `json:"status,omitempty"`
+	Connections int             `json:"connections,omitempty"`
+	EventCount  uint64          `json:"event_count,omitempty"`
+	DBPath      string          `json:"db_path,omitempty"`
+	DBSize      uint64          `json:"db_size,omitempty"`
+	Events      []store.Event   `json:"events,omitempty"`
+	Engines     []engineInfo    `json:"engines,omitempty"`
+	Mappings    []store.Mapping `json:"mappings,omitempty"`
 }
 
 func main() {
@@ -68,7 +71,7 @@ func main() {
 func newRootCommand() *cobra.Command {
 	root := &cobra.Command{Use: "pathdiff", Short: "Store and inspect FPolicy path changes", SilenceUsage: true}
 	root.AddGroup(&cobra.Group{ID: "queries", Title: "Query Commands:"}, &cobra.Group{ID: "management", Title: "Management Commands:"}, &cobra.Group{ID: "service", Title: "Service Commands:"}, &cobra.Group{ID: "other", Title: "Other Commands:"})
-	root.AddCommand(newDaemonCommand(), newEventsCommand(), newPathCommand(), newVolumeCommand(), newDBCommand(), newEngineCommand(), newServiceCommand())
+	root.AddCommand(newDaemonCommand(), newEventsCommand(), newPathCommand(), newVolumeCommand(), newSVMCommand(), newDBCommand(), newEngineCommand(), newServiceCommand())
 	root.SetHelpCommandGroupID("other")
 	root.InitDefaultCompletionCmd()
 	root.CompletionOptions.HiddenDefaultCmd = false
@@ -79,7 +82,7 @@ func newRootCommand() *cobra.Command {
 		switch command.Name() {
 		case "events", "path":
 			command.GroupID = "queries"
-		case "volume", "db", "engine":
+		case "volume", "svm", "db", "engine":
 			command.GroupID = "management"
 		case "service":
 			command.GroupID = "service"
@@ -608,6 +611,15 @@ func handleControl(connection net.Conn, db *store.DB, stop context.CancelFunc, t
 			if err == nil {
 				response.Status = "updated"
 			}
+		case "volume-list":
+			response.Mappings, err = db.ListVolumeMappings()
+		case "svm-set":
+			err = db.SetSVMName(request.SVMID, request.SVMName)
+			if err == nil {
+				response.Status = "updated"
+			}
+		case "svm-list":
+			response.Mappings, err = db.ListSVMMappings()
 		case "events-reset":
 			err = db.ResetEvents()
 			if err == nil {
@@ -713,8 +725,56 @@ func newVolumeCommand() *cobra.Command {
 	set.Flags().StringVar(&name, "name", "", "volume name")
 	_ = set.MarkFlagRequired("msid")
 	_ = set.MarkFlagRequired("name")
+	var listControlPath string
+	list := &cobra.Command{Use: "list", Short: "List volume MSID mappings", RunE: func(command *cobra.Command, _ []string) error {
+		response, err := callControl(listControlPath, controlRequest{Command: "volume-list"})
+		if err != nil {
+			return err
+		}
+		return printMappings(command.OutOrStdout(), "Volume", "MSID", response.Mappings)
+	}}
+	list.Flags().StringVar(&listControlPath, "control", defaultControl, "Unix control socket")
 	volume.AddCommand(set)
+	volume.AddCommand(list)
 	return volume
+}
+
+func newSVMCommand() *cobra.Command {
+	svm := &cobra.Command{Use: "svm", Short: "Manage SVM ID mappings"}
+	var setControlPath, id, name string
+	set := &cobra.Command{Use: "set", Short: "Map an SVM ID to an SVM name", RunE: func(command *cobra.Command, _ []string) error {
+		response, err := callControl(setControlPath, controlRequest{Command: "svm-set", SVMID: id, SVMName: name})
+		if err != nil {
+			return err
+		}
+		return printResponse(response)
+	}}
+	set.Flags().StringVar(&setControlPath, "control", defaultControl, "Unix control socket")
+	set.Flags().StringVar(&id, "id", "", "ONTAP SVM ID")
+	set.Flags().StringVar(&name, "name", "", "SVM name")
+	_ = set.MarkFlagRequired("id")
+	_ = set.MarkFlagRequired("name")
+	var listControlPath string
+	list := &cobra.Command{Use: "list", Short: "List SVM ID mappings", RunE: func(command *cobra.Command, _ []string) error {
+		response, err := callControl(listControlPath, controlRequest{Command: "svm-list"})
+		if err != nil {
+			return err
+		}
+		return printMappings(command.OutOrStdout(), "SVM", "ID", response.Mappings)
+	}}
+	list.Flags().StringVar(&listControlPath, "control", defaultControl, "Unix control socket")
+	svm.AddCommand(set, list)
+	return svm
+}
+
+func printMappings(writer io.Writer, nameColumn, idColumn string, mappings []store.Mapping) error {
+	tableWriter := newTableWriter(writer)
+	tableWriter.AppendHeader(table.Row{nameColumn, idColumn})
+	for _, mapping := range mappings {
+		tableWriter.AppendRow(table.Row{mapping.Name, mapping.ID})
+	}
+	tableWriter.Render()
+	return nil
 }
 
 func newServiceCommand() *cobra.Command {
