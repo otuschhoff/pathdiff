@@ -56,6 +56,7 @@ type controlResponse struct {
 	DBPath      string        `json:"db_path,omitempty"`
 	DBSize      uint64        `json:"db_size,omitempty"`
 	Events      []store.Event `json:"events,omitempty"`
+	Engines     []engineInfo  `json:"engines,omitempty"`
 }
 
 func main() {
@@ -67,7 +68,7 @@ func main() {
 func newRootCommand() *cobra.Command {
 	root := &cobra.Command{Use: "pathdiff", Short: "Store and inspect FPolicy path changes", SilenceUsage: true}
 	root.AddGroup(&cobra.Group{ID: "queries", Title: "Query Commands:"}, &cobra.Group{ID: "management", Title: "Management Commands:"}, &cobra.Group{ID: "service", Title: "Service Commands:"}, &cobra.Group{ID: "other", Title: "Other Commands:"})
-	root.AddCommand(newDaemonCommand(), newEventsCommand(), newPathCommand(), newVolumeCommand(), newDBCommand(), newServiceCommand())
+	root.AddCommand(newDaemonCommand(), newEventsCommand(), newPathCommand(), newVolumeCommand(), newDBCommand(), newEngineCommand(), newServiceCommand())
 	root.SetHelpCommandGroupID("other")
 	root.InitDefaultCompletionCmd()
 	root.CompletionOptions.HiddenDefaultCmd = false
@@ -78,7 +79,7 @@ func newRootCommand() *cobra.Command {
 		switch command.Name() {
 		case "events", "path":
 			command.GroupID = "queries"
-		case "volume", "db":
+		case "volume", "db", "engine":
 			command.GroupID = "management"
 		case "service":
 			command.GroupID = "service"
@@ -165,7 +166,7 @@ func acceptEvents(context context.Context, listener net.Listener, db *store.DB, 
 			activeConnections.Add(connection)
 			defer activeConnections.Remove(connection)
 			sender := senderName(connection.RemoteAddr())
-			trackers.connect(sender)
+			trackers.connect(sender, connection.LocalAddr())
 			defer trackers.disconnect(sender)
 			activeConnection := connection
 			if recordDir != "" {
@@ -227,19 +228,46 @@ type senderStats struct {
 	protocol       string
 	intervalEvents uint64
 	totalEvents    uint64
+	connectedSince time.Time
+	localPort      string
+	nodeID         string
+	svmID          string
+}
+
+type engineInfo struct {
+	Since       time.Time `json:"since"`
+	TotalEvents uint64    `json:"total_events"`
+	AverageRate float64   `json:"average_events_per_second"`
+	LIFIPv4     string    `json:"lif_ipv4"`
+	LIFHostname string    `json:"lif_hostname,omitempty"`
+	NodeID      string    `json:"node_id,omitempty"`
+	SVMID       string    `json:"svm_id,omitempty"`
+	LocalPort   string    `json:"local_port"`
 }
 
 func newSenderTracker(verbose bool) *senderTracker {
 	return &senderTracker{verbose: verbose, senders: make(map[string]*senderStats)}
 }
 
-func (t *senderTracker) connect(sender string) {
+func (t *senderTracker) connect(sender string, localAddress net.Addr) {
 	t.mu.Lock()
 	stats := t.sender(sender)
+	if stats.active == 0 {
+		stats.connectedSince = time.Now().UTC()
+		_, stats.localPort, _ = net.SplitHostPort(localAddress.String())
+	}
 	stats.active++
 	active := stats.active
 	t.mu.Unlock()
 	t.logf("sender=%s state=connected active_connections=%d", sender, active)
+}
+
+func (t *senderTracker) negotiated(sender, nodeID, svmID string) {
+	t.mu.Lock()
+	stats := t.sender(sender)
+	stats.nodeID = nodeID
+	stats.svmID = svmID
+	t.mu.Unlock()
 }
 
 func (t *senderTracker) disconnect(sender string) {
@@ -280,6 +308,25 @@ func (t *senderTracker) connectionCount() int {
 		count += stats.active
 	}
 	return count
+}
+
+func (t *senderTracker) engines() []engineInfo {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	now := time.Now().UTC()
+	engines := make([]engineInfo, 0, len(t.senders))
+	for lifIPv4, stats := range t.senders {
+		if stats.active == 0 {
+			continue
+		}
+		elapsed := now.Sub(stats.connectedSince).Seconds()
+		average := 0.0
+		if elapsed > 0 {
+			average = float64(stats.totalEvents) / elapsed
+		}
+		engines = append(engines, engineInfo{Since: stats.connectedSince, TotalEvents: stats.totalEvents, AverageRate: average, LIFIPv4: lifIPv4, NodeID: stats.nodeID, SVMID: stats.svmID, LocalPort: stats.localPort})
+	}
+	return engines
 }
 
 func (t *senderTracker) reportEvery(context context.Context, interval time.Duration) {
@@ -439,6 +486,7 @@ func readONTAPXMLEvents(reader *bufio.Reader, connection net.Conn, db *store.DB,
 		fmt.Fprintf(os.Stderr, "write ONTAP XML handshake response to %s: %v\n", connection.RemoteAddr(), err)
 		return
 	}
+	trackers.negotiated(sender, message.NodeID, message.VserverUUID)
 	trackers.logf("sender=%s state=negotiated protocol=ontap-xml policy=%s vserver_uuid=%s", sender, message.PolicyName, message.VserverUUID)
 
 	for {
@@ -546,6 +594,8 @@ func handleControl(connection net.Conn, db *store.DB, stop context.CancelFunc, t
 			response.Status = "running"
 			response.Connections = trackers.connectionCount()
 			response.EventCount, err = db.EventCount()
+		case "engines":
+			response.Engines = trackers.engines()
 		case "stop":
 			response.Status = "stopping"
 			stop()
@@ -603,6 +653,41 @@ func newDBCommand() *cobra.Command {
 	database.AddCommand(status)
 	database.AddCommand(event)
 	return database
+}
+
+func newEngineCommand() *cobra.Command {
+	engine := &cobra.Command{Use: "engine", Short: "Inspect connected FPolicy engines"}
+	var controlPath string
+	list := &cobra.Command{Use: "list", Short: "List active FPolicy engines", RunE: func(command *cobra.Command, _ []string) error {
+		response, err := callControl(controlPath, controlRequest{Command: "engines"})
+		if err != nil {
+			return err
+		}
+		return printEngines(command.OutOrStdout(), response.Engines)
+	}}
+	list.Flags().StringVar(&controlPath, "control", defaultControl, "Unix control socket")
+	engine.AddCommand(list)
+	return engine
+}
+
+func printEngines(writer io.Writer, engines []engineInfo) error {
+	sort.Slice(engines, func(left, right int) bool { return engines[left].LIFIPv4 < engines[right].LIFIPv4 })
+	tableWriter := newTableWriter(writer)
+	tableWriter.AppendHeader(table.Row{"Since", "Total Events", "Avg Event/s", "LIF IPv4", "LIF Hostname", "Node ID", "SVM ID", "Local Port"})
+	for _, engine := range engines {
+		engine.LIFHostname = resolveHostname(engine.LIFIPv4)
+		tableWriter.AppendRow(table.Row{engine.Since.UTC().Format(time.RFC3339), formatCount(engine.TotalEvents), fmt.Sprintf("%.2f", engine.AverageRate), engine.LIFIPv4, engine.LIFHostname, engine.NodeID, engine.SVMID, engine.LocalPort})
+	}
+	tableWriter.Render()
+	return nil
+}
+
+func resolveHostname(address string) string {
+	names, err := net.LookupAddr(address)
+	if err != nil || len(names) == 0 {
+		return ""
+	}
+	return strings.TrimSuffix(names[0], ".")
 }
 
 func printDBStatus(writer io.Writer, response controlResponse) error {

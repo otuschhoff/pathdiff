@@ -21,6 +21,7 @@ type ONTAPMessage struct {
 	Type        string
 	Session     string
 	VserverUUID string
+	NodeID      string
 	PolicyName  string
 	Payload     []byte
 }
@@ -60,6 +61,7 @@ func ReadONTAPXMLFrame(reader io.Reader) (ONTAPMessage, error) {
 		}
 		var handshake struct {
 			VserverUUID string `xml:"VsUUID"`
+			NodeID      string `xml:"NodeId"`
 			PolicyName  string `xml:"PolicyName"`
 			Session     string `xml:"SessionId"`
 		}
@@ -68,6 +70,7 @@ func ReadONTAPXMLFrame(reader io.Reader) (ONTAPMessage, error) {
 		}
 		message.Session = handshake.Session
 		message.VserverUUID = handshake.VserverUUID
+		message.NodeID = handshake.NodeID
 		message.PolicyName = handshake.PolicyName
 	}
 	return message, nil
