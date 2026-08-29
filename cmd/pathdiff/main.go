@@ -12,6 +12,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -549,11 +550,12 @@ func newVolumeCommand() *cobra.Command {
 func newEventsCommand() *cobra.Command {
 	var controlPath, path, startValue, endValue string
 	command := &cobra.Command{Use: "events", Short: "List changes below a path during a time range", RunE: func(*cobra.Command, []string) error {
-		start, err := parseTime("start", startValue)
+		now := time.Now().UTC()
+		start, err := parseTimeExpression("start", startValue, now, -24*time.Hour)
 		if err != nil {
 			return err
 		}
-		end, err := parseTime("end", endValue)
+		end, err := parseTimeExpression("end", endValue, now, 0)
 		if err != nil {
 			return err
 		}
@@ -568,11 +570,9 @@ func newEventsCommand() *cobra.Command {
 	}}
 	command.Flags().StringVar(&controlPath, "control", defaultControl, "Unix control socket")
 	command.Flags().StringVar(&path, "path", "", "path prefix")
-	command.Flags().StringVar(&startValue, "start", "", "inclusive RFC3339 timestamp")
-	command.Flags().StringVar(&endValue, "end", "", "inclusive RFC3339 timestamp")
+	command.Flags().StringVar(&startValue, "start", "", "inclusive time; RFC3339, YYYY-MM-DD, or relative duration (default 24h ago)")
+	command.Flags().StringVar(&endValue, "end", "", "inclusive time; RFC3339, YYYY-MM-DD, or relative duration (default now)")
 	_ = command.MarkFlagRequired("path")
-	_ = command.MarkFlagRequired("start")
-	_ = command.MarkFlagRequired("end")
 	return command
 }
 
@@ -677,4 +677,52 @@ func parseTime(name, value string) (time.Time, error) {
 		return time.Time{}, fmt.Errorf("parse %s: %w", name, err)
 	}
 	return timestamp, nil
+}
+
+func parseTimeExpression(name, value string, now time.Time, defaultOffset time.Duration) (time.Time, error) {
+	if value == "" {
+		return now.Add(defaultOffset), nil
+	}
+	if timestamp, err := time.Parse(time.RFC3339Nano, value); err == nil {
+		return timestamp, nil
+	}
+	if date, err := time.Parse("2006-01-02", value); err == nil {
+		return date, nil
+	}
+
+	remaining := value
+	months, days := 0, 0
+	duration := time.Duration(0)
+	monthSeen := false
+	for remaining != "" {
+		index := 0
+		for index < len(remaining) && remaining[index] >= '0' && remaining[index] <= '9' {
+			index++
+		}
+		if index == 0 || index == len(remaining) {
+			return time.Time{}, fmt.Errorf("parse %s: invalid time expression %q", name, value)
+		}
+		amount, err := strconv.Atoi(remaining[:index])
+		if err != nil {
+			return time.Time{}, fmt.Errorf("parse %s: %w", name, err)
+		}
+		unit := remaining[index]
+		remaining = remaining[index+1:]
+		switch unit {
+		case 'd':
+			days += amount
+		case 'h':
+			duration += time.Duration(amount) * time.Hour
+		case 'm':
+			if !monthSeen && duration == 0 && days == 0 {
+				months += amount
+				monthSeen = true
+			} else {
+				duration += time.Duration(amount) * time.Minute
+			}
+		default:
+			return time.Time{}, fmt.Errorf("parse %s: unsupported unit %q", name, unit)
+		}
+	}
+	return now.AddDate(0, -months, -days).Add(-duration), nil
 }
