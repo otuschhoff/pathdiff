@@ -25,7 +25,7 @@ import (
 )
 
 const (
-	defaultDB      = "./pathdiff.db"
+	defaultDB      = "pathdiff_data"
 	defaultControl = "/tmp/pathdiff.sock"
 	defaultListen  = ":9911"
 )
@@ -174,12 +174,30 @@ func readFramedEvents(reader *bufio.Reader, connection net.Conn, db *store.DB) {
 		fmt.Fprintf(os.Stderr, "read framed handshake from %s: %v\n", connection.RemoteAddr(), err)
 		return
 	}
-	if err := fpolicy.WriteFrame(connection, nil); err != nil {
-		fmt.Fprintf(os.Stderr, "write framed handshake response to %s: %v\n", connection.RemoteAddr(), err)
+	if bytes.HasPrefix(bytes.TrimSpace(handshake), []byte("<")) {
+		message, err := fpolicy.ParseXMLMessage(handshake)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "decode XML handshake from %s: %v\n", connection.RemoteAddr(), err)
+			return
+		}
+		if !message.Negotiate {
+			fmt.Fprintf(os.Stderr, "reject XML session from %s: expected NegotiateRequest\n", connection.RemoteAddr())
+			return
+		}
+		response, err := fpolicy.NegotiateResponse(message.SessionID)
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "encode XML handshake response:", err)
+			return
+		}
+		if err := fpolicy.WriteFrame(connection, response); err != nil {
+			fmt.Fprintf(os.Stderr, "write XML handshake response to %s: %v\n", connection.RemoteAddr(), err)
+			return
+		}
+		readFramedXMLEvents(reader, connection, db)
 		return
 	}
-	if bytes.HasPrefix(bytes.TrimSpace(handshake), []byte("<")) {
-		readFramedXMLEvents(reader, connection, db)
+	if err := fpolicy.WriteFrame(connection, nil); err != nil {
+		fmt.Fprintf(os.Stderr, "write protobuf handshake response to %s: %v\n", connection.RemoteAddr(), err)
 		return
 	}
 	readProtobufEvents(reader, connection, db)

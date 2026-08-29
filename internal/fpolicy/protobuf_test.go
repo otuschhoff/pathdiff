@@ -47,15 +47,25 @@ func TestFrames(t *testing.T) {
 }
 
 func TestParseXMLNotification(t *testing.T) {
-	payload := []byte(`<FileOperationNotification><Header timestamp_nsec="1725000000000000000"/><file_id>42</file_id><path>/vol/data/report.csv</path><operation>WRITE</operation></FileOperationNotification>`)
+	payload := []byte(`<FPolicy xmlns="http://www.netapp.com/fpolicy"><Header><SessionID>sess-1</SessionID></Header><NotificationRequest><Vserver>vs-1</Vserver><FileId>42</FileId><VolumeUuid>vol-1</VolumeUuid><Path>/vol/data/report.csv</Path><Operation>WRITE</Operation><Timestamp>1725000000000000</Timestamp></NotificationRequest></FPolicy>`)
 	event, err := ParseXMLNotification(payload)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if event.Inode != 42 || event.Path != "/vol/data/report.csv" || event.Operation != "write" {
+	if event.Inode != 42 || event.Path != "/vol/data/report.csv" || event.Operation != "WRITE" {
 		t.Fatalf("unexpected event: %#v", event)
 	}
-	if want := time.Unix(0, 1_725_000_000_000_000_000).UTC(); !event.Timestamp.Equal(want) {
+	if want := time.UnixMicro(1_725_000_000_000_000).UTC(); !event.Timestamp.Equal(want) {
 		t.Fatalf("timestamp = %s, want %s", event.Timestamp, want)
+	}
+}
+
+func TestNegotiateResponse(t *testing.T) {
+	payload, err := NegotiateResponse("sess-998811")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(payload) != "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<FPolicy xmlns=\"http://www.netapp.com/fpolicy\"><Header><SessionID>sess-998811</SessionID></Header><NegotiateResponse><SelectedProtocol>1.0</SelectedProtocol><Status>SUCCESS</Status></NegotiateResponse></FPolicy>" {
+		t.Fatalf("unexpected handshake response: %s", payload)
 	}
 }
