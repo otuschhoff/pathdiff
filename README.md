@@ -20,6 +20,8 @@ bin/pathdiff service stop
 bin/pathdiff engine list
 bin/pathdiff cdot pubkey generate
 bin/pathdiff cdot pubkey show
+bin/pathdiff cdot set-cluster cluster.example.test
+bin/pathdiff cdot check --host cluster.example.test
 ```
 
 On first start, `pathdiff` writes `~/.config/systemd/user/pathdiff.service`, reloads the user systemd manager, and starts it. Later `service start` calls start the registered unit without replacing its configuration. Add `--verbose` (or `-v`) to the first start to log sender connection, protocol, negotiation, keep-alive, and accepted-event state changes. While verbose mode is enabled, the daemon reports per-sender accepted-event throughput every 10 seconds.
@@ -29,6 +31,8 @@ On first start, `pathdiff` writes `~/.config/systemd/user/pathdiff.service`, rel
 `engine list` renders active FPolicy engine connections with their connection time, total accepted events, average event rate, LIF IPv4 address, reverse-resolved hostname when available, local listener port, and `NodeId`/SVM ID when ONTAP supplies those fields during negotiation.
 
 `cdot pubkey generate` creates a non-interactive Ed25519 keypair at `$XDG_DATA_HOME/pathdiff/cdot_ed25519`, or `~/.local/share/pathdiff/cdot_ed25519` when `XDG_DATA_HOME` is unset. It uses Go cryptography and SSH libraries rather than external SSH commands, prints the public-key path, and will not overwrite an existing key. Use `cdot pubkey show` to print the public key for adding to ONTAP. Future cDOT SSH operations default to user `pathdiff`; pass `cdot --user <user>` to override it.
+
+`cdot set-cluster <clusterFQDN>` writes the default cDOT cluster to `$XDG_CONFIG_HOME/pathdiff/cdot.json`, or `~/.config/pathdiff/cdot.json` when unset. `cdot check` uses this default unless `--host <cluster>` overrides it. The check connects to ONTAP using the generated key and user `pathdiff` by default, then runs `vserver fpolicy policy show` and `vserver fpolicy policy external-engine show` to verify policy visibility and whether a configured external-engine endpoint matches this host's addresses. It verifies cluster host keys using `$XDG_CONFIG_HOME/pathdiff/known_hosts`, or `~/.config/pathdiff/known_hosts` when unset. For the first connection, use `--accept-new-host-key` to save the presented host key; subsequent checks verify it strictly. Add `--debug-ssh-exec` to print each SSH command and its returned output. Use `--known-hosts` or `--key` to override either path.
 
 When diagnosing an incompatible FPolicy session, add `--record-dir captures` to write the raw bytes from every event connection. Each capture has a timestamped `.in` file for bytes received from ONTAP and a matching `.out` file for bytes sent by `pathdiff`. Captures may contain file paths and user or client identifiers; protect and remove them appropriately.
 
@@ -49,9 +53,9 @@ bin/pathdiff path list firefox --start 10d
 bin/pathdiff path parent --path /vol/finance/ --sort timestamp --max 250
 bin/pathdiff db status
 bin/pathdiff db event reset
-bin/pathdiff volume list
-bin/pathdiff svm set --id 5b701784-7459-11e8-8e95-00a098bc5a13 --name finance
-bin/pathdiff svm list
+bin/pathdiff cdot volume list
+bin/pathdiff cdot svm set --id 5b701784-7459-11e8-8e95-00a098bc5a13 --name finance
+bin/pathdiff cdot svm list
 ```
 
 `monitor` prints newly observed events as JSON lines until interrupted. Add `--since RFC3339` to replay changes from a particular timestamp. The default control socket is `/tmp/pathdiff.sock`; set `--control` on both daemon and client to use another socket. The daemon commits both time and path indexes atomically to Pebble. Configure the FPolicy receiver or a protocol adapter to emit the line-delimited JSON above.
@@ -81,13 +85,13 @@ Native synchronous `SCREEN_REQ` messages are also stored as audit events using t
 `SCREEN_REQ` payloads also include the numeric `VolMsid`. Persisted query results retain it as `volume_msid`; configure a human-readable name through the daemon with:
 
 ```sh
-bin/pathdiff volume set --msid 2163258291 --name asic_user
-bin/pathdiff volume list
+bin/pathdiff cdot volume set --msid 2163258291 --name asic_user
+bin/pathdiff cdot volume list
 ```
 
 Subsequent query and monitor output resolves that ID as `volume_name` without rewriting historic event records.
 
-`svm set --id <uuid> --name <name>` persists an SVM UUID-to-name mapping, and `svm list` renders configured SVM mappings. Both SVM and volume mapping commands operate through the running daemon's control socket.
+`cdot svm set --id <uuid> --name <name>` persists an SVM UUID-to-name mapping, and `cdot svm list` renders configured SVM mappings. Both SVM and volume mapping commands operate through the running daemon's control socket.
 
 ## Tasks
 

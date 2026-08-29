@@ -2,6 +2,8 @@ package main
 
 import (
 	"bytes"
+	"crypto/ed25519"
+	"crypto/rand"
 	"crypto/x509"
 	"encoding/pem"
 	"net"
@@ -312,5 +314,74 @@ func TestGenerateCDOTKey(t *testing.T) {
 	}
 	if err := generateCDOTKey(keyFile); err == nil {
 		t.Fatal("generateCDOTKey overwrote an existing key")
+	}
+}
+
+func TestCDOTCheckHelpers(t *testing.T) {
+	if fpolicyPolicyShowCommand != "vserver fpolicy policy show" {
+		t.Fatalf("unexpected FPolicy command: %q", fpolicyPolicyShowCommand)
+	}
+	if fpolicyEngineShowCommand != "vserver fpolicy policy external-engine show -fields primary-servers,secondary-servers,port,ssl-option" {
+		t.Fatalf("unexpected external-engine command: %q", fpolicyEngineShowCommand)
+	}
+	if got := sshAddress("cluster.example.test"); got != "cluster.example.test:22" {
+		t.Fatalf("sshAddress() = %q", got)
+	}
+	if got := sshAddress("192.0.2.10:2222"); got != "192.0.2.10:2222" {
+		t.Fatalf("sshAddress() = %q", got)
+	}
+	if !fpolicyServerMatches("primary-servers: 192.0.2.10", []string{"192.0.2.10"}) {
+		t.Fatal("FPolicy endpoint match was not found")
+	}
+	if fpolicyServerMatches("primary-servers: 192.0.2.10", []string{"192.0.2.11"}) {
+		t.Fatal("unexpected FPolicy endpoint match")
+	}
+}
+
+func TestCDOTDefaultClusterConfig(t *testing.T) {
+	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+	if err := setCDOTCluster("cluster.example.test"); err != nil {
+		t.Fatal(err)
+	}
+	config, err := loadCDOTConfig()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if config.Cluster != "cluster.example.test" {
+		t.Fatalf("cluster = %q", config.Cluster)
+	}
+	cdot := newCDOTCommand()
+	if host, err := cdot.PersistentFlags().GetString("host"); err != nil || host != "cluster.example.test" {
+		t.Fatalf("default cDOT host = %q, err = %v", host, err)
+	}
+}
+
+func TestCDOTHostKeyCallbackAcceptsNewKey(t *testing.T) {
+	knownHostsFile := filepath.Join(t.TempDir(), "known_hosts")
+	if _, err := cdotHostKeyCallback(knownHostsFile, "cluster.example.test:22", false); err == nil {
+		t.Fatal("strict host key callback accepted a missing known_hosts file")
+	}
+	publicKey, _, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	key, err := ssh.NewPublicKey(publicKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	callback, err := cdotHostKeyCallback(knownHostsFile, "cluster.example.test:22", true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	remoteAddress := &net.TCPAddr{IP: net.ParseIP("192.0.2.10"), Port: 22}
+	if err := callback("cluster.example.test:22", remoteAddress, key); err != nil {
+		t.Fatal(err)
+	}
+	strictCallback, err := cdotHostKeyCallback(knownHostsFile, "cluster.example.test:22", false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := strictCallback("cluster.example.test:22", remoteAddress, key); err != nil {
+		t.Fatalf("saved host key was not verified: %v", err)
 	}
 }
