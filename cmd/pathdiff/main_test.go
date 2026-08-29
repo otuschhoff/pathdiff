@@ -375,6 +375,33 @@ func TestParseONTAPVolumeTable(t *testing.T) {
 	}
 }
 
+func TestParseFPolicyPolicies(t *testing.T) {
+	policies := parseFPolicyPolicies("Vserver: finance\nPolicy: track_inode_changes\nEvents to Monitor: inode_change_events\nFPolicy Engine: pathdiff\n", "Vserver: finance\nEngine: pathdiff\nPrimary FPolicy Servers: 192.0.2.10\nSecondary FPolicy Servers: 192.0.2.11\nPort Number of FPolicy Service: 9911\nSSL Option for External Communication: no-auth\nExternal Engine Type: asynchronous\nExternal Engine Format: xml\n")
+	if len(policies) != 1 {
+		t.Fatalf("policies = %#v", policies)
+	}
+	policy := policies[0]
+	if policy.SVM != "finance" || policy.Name != "track_inode_changes" || policy.Engine != "pathdiff" || policy.Targets != "192.0.2.10, 192.0.2.11" || policy.Port != "9911" || policy.SSL != "no-auth" || policy.Type != "asynchronous" || policy.Format != "xml" || policy.Events != "inode_change_events" {
+		t.Fatalf("unexpected policy: %#v", policy)
+	}
+	if filtered := filterFPolicyPolicies(policies, "finance", "", false); len(filtered) != 1 {
+		t.Fatalf("default filter excluded pathdiff policy: %#v", filtered)
+	}
+}
+
+func TestFPolicyActionCommands(t *testing.T) {
+	fpolicy := newFPolicyCommand()
+	for _, name := range []string{"start", "stop"} {
+		command, _, err := fpolicy.Find([]string{name})
+		if err != nil || command == nil || command.Use != name+" [<svmWildcardSearchTerm> [<policyClass>]]" {
+			t.Fatalf("%s command = %#v, err = %v", name, command, err)
+		}
+		if all, err := command.Flags().GetBool("all"); err != nil || all {
+			t.Fatalf("%s --all = %t, err = %v", name, all, err)
+		}
+	}
+}
+
 func TestCDOTDefaultClusterConfig(t *testing.T) {
 	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
 	if err := setCDOTCluster("cluster.example.test"); err != nil {

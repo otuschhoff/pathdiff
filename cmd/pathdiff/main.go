@@ -823,8 +823,351 @@ func newCDOTCommand() *cobra.Command {
 	}}
 	show.Flags().StringVar(&showFile, "file", "", "private key path; defaults to the XDG path")
 	pubkey.AddCommand(generate, show)
-	cdot.AddCommand(pubkey, newVolumeCommand(), newSVMCommand(), newNodeCommand(), newLIFCommand(), newCDOTCheckCommand(), newCDOTSetClusterCommand())
+	cdot.AddCommand(pubkey, newVolumeCommand(), newSVMCommand(), newNodeCommand(), newLIFCommand(), newFPolicyCommand(), newCDOTCheckCommand(), newCDOTSetClusterCommand())
 	return cdot
+}
+
+func newFPolicyCommand() *cobra.Command {
+	fpolicy := &cobra.Command{Use: "fpolicy", Short: "Inspect and manage cDOT FPolicy policies"}
+	fpolicy.AddCommand(newFPolicyListCommand(), newFPolicyScopeCommand(), newFPolicyStartCommand(), newFPolicyStopCommand())
+	return fpolicy
+}
+
+func newFPolicyListCommand() *cobra.Command {
+	var keyFile, knownHostsFile string
+	var acceptNewHostKey, debugSSHExec, all bool
+	command := &cobra.Command{Use: "list [<svmWildcardSearchTerm>]", Args: cobra.MaximumNArgs(1), Short: "List FPolicy external-engine policies", RunE: func(command *cobra.Command, arguments []string) error {
+		policies, err := queryFPolicy(command, keyFile, knownHostsFile, acceptNewHostKey, debugSSHExec)
+		if err != nil {
+			return err
+		}
+		svmPattern := "*"
+		if len(arguments) == 1 {
+			svmPattern = arguments[0]
+		}
+		return printFPolicyPolicies(command.OutOrStdout(), filterFPolicyPolicies(policies, svmPattern, "", all))
+	}}
+	addCDOTConnectionFlags(command, &keyFile, &knownHostsFile, &acceptNewHostKey, &debugSSHExec)
+	command.Flags().BoolVarP(&all, "all", "a", false, "show all FPolicy policies instead of pathdiff*")
+	return command
+}
+
+func newFPolicyScopeCommand() *cobra.Command {
+	var keyFile, knownHostsFile string
+	var acceptNewHostKey, debugSSHExec, all bool
+	scope := &cobra.Command{Use: "scope", Short: "Inspect cDOT FPolicy policy scopes"}
+	list := &cobra.Command{Use: "list [<svmWildcardSearchTerm>]", Args: cobra.MaximumNArgs(1), Short: "List FPolicy policy scopes", RunE: func(command *cobra.Command, arguments []string) error {
+		policies, err := queryFPolicy(command, keyFile, knownHostsFile, acceptNewHostKey, debugSSHExec)
+		if err != nil {
+			return err
+		}
+		host, _ := command.Flags().GetString("host")
+		user, _ := command.Flags().GetString("user")
+		keyPath, err := cdotKeyFile(keyFile)
+		if err != nil {
+			return err
+		}
+		if knownHostsFile == "" {
+			knownHostsFile, err = cdotKnownHostsFile()
+			if err != nil {
+				return err
+			}
+		}
+		client, err := openCDOTClient(host, user, keyPath, knownHostsFile, acceptNewHostKey)
+		if err != nil {
+			return err
+		}
+		defer client.Close()
+		var debugWriter io.Writer
+		if debugSSHExec {
+			debugWriter = command.ErrOrStderr()
+		}
+		output, err := runSSHCommand(client, "vserver fpolicy policy scope show -instance", debugWriter)
+		if err != nil {
+			return fmt.Errorf("query cDOT FPolicy scopes: %w: %s", err, strings.TrimSpace(string(output)))
+		}
+		svmPattern := "*"
+		if len(arguments) == 1 {
+			svmPattern = arguments[0]
+		}
+		return printFPolicyScopes(command.OutOrStdout(), filterFPolicyScopes(parseFPolicyScopes(string(output), policies), svmPattern, all))
+	}}
+	addCDOTConnectionFlags(list, &keyFile, &knownHostsFile, &acceptNewHostKey, &debugSSHExec)
+	list.Flags().BoolVarP(&all, "all", "a", false, "show all FPolicy policies instead of pathdiff*")
+	scope.AddCommand(list)
+	return scope
+}
+
+func newFPolicyStartCommand() *cobra.Command {
+	return newFPolicyActionCommand("start", "enable")
+}
+
+func newFPolicyStopCommand() *cobra.Command {
+	return newFPolicyActionCommand("stop", "disable")
+}
+
+func newFPolicyActionCommand(action, ontapAction string) *cobra.Command {
+	var keyFile, knownHostsFile string
+	var acceptNewHostKey, debugSSHExec, all bool
+	command := &cobra.Command{Use: action + " [<svmWildcardSearchTerm> [<policyClass>]]", Args: cobra.MaximumNArgs(2), Short: strings.ToUpper(action[:1]) + action[1:] + " FPolicy policy classes", RunE: func(command *cobra.Command, arguments []string) error {
+		policies, err := queryFPolicy(command, keyFile, knownHostsFile, acceptNewHostKey, debugSSHExec)
+		if err != nil {
+			return err
+		}
+		svmPattern, policyPattern := "*", ""
+		if len(arguments) > 0 {
+			svmPattern = arguments[0]
+		}
+		if len(arguments) > 1 {
+			policyPattern = arguments[1]
+		}
+		selected := filterFPolicyPolicies(policies, svmPattern, policyPattern, all)
+		if len(selected) == 0 {
+			return errors.New("no matching FPolicy policy classes")
+		}
+		host, _ := command.Flags().GetString("host")
+		user, _ := command.Flags().GetString("user")
+		keyPath, err := cdotKeyFile(keyFile)
+		if err != nil {
+			return err
+		}
+		if knownHostsFile == "" {
+			knownHostsFile, err = cdotKnownHostsFile()
+			if err != nil {
+				return err
+			}
+		}
+		client, err := openCDOTClient(host, user, keyPath, knownHostsFile, acceptNewHostKey)
+		if err != nil {
+			return err
+		}
+		defer client.Close()
+		var debugWriter io.Writer
+		if debugSSHExec {
+			debugWriter = command.ErrOrStderr()
+		}
+		for _, policy := range selected {
+			remoteCommand := "vserver fpolicy " + ontapAction + " -vserver " + shellQuote(policy.SVM) + " -policy-name " + shellQuote(policy.Name)
+			output, err := runSSHCommand(client, remoteCommand, debugWriter)
+			if err != nil {
+				return fmt.Errorf("%s FPolicy policy %s on %s: %w: %s", action, policy.Name, policy.SVM, err, strings.TrimSpace(string(output)))
+			}
+		}
+		state := action + "ed"
+		if action == "stop" {
+			state = "stopped"
+		}
+		return printFPolicyAction(command.OutOrStdout(), selected, state)
+	}}
+	addCDOTConnectionFlags(command, &keyFile, &knownHostsFile, &acceptNewHostKey, &debugSSHExec)
+	command.Flags().BoolVarP(&all, "all", "a", false, action+" all matching FPolicy policies instead of pathdiff*")
+	return command
+}
+
+type fpolicyPolicy struct {
+	SVM     string
+	Name    string
+	Engine  string
+	Targets string
+	Port    string
+	SSL     string
+	Type    string
+	Format  string
+	Events  string
+}
+
+type fpolicyScope struct {
+	SVM    string
+	Engine string
+	Policy string
+	Scope  string
+}
+
+func addCDOTConnectionFlags(command *cobra.Command, keyFile, knownHostsFile *string, acceptNewHostKey, debugSSHExec *bool) {
+	command.Flags().StringVar(keyFile, "key", "", "private key path; defaults to the XDG path")
+	command.Flags().StringVar(knownHostsFile, "known-hosts", "", "known_hosts file; defaults to the XDG path")
+	command.Flags().BoolVar(acceptNewHostKey, "accept-new-host-key", false, "trust and save the host key when known_hosts is absent")
+	command.Flags().BoolVar(debugSSHExec, "debug-ssh-exec", false, "print SSH commands and their results to stderr")
+}
+
+func queryFPolicy(command *cobra.Command, keyFile, knownHostsFile string, acceptNewHostKey, debugSSHExec bool) ([]fpolicyPolicy, error) {
+	host, _ := command.Flags().GetString("host")
+	user, _ := command.Flags().GetString("user")
+	if host == "" {
+		return nil, errors.New("host is required")
+	}
+	keyPath, err := cdotKeyFile(keyFile)
+	if err != nil {
+		return nil, err
+	}
+	if knownHostsFile == "" {
+		knownHostsFile, err = cdotKnownHostsFile()
+		if err != nil {
+			return nil, err
+		}
+	}
+	client, err := openCDOTClient(host, user, keyPath, knownHostsFile, acceptNewHostKey)
+	if err != nil {
+		return nil, err
+	}
+	defer client.Close()
+	var debugWriter io.Writer
+	if debugSSHExec {
+		debugWriter = command.ErrOrStderr()
+	}
+	policyOutput, err := runSSHCommand(client, fpolicyPolicyShowCommand+" -instance", debugWriter)
+	if err != nil {
+		return nil, fmt.Errorf("query cDOT FPolicy policies: %w: %s", err, strings.TrimSpace(string(policyOutput)))
+	}
+	engineOutput, err := runSSHCommand(client, "vserver fpolicy policy external-engine show -instance", debugWriter)
+	if err != nil {
+		return nil, fmt.Errorf("query cDOT FPolicy external engines: %w: %s", err, strings.TrimSpace(string(engineOutput)))
+	}
+	return parseFPolicyPolicies(string(policyOutput), string(engineOutput)), nil
+}
+
+func parseFPolicyPolicies(policyOutput, engineOutput string) []fpolicyPolicy {
+	engines := make(map[string]map[string]string)
+	for _, record := range parseONTAPInstances(engineOutput) {
+		engines[fpolicyRecordKey(record, "Engine", "External Engine Name", "Engine Name", "Name")] = record
+	}
+	var policies []fpolicyPolicy
+	for _, record := range parseONTAPInstances(policyOutput) {
+		engineName := firstInstanceField(record, "FPolicy Engine", "External Engine Name", "Engine Name")
+		if engineName == "" {
+			continue
+		}
+		engine := engines[instanceField(record, "Vserver")+"\x00"+engineName]
+		eventNames := firstInstanceField(record, "Events To Monitor", "Event Names", "Event Name")
+		policies = append(policies, fpolicyPolicy{
+			SVM:     instanceField(record, "Vserver"),
+			Name:    firstInstanceField(record, "Policy", "Policy Name", "Name"),
+			Engine:  engineName,
+			Targets: fpolicyTargets(engine),
+			Port:    firstInstanceField(engine, "Port Number of FPolicy Service", "Port"),
+			SSL:     firstInstanceField(engine, "SSL Option for External Communication", "SSL Option", "SSL"),
+			Type:    firstInstanceField(engine, "Type", "External Engine Type"),
+			Format:  firstInstanceField(engine, "External Engine Format", "Format"),
+			Events:  eventNames,
+		})
+	}
+	sort.Slice(policies, func(left, right int) bool {
+		return policies[left].SVM+"\x00"+policies[left].Name < policies[right].SVM+"\x00"+policies[right].Name
+	})
+	return policies
+}
+
+func fpolicyRecordKey(record map[string]string, names ...string) string {
+	return instanceField(record, "Vserver") + "\x00" + firstInstanceField(record, names...)
+}
+
+func firstInstanceField(record map[string]string, names ...string) string {
+	for _, name := range names {
+		if value := instanceField(record, name); value != "" {
+			return value
+		}
+	}
+	return ""
+}
+
+func fpolicyTargets(engine map[string]string) string {
+	var targets []string
+	for _, target := range []string{
+		firstInstanceField(engine, "Primary FPolicy Servers", "Primary Servers", "Primary Server", "Servers"),
+		firstInstanceField(engine, "Secondary FPolicy Servers", "Secondary Servers", "Secondary Server"),
+	} {
+		if target != "" && target != "-" {
+			targets = append(targets, target)
+		}
+	}
+	return strings.Join(targets, ", ")
+}
+
+func filterFPolicyPolicies(policies []fpolicyPolicy, svmPattern, policyPattern string, all bool) []fpolicyPolicy {
+	var filtered []fpolicyPolicy
+	for _, policy := range policies {
+		if !wildcardContains(policy.SVM, svmPattern) {
+			continue
+		}
+		if policyPattern != "" && !wildcardContains(policy.Name, policyPattern) {
+			continue
+		}
+		if !all && !wildcardContains(policy.Name, "pathdiff*") && !wildcardContains(policy.Engine, "pathdiff*") {
+			continue
+		}
+		filtered = append(filtered, policy)
+	}
+	return filtered
+}
+
+func wildcardContains(value, pattern string) bool {
+	value, pattern = strings.ToLower(value), strings.ToLower(pattern)
+	if !strings.ContainsAny(pattern, "*?") {
+		pattern = "*" + pattern + "*"
+	}
+	matched, err := filepath.Match(pattern, value)
+	return err == nil && matched
+}
+
+func printFPolicyPolicies(writer io.Writer, policies []fpolicyPolicy) error {
+	tableWriter := newTableWriter(writer)
+	tableWriter.AppendHeader(table.Row{"SVM", "Engine", "Targets", "Port", "SSL", "Type", "Format", "Policy Class", "Event Class"})
+	for _, policy := range policies {
+		tableWriter.AppendRow(table.Row{policy.SVM, policy.Engine, policy.Targets, policy.Port, policy.SSL, policy.Type, policy.Format, policy.Name, policy.Events})
+	}
+	tableWriter.Render()
+	return nil
+}
+
+func parseFPolicyScopes(output string, policies []fpolicyPolicy) []fpolicyScope {
+	engines := make(map[string]string)
+	for _, policy := range policies {
+		engines[policy.SVM+"\x00"+policy.Name] = policy.Engine
+	}
+	var scopes []fpolicyScope
+	for _, record := range parseONTAPInstances(output) {
+		svm := instanceField(record, "Vserver")
+		policy := firstInstanceField(record, "Policy", "Policy Name", "Name")
+		parts := make([]string, 0, len(record))
+		for name, value := range record {
+			if value != "" && !strings.EqualFold(name, "Vserver") && !strings.EqualFold(name, "Policy") && !strings.EqualFold(name, "Policy Name") && !strings.EqualFold(name, "Name") {
+				parts = append(parts, name+": "+value)
+			}
+		}
+		sort.Strings(parts)
+		scopes = append(scopes, fpolicyScope{SVM: svm, Engine: engines[svm+"\x00"+policy], Policy: policy, Scope: strings.Join(parts, "; ")})
+	}
+	return scopes
+}
+
+func filterFPolicyScopes(scopes []fpolicyScope, svmPattern string, all bool) []fpolicyScope {
+	var filtered []fpolicyScope
+	for _, scope := range scopes {
+		if wildcardContains(scope.SVM, svmPattern) && (all || wildcardContains(scope.Policy, "pathdiff*") || wildcardContains(scope.Engine, "pathdiff*")) {
+			filtered = append(filtered, scope)
+		}
+	}
+	return filtered
+}
+
+func printFPolicyScopes(writer io.Writer, scopes []fpolicyScope) error {
+	tableWriter := newTableWriter(writer)
+	tableWriter.AppendHeader(table.Row{"SVM", "Engine", "Policy Class", "Scope"})
+	for _, scope := range scopes {
+		tableWriter.AppendRow(table.Row{scope.SVM, scope.Engine, scope.Policy, scope.Scope})
+	}
+	tableWriter.Render()
+	return nil
+}
+
+func printFPolicyAction(writer io.Writer, policies []fpolicyPolicy, state string) error {
+	tableWriter := newTableWriter(writer)
+	tableWriter.AppendHeader(table.Row{"SVM", "Policy Class", "State"})
+	for _, policy := range policies {
+		tableWriter.AppendRow(table.Row{policy.SVM, policy.Name, state})
+	}
+	tableWriter.Render()
+	return nil
 }
 
 func newCDOTSetClusterCommand() *cobra.Command {
