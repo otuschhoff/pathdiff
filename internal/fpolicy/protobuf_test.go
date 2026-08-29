@@ -69,3 +69,33 @@ func TestNegotiateResponse(t *testing.T) {
 		t.Fatalf("unexpected handshake response: %s", payload)
 	}
 }
+
+func TestONTAPXMLHandshakeFrames(t *testing.T) {
+	request := []byte(`<?xml version="1.0"?><Handshake><VsUUID>5b701784-7459-11e8-8e95-00a098bc5a13</VsUUID><PolicyName>track_inode_changes</PolicyName><SessionId>bef098d2-a3a6-11f1-8e8e-d039ea524d0f</SessionId><ProtVersion><Vers>1.0</Vers><Vers>1.1</Vers></ProtVersion></Handshake>`)
+	var wire bytes.Buffer
+	if err := WriteONTAPXMLFrame(&wire, "NEGO_REQ", request); err != nil {
+		t.Fatal(err)
+	}
+	message, err := ReadONTAPXMLFrame(&wire)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if message.Type != "NEGO_REQ" || message.Session != "bef098d2-a3a6-11f1-8e8e-d039ea524d0f" {
+		t.Fatalf("unexpected handshake: %#v", message)
+	}
+
+	response, err := ONTAPNegotiateResponse(message.Session)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := WriteONTAPXMLFrame(&wire, "NEGO_RESP", response); err != nil {
+		t.Fatal(err)
+	}
+	message, err = ReadONTAPXMLFrame(&wire)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if message.Type != "NEGO_RESP" || !bytes.Contains(message.Payload, []byte("<Status>SUCCESS</Status>")) || !bytes.Contains(message.Payload, []byte("<Vers>1.0</Vers>")) {
+		t.Fatalf("unexpected negotiation response: %#v", message)
+	}
+}

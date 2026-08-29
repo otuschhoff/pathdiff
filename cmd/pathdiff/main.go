@@ -200,6 +200,10 @@ func readEvents(connection net.Conn, db *store.DB) {
 		readXMLEvents(reader, connection, db)
 		return
 	}
+	if first[0] == 0x22 {
+		readONTAPXMLEvents(reader, connection, db)
+		return
+	}
 	if first[0] != '{' {
 		readFramedEvents(reader, connection, db)
 		return
@@ -223,6 +227,43 @@ func readEvents(connection net.Conn, db *store.DB) {
 	}
 	if err := scanner.Err(); err != nil {
 		fmt.Fprintln(os.Stderr, "read event stream:", err)
+	}
+}
+
+func readONTAPXMLEvents(reader *bufio.Reader, connection net.Conn, db *store.DB) {
+	message, err := fpolicy.ReadONTAPXMLFrame(reader)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "read ONTAP XML handshake from %s: %v\n", connection.RemoteAddr(), err)
+		return
+	}
+	if message.Type != "NEGO_REQ" {
+		fmt.Fprintf(os.Stderr, "reject ONTAP XML session from %s: expected NEGO_REQ, got %s\n", connection.RemoteAddr(), message.Type)
+		return
+	}
+	response, err := fpolicy.ONTAPNegotiateResponse(message.Session)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "encode ONTAP XML handshake response:", err)
+		return
+	}
+	if err := fpolicy.WriteONTAPXMLFrame(connection, "NEGO_RESP", response); err != nil {
+		fmt.Fprintf(os.Stderr, "write ONTAP XML handshake response to %s: %v\n", connection.RemoteAddr(), err)
+		return
+	}
+
+	for {
+		message, err := fpolicy.ReadONTAPXMLFrame(reader)
+		if errors.Is(err, io.EOF) {
+			return
+		}
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "read ONTAP XML event from %s: %v\n", connection.RemoteAddr(), err)
+			return
+		}
+		if message.Type != "NOTIFY_REQ" {
+			fmt.Fprintf(os.Stderr, "ignore ONTAP XML message from %s: %s\n", connection.RemoteAddr(), message.Type)
+			continue
+		}
+		storeXMLEvent(message.Payload, connection, db)
 	}
 }
 

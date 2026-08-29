@@ -17,6 +17,8 @@ import (
 
 const MaxFrameSize = 1024 * 1024
 
+const ontapXMLMessageType = 0x22
+
 var operationNames = map[protowire.Number]string{
 	0: "unknown",
 	1: "create",
@@ -46,6 +48,118 @@ func WriteFrame(writer io.Writer, payload []byte) error {
 	if len(payload) > MaxFrameSize {
 		return fmt.Errorf("frame length %d exceeds %d bytes", len(payload), MaxFrameSize)
 	}
+	var header [4]byte
+	binary.BigEndian.PutUint32(header[:], uint32(len(payload)))
+	if _, err := writer.Write(header[:]); err != nil {
+		return err
+	}
+	_, err := writer.Write(payload)
+	return err
+}
+
+type ONTAPMessage struct {
+	Type    string
+	Session string
+	Payload []byte
+}
+
+// ReadONTAPXMLFrame reads the FPolicy frame seen on the ONTAP wire: a one-byte
+// message type, a big-endian payload length, an XML header/body payload, and NUL.
+func ReadONTAPXMLFrame(reader io.Reader) (ONTAPMessage, error) {
+	messageType, err := readByte(reader)
+	if err != nil {
+		return ONTAPMessage{}, err
+	}
+	if messageType != ontapXMLMessageType {
+		return ONTAPMessage{}, fmt.Errorf("unsupported ONTAP message type %#x", messageType)
+	}
+	payload, err := readSizedPayload(reader)
+	if err != nil {
+		return ONTAPMessage{}, err
+	}
+	if _, err := readByte(reader); err != nil {
+		return ONTAPMessage{}, err
+	}
+
+	parts := bytes.SplitN(bytes.TrimPrefix(payload, []byte{'"'}), []byte("\n\n"), 2)
+	if len(parts) != 2 {
+		return ONTAPMessage{}, fmt.Errorf("missing ONTAP XML header/body separator")
+	}
+	var header struct {
+		NotificationType string `xml:"NotfType"`
+	}
+	if err := xml.Unmarshal(parts[0], &header); err != nil {
+		return ONTAPMessage{}, fmt.Errorf("decode ONTAP XML header: %w", err)
+	}
+	message := ONTAPMessage{Type: header.NotificationType, Payload: bytes.TrimSpace(parts[1])}
+	if message.Type == "NEGO_REQ" {
+		var handshake struct {
+			Session string `xml:"SessionId"`
+		}
+		if err := xml.Unmarshal(message.Payload, &handshake); err != nil {
+			return ONTAPMessage{}, fmt.Errorf("decode ONTAP handshake: %w", err)
+		}
+		message.Session = handshake.Session
+	}
+	return message, nil
+}
+
+func WriteONTAPXMLFrame(writer io.Writer, notificationType string, payload []byte) error {
+	header := fmt.Sprintf(`<?xml version="1.0"?><Header><NotfType>%s</NotfType><ContentLen>%d</ContentLen><DataFormat>XML</DataFormat></Header>`, notificationType, len(payload))
+	framePayload := append([]byte{'"'}, header...)
+	framePayload = append(framePayload, '\n', '\n')
+	framePayload = append(framePayload, payload...)
+	if len(framePayload) > MaxFrameSize {
+		return fmt.Errorf("frame length %d exceeds %d bytes", len(framePayload), MaxFrameSize)
+	}
+	if _, err := writer.Write([]byte{ontapXMLMessageType}); err != nil {
+		return err
+	}
+	if err := writeSizedPayload(writer, framePayload); err != nil {
+		return err
+	}
+	_, err := writer.Write([]byte{0})
+	return err
+}
+
+func ONTAPNegotiateResponse(session string) ([]byte, error) {
+	response := struct {
+		XMLName xml.Name `xml:"Handshake"`
+		Session string   `xml:"SessionId"`
+		Version struct {
+			Value string `xml:"Vers"`
+		} `xml:"ProtVersion"`
+		Status string `xml:"Status"`
+	}{Session: session, Status: "SUCCESS"}
+	response.Version.Value = "1.0"
+	payload, err := xml.Marshal(response)
+	if err != nil {
+		return nil, err
+	}
+	return append([]byte(xml.Header), payload...), nil
+}
+
+func readByte(reader io.Reader) (byte, error) {
+	var value [1]byte
+	_, err := io.ReadFull(reader, value[:])
+	return value[0], err
+}
+
+func readSizedPayload(reader io.Reader) ([]byte, error) {
+	var header [4]byte
+	if _, err := io.ReadFull(reader, header[:]); err != nil {
+		return nil, err
+	}
+	length := binary.BigEndian.Uint32(header[:])
+	if length > MaxFrameSize {
+		return nil, fmt.Errorf("frame length %d exceeds %d bytes", length, MaxFrameSize)
+	}
+	payload := make([]byte, length)
+	_, err := io.ReadFull(reader, payload)
+	return payload, err
+}
+
+func writeSizedPayload(writer io.Writer, payload []byte) error {
 	var header [4]byte
 	binary.BigEndian.PutUint32(header[:], uint32(len(payload)))
 	if _, err := writer.Write(header[:]); err != nil {
