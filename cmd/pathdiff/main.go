@@ -3,7 +3,11 @@ package main
 import (
 	"bufio"
 	"context"
+	"crypto/ed25519"
+	"crypto/rand"
+	"crypto/x509"
 	"encoding/json"
+	"encoding/pem"
 	"encoding/xml"
 	"errors"
 	"fmt"
@@ -28,6 +32,7 @@ import (
 	"github.com/jedib0t/go-pretty/v6/table"
 	"github.com/jedib0t/go-pretty/v6/text"
 	"github.com/spf13/cobra"
+	"golang.org/x/crypto/ssh"
 )
 
 const (
@@ -55,6 +60,7 @@ type controlResponse struct {
 	Status      string          `json:"status,omitempty"`
 	Connections int             `json:"connections,omitempty"`
 	EventCount  uint64          `json:"event_count,omitempty"`
+	RequestRate float64         `json:"request_rate,omitempty"`
 	DBPath      string          `json:"db_path,omitempty"`
 	DBSize      uint64          `json:"db_size,omitempty"`
 	Events      []store.Event   `json:"events,omitempty"`
@@ -71,7 +77,7 @@ func main() {
 func newRootCommand() *cobra.Command {
 	root := &cobra.Command{Use: "pathdiff", Short: "Store and inspect FPolicy path changes", SilenceUsage: true}
 	root.AddGroup(&cobra.Group{ID: "queries", Title: "Query Commands:"}, &cobra.Group{ID: "management", Title: "Management Commands:"}, &cobra.Group{ID: "service", Title: "Service Commands:"}, &cobra.Group{ID: "other", Title: "Other Commands:"})
-	root.AddCommand(newDaemonCommand(), newEventsCommand(), newPathCommand(), newVolumeCommand(), newSVMCommand(), newDBCommand(), newEngineCommand(), newServiceCommand())
+	root.AddCommand(newDaemonCommand(), newEventsCommand(), newPathCommand(), newVolumeCommand(), newSVMCommand(), newDBCommand(), newEngineCommand(), newCDOTCommand(), newServiceCommand())
 	root.SetHelpCommandGroupID("other")
 	root.InitDefaultCompletionCmd()
 	root.CompletionOptions.HiddenDefaultCmd = false
@@ -82,7 +88,7 @@ func newRootCommand() *cobra.Command {
 		switch command.Name() {
 		case "events", "path":
 			command.GroupID = "queries"
-		case "volume", "svm", "db", "engine":
+		case "volume", "svm", "db", "engine", "cdot":
 			command.GroupID = "management"
 		case "service":
 			command.GroupID = "service"
@@ -221,9 +227,10 @@ func (r *connectionRegistry) CloseAll() {
 }
 
 type senderTracker struct {
-	verbose bool
-	mu      sync.Mutex
-	senders map[string]*senderStats
+	verbose   bool
+	startedAt time.Time
+	mu        sync.Mutex
+	senders   map[string]*senderStats
 }
 
 type senderStats struct {
@@ -249,7 +256,7 @@ type engineInfo struct {
 }
 
 func newSenderTracker(verbose bool) *senderTracker {
-	return &senderTracker{verbose: verbose, senders: make(map[string]*senderStats)}
+	return &senderTracker{verbose: verbose, startedAt: time.Now().UTC(), senders: make(map[string]*senderStats)}
 }
 
 func (t *senderTracker) connect(sender string, localAddress net.Addr) {
@@ -311,6 +318,20 @@ func (t *senderTracker) connectionCount() int {
 		count += stats.active
 	}
 	return count
+}
+
+func (t *senderTracker) requestRate(now time.Time) float64 {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	var total uint64
+	for _, stats := range t.senders {
+		total += stats.totalEvents
+	}
+	elapsed := now.Sub(t.startedAt).Seconds()
+	if elapsed <= 0 {
+		return 0
+	}
+	return float64(total) / elapsed
 }
 
 func (t *senderTracker) engines() []engineInfo {
@@ -597,6 +618,7 @@ func handleControl(connection net.Conn, db *store.DB, stop context.CancelFunc, t
 			response.Status = "running"
 			response.Connections = trackers.connectionCount()
 			response.EventCount, err = db.EventCount()
+			response.RequestRate = trackers.requestRate(time.Now().UTC())
 		case "engines":
 			response.Engines = trackers.engines()
 		case "stop":
@@ -680,6 +702,111 @@ func newEngineCommand() *cobra.Command {
 	list.Flags().StringVar(&controlPath, "control", defaultControl, "Unix control socket")
 	engine.AddCommand(list)
 	return engine
+}
+
+func newCDOTCommand() *cobra.Command {
+	cdot := &cobra.Command{Use: "cdot", Short: "Manage cDOT SSH access"}
+	cdot.PersistentFlags().String("user", "pathdiff", "default SSH user for cDOT connections")
+	pubkey := &cobra.Command{Use: "pubkey", Short: "Manage the cDOT SSH public key"}
+	var generateFile string
+	generate := &cobra.Command{Use: "generate", Short: "Generate a cDOT SSH public key", RunE: func(command *cobra.Command, _ []string) error {
+		keyFile, err := cdotKeyFile(generateFile)
+		if err != nil {
+			return err
+		}
+		if err := generateCDOTKey(keyFile); err != nil {
+			return err
+		}
+		_, err = fmt.Fprintln(command.OutOrStdout(), keyFile+".pub")
+		return err
+	}}
+	generate.Flags().StringVar(&generateFile, "file", "", "private key path; defaults to the XDG path")
+	var showFile string
+	show := &cobra.Command{Use: "show", Short: "Show the cDOT SSH public key", RunE: func(command *cobra.Command, _ []string) error {
+		keyFile, err := cdotKeyFile(showFile)
+		if err != nil {
+			return err
+		}
+		publicKey, err := os.ReadFile(keyFile + ".pub")
+		if err != nil {
+			return fmt.Errorf("read cDOT public key: %w", err)
+		}
+		_, err = fmt.Fprint(command.OutOrStdout(), string(publicKey))
+		return err
+	}}
+	show.Flags().StringVar(&showFile, "file", "", "private key path; defaults to the XDG path")
+	pubkey.AddCommand(generate, show)
+	cdot.AddCommand(pubkey)
+	return cdot
+}
+
+func cdotKeyFile(override string) (string, error) {
+	if override != "" {
+		return filepath.Abs(override)
+	}
+	dataHome := os.Getenv("XDG_DATA_HOME")
+	if dataHome == "" {
+		home, err := os.UserHomeDir()
+		if err != nil {
+			return "", err
+		}
+		dataHome = filepath.Join(home, ".local", "share")
+	}
+	return filepath.Join(dataHome, "pathdiff", "cdot_ed25519"), nil
+}
+
+func generateCDOTKey(keyFile string) error {
+	if _, err := os.Stat(keyFile); err == nil {
+		return fmt.Errorf("cDOT SSH key already exists at %s", keyFile)
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return err
+	}
+	if err := os.MkdirAll(filepath.Dir(keyFile), 0o700); err != nil {
+		return err
+	}
+	publicKey, privateKey, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		return fmt.Errorf("generate cDOT SSH key: %w", err)
+	}
+	privateDER, err := x509.MarshalPKCS8PrivateKey(privateKey)
+	if err != nil {
+		return fmt.Errorf("encode cDOT SSH private key: %w", err)
+	}
+	privateFile, err := os.OpenFile(keyFile, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
+	if err != nil {
+		return fmt.Errorf("create cDOT SSH private key: %w", err)
+	}
+	if err := pem.Encode(privateFile, &pem.Block{Type: "PRIVATE KEY", Bytes: privateDER}); err != nil {
+		_ = privateFile.Close()
+		_ = os.Remove(keyFile)
+		return fmt.Errorf("write cDOT SSH private key: %w", err)
+	}
+	if err := privateFile.Close(); err != nil {
+		_ = os.Remove(keyFile)
+		return fmt.Errorf("close cDOT SSH private key: %w", err)
+	}
+	sshPublicKey, err := ssh.NewPublicKey(publicKey)
+	if err != nil {
+		_ = os.Remove(keyFile)
+		return fmt.Errorf("encode cDOT SSH public key: %w", err)
+	}
+	publicFile, err := os.OpenFile(keyFile+".pub", os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o644)
+	if err != nil {
+		_ = os.Remove(keyFile)
+		return fmt.Errorf("create cDOT SSH public key: %w", err)
+	}
+	if _, err := publicFile.Write(ssh.MarshalAuthorizedKey(sshPublicKey)); err != nil {
+		_ = publicFile.Close()
+		_ = os.Remove(keyFile + ".pub")
+		_ = os.Remove(keyFile)
+		return fmt.Errorf("write cDOT SSH public key: %w", err)
+	}
+	if err := publicFile.Close(); err != nil {
+		_ = os.Remove(keyFile + ".pub")
+		_ = os.Remove(keyFile)
+		return fmt.Errorf("close cDOT SSH public key: %w", err)
+	}
+	return nil
 }
 
 func printEngines(writer io.Writer, engines []engineInfo) error {
@@ -817,19 +944,20 @@ func newServiceStatusCommand() *cobra.Command {
 		if err != nil {
 			return err
 		}
-		connections, events := "-", "-"
+		connections, events, rate := "-", "-", "-"
 		if state == "active" {
 			response, err := callControl(controlPath, controlRequest{Command: "status"})
 			if err == nil {
 				connections = formatCount(uint64(response.Connections))
 				events = formatCount(response.EventCount)
+				rate = fmt.Sprintf("%.2f", response.RequestRate)
 			} else {
 				state += " (control unavailable)"
 			}
 		}
 		tableWriter := newTableWriter(command.OutOrStdout())
-		tableWriter.AppendHeader(table.Row{"Service", "State", "FPolicy Connections", "Registered Events"})
-		tableWriter.AppendRow(table.Row{"pathdiff", state, connections, events})
+		tableWriter.AppendHeader(table.Row{"Service", "State", "FPolicy Connections", "Registered Events", "Requests/s Since Start"})
+		tableWriter.AppendRow(table.Row{"pathdiff", state, connections, events, rate})
 		tableWriter.Render()
 		return nil
 	}}
