@@ -106,18 +106,20 @@ func runDaemon(dbPath, listenAddr, controlPath, recordDir string, verbose bool) 
 	defer cancel()
 
 	var connections sync.WaitGroup
+	activeConnections := newConnectionRegistry()
 	trackers := newSenderTracker(verbose)
 	go trackers.reportEvery(context, 10*time.Second)
-	go acceptEvents(context, eventListener, db, recordDir, trackers, &connections)
-	go acceptControls(context, controlListener, db, cancel, &connections)
+	go acceptEvents(context, eventListener, db, recordDir, trackers, activeConnections, &connections)
+	go acceptControls(context, controlListener, db, cancel, activeConnections, &connections)
 	<-context.Done()
 	_ = eventListener.Close()
 	_ = controlListener.Close()
+	activeConnections.CloseAll()
 	connections.Wait()
 	return nil
 }
 
-func acceptEvents(context context.Context, listener net.Listener, db *store.DB, recordDir string, trackers *senderTracker, connections *sync.WaitGroup) {
+func acceptEvents(context context.Context, listener net.Listener, db *store.DB, recordDir string, trackers *senderTracker, activeConnections *connectionRegistry, connections *sync.WaitGroup) {
 	for {
 		connection, err := listener.Accept()
 		if err != nil {
@@ -130,6 +132,8 @@ func acceptEvents(context context.Context, listener net.Listener, db *store.DB, 
 		connections.Add(1)
 		go func() {
 			defer connections.Done()
+			activeConnections.Add(connection)
+			defer activeConnections.Remove(connection)
 			sender := senderName(connection.RemoteAddr())
 			trackers.connect(sender)
 			defer trackers.disconnect(sender)
@@ -146,6 +150,39 @@ func acceptEvents(context context.Context, listener net.Listener, db *store.DB, 
 			defer activeConnection.Close()
 			readEvents(activeConnection, db, trackers, sender)
 		}()
+	}
+}
+
+type connectionRegistry struct {
+	mu          sync.Mutex
+	connections map[net.Conn]struct{}
+}
+
+func newConnectionRegistry() *connectionRegistry {
+	return &connectionRegistry{connections: make(map[net.Conn]struct{})}
+}
+
+func (r *connectionRegistry) Add(connection net.Conn) {
+	r.mu.Lock()
+	r.connections[connection] = struct{}{}
+	r.mu.Unlock()
+}
+
+func (r *connectionRegistry) Remove(connection net.Conn) {
+	r.mu.Lock()
+	delete(r.connections, connection)
+	r.mu.Unlock()
+}
+
+func (r *connectionRegistry) CloseAll() {
+	r.mu.Lock()
+	connections := make([]net.Conn, 0, len(r.connections))
+	for connection := range r.connections {
+		connections = append(connections, connection)
+	}
+	r.mu.Unlock()
+	for _, connection := range connections {
+		_ = connection.Close()
 	}
 }
 
@@ -419,7 +456,7 @@ func storeXMLEvent(payload []byte, connection net.Conn, db *store.DB, trackers *
 	trackers.logf("sender=%s state=event_stored inode=%d operation=%s path=%q", sender, event.Inode, event.Operation, event.Path)
 }
 
-func acceptControls(context context.Context, listener net.Listener, db *store.DB, stop context.CancelFunc, connections *sync.WaitGroup) {
+func acceptControls(context context.Context, listener net.Listener, db *store.DB, stop context.CancelFunc, activeConnections *connectionRegistry, connections *sync.WaitGroup) {
 	for {
 		connection, err := listener.Accept()
 		if err != nil {
@@ -432,6 +469,8 @@ func acceptControls(context context.Context, listener net.Listener, db *store.DB
 		connections.Add(1)
 		go func() {
 			defer connections.Done()
+			activeConnections.Add(connection)
+			defer activeConnections.Remove(connection)
 			defer connection.Close()
 			handleControl(connection, db, stop)
 		}()
