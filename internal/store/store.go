@@ -125,6 +125,19 @@ func (d *DB) ResetEvents() error {
 	return batch.Commit(pebble.NoSync)
 }
 
+func (d *DB) EventCount() (uint64, error) {
+	iter, err := d.db.NewIter(&pebble.IterOptions{LowerBound: []byte("t:"), UpperBound: []byte("u:")})
+	if err != nil {
+		return 0, err
+	}
+	defer iter.Close()
+	var count uint64
+	for iter.First(); iter.Valid(); iter.Next() {
+		count++
+	}
+	return count, iter.Error()
+}
+
 func (d *DB) EventsSince(since time.Time) ([]Event, error) {
 	iter, err := d.db.NewIter(&pebble.IterOptions{
 		LowerBound: []byte("t:"),

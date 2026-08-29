@@ -10,6 +10,7 @@ import (
 	"io"
 	"net"
 	"os"
+	"os/exec"
 	"os/signal"
 	"path/filepath"
 	"regexp"
@@ -47,9 +48,11 @@ type controlRequest struct {
 }
 
 type controlResponse struct {
-	Error  string        `json:"error,omitempty"`
-	Status string        `json:"status,omitempty"`
-	Events []store.Event `json:"events,omitempty"`
+	Error       string        `json:"error,omitempty"`
+	Status      string        `json:"status,omitempty"`
+	Connections int           `json:"connections,omitempty"`
+	EventCount  uint64        `json:"event_count,omitempty"`
+	Events      []store.Event `json:"events,omitempty"`
 }
 
 func main() {
@@ -60,22 +63,41 @@ func main() {
 
 func newRootCommand() *cobra.Command {
 	root := &cobra.Command{Use: "pathdiff", Short: "Store and inspect FPolicy path changes", SilenceUsage: true}
-	root.AddCommand(newDaemonCommand(), newEventsCommand(), newPathCommand(), newMonitorCommand(), newVolumeCommand(), newDBCommand(), newControlCommand("status"), newControlCommand("stop"))
+	root.AddGroup(&cobra.Group{ID: "queries", Title: "Query Commands:"}, &cobra.Group{ID: "management", Title: "Management Commands:"}, &cobra.Group{ID: "service", Title: "Service Commands:"}, &cobra.Group{ID: "other", Title: "Other Commands:"})
+	root.AddCommand(newDaemonCommand(), newEventsCommand(), newPathCommand(), newVolumeCommand(), newDBCommand(), newServiceCommand())
+	root.SetHelpCommandGroupID("other")
+	root.InitDefaultCompletionCmd()
+	root.CompletionOptions.HiddenDefaultCmd = false
+	if completion, _, err := root.Find([]string{"completion"}); err == nil {
+		completion.GroupID = "other"
+	}
+	for _, command := range root.Commands() {
+		switch command.Name() {
+		case "events", "path":
+			command.GroupID = "queries"
+		case "volume", "db":
+			command.GroupID = "management"
+		case "service":
+			command.GroupID = "service"
+		}
+	}
 	return root
 }
 
 func newDaemonCommand() *cobra.Command {
 	var dbPath, listenAddr, controlPath, recordDir string
 	var verbose bool
-	command := &cobra.Command{Use: "daemon", Short: "Run the event receiver and query service", RunE: func(*cobra.Command, []string) error {
+	run := &cobra.Command{Use: "run", Hidden: true, RunE: func(*cobra.Command, []string) error {
 		return runDaemon(dbPath, listenAddr, controlPath, recordDir, verbose)
 	}}
-	command.Flags().StringVar(&dbPath, "db", defaultDB, "Pebble database directory")
-	command.Flags().StringVar(&listenAddr, "listen", defaultListen, "FPolicy event listener address")
-	command.Flags().StringVar(&controlPath, "control", defaultControl, "Unix control socket")
-	command.Flags().StringVar(&recordDir, "record-dir", "", "directory for raw per-connection .in and .out captures")
-	command.Flags().BoolVarP(&verbose, "verbose", "v", false, "log sender state changes and 10-second throughput reports")
-	return command
+	run.Flags().StringVar(&dbPath, "db", defaultDB, "Pebble database directory")
+	run.Flags().StringVar(&listenAddr, "listen", defaultListen, "FPolicy event listener address")
+	run.Flags().StringVar(&controlPath, "control", defaultControl, "Unix control socket")
+	run.Flags().StringVar(&recordDir, "record-dir", "", "directory for raw per-connection .in and .out captures")
+	run.Flags().BoolVarP(&verbose, "verbose", "v", false, "log sender state changes and 10-second throughput reports")
+	daemon := &cobra.Command{Use: "daemon", Hidden: true}
+	daemon.AddCommand(run)
+	return daemon
 }
 
 func runDaemon(dbPath, listenAddr, controlPath, recordDir string, verbose bool) error {
@@ -115,7 +137,7 @@ func runDaemon(dbPath, listenAddr, controlPath, recordDir string, verbose bool) 
 	trackers := newSenderTracker(verbose)
 	go trackers.reportEvery(context, 10*time.Second)
 	go acceptEvents(context, eventListener, db, recordDir, trackers, activeConnections, &connections)
-	go acceptControls(context, controlListener, db, cancel, activeConnections, &connections)
+	go acceptControls(context, controlListener, db, cancel, trackers, activeConnections, &connections)
 	<-context.Done()
 	_ = eventListener.Close()
 	_ = controlListener.Close()
@@ -245,6 +267,16 @@ func (t *senderTracker) eventStored(sender string) {
 	stats.intervalEvents++
 	stats.totalEvents++
 	t.mu.Unlock()
+}
+
+func (t *senderTracker) connectionCount() int {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	count := 0
+	for _, stats := range t.senders {
+		count += stats.active
+	}
+	return count
 }
 
 func (t *senderTracker) reportEvery(context context.Context, interval time.Duration) {
@@ -479,7 +511,7 @@ func storeXMLEvent(payload []byte, connection net.Conn, db *store.DB, trackers *
 	trackers.logf("sender=%s state=event_stored operation=%s path=%q", sender, event.Operation, event.Path)
 }
 
-func acceptControls(context context.Context, listener net.Listener, db *store.DB, stop context.CancelFunc, activeConnections *connectionRegistry, connections *sync.WaitGroup) {
+func acceptControls(context context.Context, listener net.Listener, db *store.DB, stop context.CancelFunc, trackers *senderTracker, activeConnections *connectionRegistry, connections *sync.WaitGroup) {
 	for {
 		connection, err := listener.Accept()
 		if err != nil {
@@ -495,12 +527,12 @@ func acceptControls(context context.Context, listener net.Listener, db *store.DB
 			activeConnections.Add(connection)
 			defer activeConnections.Remove(connection)
 			defer connection.Close()
-			handleControl(connection, db, stop)
+			handleControl(connection, db, stop, trackers)
 		}()
 	}
 }
 
-func handleControl(connection net.Conn, db *store.DB, stop context.CancelFunc) {
+func handleControl(connection net.Conn, db *store.DB, stop context.CancelFunc, trackers *senderTracker) {
 	var request controlRequest
 	response := controlResponse{}
 	if err := json.NewDecoder(io.LimitReader(connection, 1024*1024)).Decode(&request); err != nil {
@@ -509,6 +541,8 @@ func handleControl(connection net.Conn, db *store.DB, stop context.CancelFunc) {
 		switch request.Command {
 		case "status":
 			response.Status = "running"
+			response.Connections = trackers.connectionCount()
+			response.EventCount, err = db.EventCount()
 		case "stop":
 			response.Status = "stopping"
 			stop()
@@ -570,6 +604,151 @@ func newVolumeCommand() *cobra.Command {
 	_ = set.MarkFlagRequired("name")
 	volume.AddCommand(set)
 	return volume
+}
+
+func newServiceCommand() *cobra.Command {
+	service := &cobra.Command{Use: "service", Short: "Manage the pathdiff systemd service"}
+	service.AddCommand(newServiceStartCommand(), newServiceStatusCommand(), newServiceStopCommand(), newServiceMonitorCommand())
+	return service
+}
+
+func newServiceStartCommand() *cobra.Command {
+	var dbPath, listenAddr, controlPath, recordDir string
+	var verbose bool
+	command := &cobra.Command{Use: "start", Short: "Register and start the user systemd service", RunE: func(command *cobra.Command, _ []string) error {
+		unitPath, created, err := ensureSystemdUnit(dbPath, listenAddr, controlPath, recordDir, verbose)
+		if err != nil {
+			return err
+		}
+		if created {
+			if err := runSystemctlUser("daemon-reload"); err != nil {
+				return err
+			}
+		}
+		if err := runSystemctlUser("start", "pathdiff.service"); err != nil {
+			return err
+		}
+		_, err = fmt.Fprintf(command.OutOrStdout(), "pathdiff service started (%s)\n", unitPath)
+		return err
+	}}
+	command.Flags().StringVar(&dbPath, "db", defaultDB, "Pebble database directory")
+	command.Flags().StringVar(&listenAddr, "listen", defaultListen, "FPolicy event listener address")
+	command.Flags().StringVar(&controlPath, "control", defaultControl, "Unix control socket")
+	command.Flags().StringVar(&recordDir, "record-dir", "", "directory for raw per-connection .in and .out captures")
+	command.Flags().BoolVarP(&verbose, "verbose", "v", false, "enable daemon sender diagnostics")
+	return command
+}
+
+func newServiceStatusCommand() *cobra.Command {
+	var controlPath string
+	command := &cobra.Command{Use: "status", Short: "Show systemd and daemon status", RunE: func(command *cobra.Command, _ []string) error {
+		state, err := systemdServiceState()
+		if err != nil {
+			return err
+		}
+		connections, events := "-", "-"
+		if state == "active" {
+			response, err := callControl(controlPath, controlRequest{Command: "status"})
+			if err == nil {
+				connections = formatCount(uint64(response.Connections))
+				events = formatCount(response.EventCount)
+			} else {
+				state += " (control unavailable)"
+			}
+		}
+		tableWriter := table.NewWriter()
+		tableWriter.SetOutputMirror(command.OutOrStdout())
+		tableWriter.AppendHeader(table.Row{"Service", "State", "FPolicy Connections", "Registered Events"})
+		tableWriter.AppendRow(table.Row{"pathdiff", state, connections, events})
+		tableWriter.Render()
+		return nil
+	}}
+	command.Flags().StringVar(&controlPath, "control", defaultControl, "Unix control socket")
+	return command
+}
+
+func newServiceStopCommand() *cobra.Command {
+	return &cobra.Command{Use: "stop", Short: "Stop the user systemd service", RunE: func(*cobra.Command, []string) error {
+		return runSystemctlUser("stop", "pathdiff.service")
+	}}
+}
+
+func newServiceMonitorCommand() *cobra.Command {
+	command := newMonitorCommand()
+	command.Use = "monitor"
+	command.Short = "Monitor newly observed path changes"
+	return command
+}
+
+func ensureSystemdUnit(dbPath, listenAddr, controlPath, recordDir string, verbose bool) (string, bool, error) {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return "", false, err
+	}
+	unitPath := filepath.Join(home, ".config", "systemd", "user", "pathdiff.service")
+	if _, err := os.Stat(unitPath); err == nil {
+		return unitPath, false, nil
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return "", false, err
+	}
+	executable, err := os.Executable()
+	if err != nil {
+		return "", false, err
+	}
+	arguments := []string{shellQuote(executable), "daemon", "run", "--db", shellQuote(dbPath), "--listen", shellQuote(listenAddr), "--control", shellQuote(controlPath)}
+	if recordDir != "" {
+		arguments = append(arguments, "--record-dir", shellQuote(recordDir))
+	}
+	if verbose {
+		arguments = append(arguments, "--verbose")
+	}
+	unit := systemdUnit(arguments)
+	if err := os.MkdirAll(filepath.Dir(unitPath), 0o755); err != nil {
+		return "", false, err
+	}
+	if err := os.WriteFile(unitPath, []byte(unit), 0o644); err != nil {
+		return "", false, err
+	}
+	return unitPath, true, nil
+}
+
+func runSystemctlUser(arguments ...string) error {
+	output, err := exec.Command("systemctl", append([]string{"--user"}, arguments...)...).CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("systemctl --user %s: %w: %s", strings.Join(arguments, " "), err, strings.TrimSpace(string(output)))
+	}
+	return nil
+}
+
+func systemdServiceState() (string, error) {
+	output, err := exec.Command("systemctl", "--user", "is-active", "pathdiff.service").Output()
+	state := strings.TrimSpace(string(output))
+	if state != "" {
+		return state, nil
+	}
+	if exitError, ok := err.(*exec.ExitError); ok && (exitError.ExitCode() == 3 || exitError.ExitCode() == 4) {
+		return "not registered", nil
+	}
+	if err != nil {
+		return "", fmt.Errorf("systemctl --user is-active pathdiff.service: %w", err)
+	}
+	return "unknown", nil
+}
+
+func systemdUnit(arguments []string) string {
+	return "[Unit]\nDescription=pathdiff FPolicy event receiver\n\n[Service]\nExecStart=" + strings.Join(arguments, " ") + "\nRestart=on-failure\nRestartSec=2\n\n[Install]\nWantedBy=default.target\n"
+}
+
+func shellQuote(value string) string {
+	return strconv.Quote(value)
+}
+
+func formatCount(value uint64) string {
+	text := strconv.FormatUint(value, 10)
+	for index := len(text) - 3; index > 0; index -= 3 {
+		text = text[:index] + "," + text[index:]
+	}
+	return text
 }
 
 func newEventsCommand() *cobra.Command {

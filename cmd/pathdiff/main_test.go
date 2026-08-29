@@ -213,3 +213,13 @@ func TestPrintParentPathsCoalescesDirectories(t *testing.T) {
 		t.Fatalf("parent paths were not coalesced to latest changes: %s", got)
 	}
 }
+
+func TestServiceFormatting(t *testing.T) {
+	if got := formatCount(1234567); got != "1,234,567" {
+		t.Fatalf("formatCount() = %q", got)
+	}
+	unit := systemdUnit([]string{"/opt/pathdiff", "daemon", "run"})
+	if !strings.Contains(unit, "ExecStart=/opt/pathdiff daemon run") || !strings.Contains(unit, "Restart=on-failure") {
+		t.Fatalf("unexpected systemd unit: %s", unit)
+	}
+}
