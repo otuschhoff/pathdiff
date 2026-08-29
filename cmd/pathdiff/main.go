@@ -33,12 +33,15 @@ import (
 	"github.com/jedib0t/go-pretty/v6/text"
 	"github.com/spf13/cobra"
 	"golang.org/x/crypto/ssh"
+	"golang.org/x/crypto/ssh/knownhosts"
 )
 
 const (
-	defaultDB      = "pathdiff_data"
-	defaultControl = "/tmp/pathdiff.sock"
-	defaultListen  = ":9911"
+	defaultDB                = "pathdiff_data"
+	defaultControl           = "/tmp/pathdiff.sock"
+	defaultListen            = ":9911"
+	fpolicyPolicyShowCommand = "vserver fpolicy policy show"
+	fpolicyEngineShowCommand = "vserver fpolicy policy external-engine show -fields primary-servers,secondary-servers,port,ssl-option"
 )
 
 var captureSequence atomic.Uint64
@@ -77,7 +80,7 @@ func main() {
 func newRootCommand() *cobra.Command {
 	root := &cobra.Command{Use: "pathdiff", Short: "Store and inspect FPolicy path changes", SilenceUsage: true}
 	root.AddGroup(&cobra.Group{ID: "queries", Title: "Query Commands:"}, &cobra.Group{ID: "management", Title: "Management Commands:"}, &cobra.Group{ID: "service", Title: "Service Commands:"}, &cobra.Group{ID: "other", Title: "Other Commands:"})
-	root.AddCommand(newDaemonCommand(), newEventsCommand(), newPathCommand(), newVolumeCommand(), newSVMCommand(), newDBCommand(), newEngineCommand(), newCDOTCommand(), newServiceCommand())
+	root.AddCommand(newDaemonCommand(), newEventsCommand(), newPathCommand(), newDBCommand(), newEngineCommand(), newCDOTCommand(), newServiceCommand())
 	root.SetHelpCommandGroupID("other")
 	root.InitDefaultCompletionCmd()
 	root.CompletionOptions.HiddenDefaultCmd = false
@@ -707,6 +710,7 @@ func newEngineCommand() *cobra.Command {
 func newCDOTCommand() *cobra.Command {
 	cdot := &cobra.Command{Use: "cdot", Short: "Manage cDOT SSH access"}
 	cdot.PersistentFlags().String("user", "pathdiff", "default SSH user for cDOT connections")
+	cdot.PersistentFlags().String("host", defaultCDOTCluster(), "cDOT cluster hostname or address")
 	pubkey := &cobra.Command{Use: "pubkey", Short: "Manage the cDOT SSH public key"}
 	var generateFile string
 	generate := &cobra.Command{Use: "generate", Short: "Generate a cDOT SSH public key", RunE: func(command *cobra.Command, _ []string) error {
@@ -736,8 +740,293 @@ func newCDOTCommand() *cobra.Command {
 	}}
 	show.Flags().StringVar(&showFile, "file", "", "private key path; defaults to the XDG path")
 	pubkey.AddCommand(generate, show)
-	cdot.AddCommand(pubkey)
+	cdot.AddCommand(pubkey, newVolumeCommand(), newSVMCommand(), newCDOTCheckCommand(), newCDOTSetClusterCommand())
 	return cdot
+}
+
+func newCDOTSetClusterCommand() *cobra.Command {
+	return &cobra.Command{Use: "set-cluster <clusterFQDN>", Args: cobra.ExactArgs(1), Short: "Set the default cDOT cluster", RunE: func(command *cobra.Command, arguments []string) error {
+		if err := setCDOTCluster(arguments[0]); err != nil {
+			return err
+		}
+		_, err := fmt.Fprintln(command.OutOrStdout(), arguments[0])
+		return err
+	}}
+}
+
+func newCDOTCheckCommand() *cobra.Command {
+	var keyFile, knownHostsFile string
+	var acceptNewHostKey, debugSSHExec bool
+	command := &cobra.Command{Use: "check", Short: "Check cDOT FPolicy external-engine configuration", RunE: func(command *cobra.Command, _ []string) error {
+		host, err := command.Flags().GetString("host")
+		if err != nil {
+			return err
+		}
+		user, err := command.Flags().GetString("user")
+		if err != nil {
+			return err
+		}
+		if host == "" {
+			return errors.New("host is required")
+		}
+		keyPath, err := cdotKeyFile(keyFile)
+		if err != nil {
+			return err
+		}
+		if knownHostsFile == "" {
+			knownHostsFile, err = cdotKnownHostsFile()
+			if err != nil {
+				return err
+			}
+		}
+		var debugWriter io.Writer
+		if debugSSHExec {
+			debugWriter = command.ErrOrStderr()
+		}
+		result, err := checkCDOT(host, user, keyPath, knownHostsFile, acceptNewHostKey, debugWriter)
+		if err != nil {
+			return err
+		}
+		return printCDOTCheck(command.OutOrStdout(), result)
+	}}
+	command.Flags().StringVar(&keyFile, "key", "", "private key path; defaults to the XDG path")
+	command.Flags().StringVar(&knownHostsFile, "known-hosts", "", "known_hosts file; defaults to the XDG path")
+	command.Flags().BoolVar(&acceptNewHostKey, "accept-new-host-key", false, "trust and save the host key when known_hosts is absent")
+	command.Flags().BoolVar(&debugSSHExec, "debug-ssh-exec", false, "print SSH commands and their results to stderr")
+	return command
+}
+
+type cdotCheckResult struct {
+	Host            string
+	User            string
+	FPolicyPolicy   string
+	FPolicyEndpoint string
+}
+
+func checkCDOT(host, user, keyFile, knownHostsFile string, acceptNewHostKey bool, debugWriter io.Writer) (cdotCheckResult, error) {
+	signer, err := readSSHSigner(keyFile)
+	if err != nil {
+		return cdotCheckResult{}, err
+	}
+	hostKeyCallback, err := cdotHostKeyCallback(knownHostsFile, sshAddress(host), acceptNewHostKey)
+	if err != nil {
+		return cdotCheckResult{}, fmt.Errorf("load cDOT known hosts: %w", err)
+	}
+	address := sshAddress(host)
+	connection, err := net.DialTimeout("tcp", address, 10*time.Second)
+	if err != nil {
+		return cdotCheckResult{}, fmt.Errorf("connect to cDOT %s: %w", address, err)
+	}
+	defer connection.Close()
+	clientConnection, channels, requests, err := ssh.NewClientConn(connection, address, &ssh.ClientConfig{User: user, Auth: []ssh.AuthMethod{ssh.PublicKeys(signer)}, HostKeyCallback: hostKeyCallback, Timeout: 10 * time.Second})
+	if err != nil {
+		return cdotCheckResult{}, fmt.Errorf("authenticate to cDOT %s: %w", address, err)
+	}
+	client := ssh.NewClient(clientConnection, channels, requests)
+	defer client.Close()
+	output, err := runSSHCommand(client, fpolicyPolicyShowCommand, debugWriter)
+	if err != nil {
+		return cdotCheckResult{}, fmt.Errorf("query cDOT FPolicy policies: %w: %s", err, strings.TrimSpace(string(output)))
+	}
+	policy := "readable"
+	if strings.TrimSpace(string(output)) == "" {
+		policy = "no policies returned"
+	}
+	output, err = runSSHCommand(client, fpolicyEngineShowCommand, debugWriter)
+	if err != nil {
+		return cdotCheckResult{}, fmt.Errorf("query cDOT FPolicy external engines: %w: %s", err, strings.TrimSpace(string(output)))
+	}
+	endpoint := "not configured for this host"
+	if fpolicyServerMatches(string(output), localAddresses()) {
+		endpoint = "configured for this host"
+	}
+	return cdotCheckResult{Host: host, User: user, FPolicyPolicy: policy, FPolicyEndpoint: endpoint}, nil
+}
+
+func runSSHCommand(client *ssh.Client, command string, debugWriter io.Writer) ([]byte, error) {
+	if debugWriter != nil {
+		_, _ = fmt.Fprintf(debugWriter, "ssh exec: %s\n", command)
+	}
+	session, err := client.NewSession()
+	if err != nil {
+		return nil, err
+	}
+	defer session.Close()
+	output, err := session.CombinedOutput(command)
+	if debugWriter != nil {
+		_, _ = fmt.Fprintf(debugWriter, "ssh result:\n%s\n", output)
+	}
+	return output, err
+}
+
+func cdotHostKeyCallback(knownHostsFile, address string, acceptNewHostKey bool) (ssh.HostKeyCallback, error) {
+	callback, err := knownhosts.New(knownHostsFile)
+	if err == nil {
+		return callback, nil
+	}
+	if !errors.Is(err, os.ErrNotExist) || !acceptNewHostKey {
+		return nil, fmt.Errorf("load cDOT known hosts: %w; run cdot check with --accept-new-host-key to trust the first key", err)
+	}
+	if err := os.MkdirAll(filepath.Dir(knownHostsFile), 0o700); err != nil {
+		return nil, err
+	}
+	return func(_ string, _ net.Addr, key ssh.PublicKey) error {
+		file, err := os.OpenFile(knownHostsFile, os.O_WRONLY|os.O_CREATE|os.O_APPEND, 0o600)
+		if err != nil {
+			return err
+		}
+		defer file.Close()
+		_, err = file.WriteString(knownhosts.Line([]string{knownhosts.Normalize(address)}, key) + "\n")
+		return err
+	}, nil
+}
+
+func readSSHSigner(keyFile string) (ssh.Signer, error) {
+	key, err := os.ReadFile(keyFile)
+	if err != nil {
+		return nil, fmt.Errorf("read cDOT SSH private key: %w", err)
+	}
+	signer, err := ssh.ParsePrivateKey(key)
+	if err != nil {
+		return nil, fmt.Errorf("parse cDOT SSH private key: %w", err)
+	}
+	return signer, nil
+}
+
+func cdotKnownHostsFile() (string, error) {
+	configHome, err := cdotConfigHome()
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(configHome, "known_hosts"), nil
+}
+
+type cdotConfig struct {
+	Cluster string `json:"cluster"`
+}
+
+func defaultCDOTCluster() string {
+	config, err := loadCDOTConfig()
+	if err != nil {
+		return ""
+	}
+	return config.Cluster
+}
+
+func setCDOTCluster(cluster string) error {
+	if cluster == "" {
+		return errors.New("cluster FQDN is required")
+	}
+	configPath, err := cdotConfigFile()
+	if err != nil {
+		return err
+	}
+	if err := os.MkdirAll(filepath.Dir(configPath), 0o700); err != nil {
+		return err
+	}
+	data, err := json.Marshal(cdotConfig{Cluster: cluster})
+	if err != nil {
+		return err
+	}
+	temporary, err := os.CreateTemp(filepath.Dir(configPath), ".cdot.json-")
+	if err != nil {
+		return err
+	}
+	temporaryPath := temporary.Name()
+	defer os.Remove(temporaryPath)
+	if err := temporary.Chmod(0o600); err != nil {
+		_ = temporary.Close()
+		return err
+	}
+	if _, err := temporary.Write(append(data, '\n')); err != nil {
+		_ = temporary.Close()
+		return err
+	}
+	if err := temporary.Close(); err != nil {
+		return err
+	}
+	return os.Rename(temporaryPath, configPath)
+}
+
+func loadCDOTConfig() (cdotConfig, error) {
+	configPath, err := cdotConfigFile()
+	if err != nil {
+		return cdotConfig{}, err
+	}
+	data, err := os.ReadFile(configPath)
+	if errors.Is(err, os.ErrNotExist) {
+		return cdotConfig{}, nil
+	}
+	if err != nil {
+		return cdotConfig{}, err
+	}
+	var config cdotConfig
+	if err := json.Unmarshal(data, &config); err != nil {
+		return cdotConfig{}, fmt.Errorf("parse cDOT config: %w", err)
+	}
+	return config, nil
+}
+
+func cdotConfigFile() (string, error) {
+	configHome, err := cdotConfigHome()
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(configHome, "cdot.json"), nil
+}
+
+func cdotConfigHome() (string, error) {
+	configHome := os.Getenv("XDG_CONFIG_HOME")
+	if configHome == "" {
+		home, err := os.UserHomeDir()
+		if err != nil {
+			return "", err
+		}
+		configHome = filepath.Join(home, ".config")
+	}
+	return filepath.Join(configHome, "pathdiff"), nil
+}
+
+func sshAddress(host string) string {
+	if _, _, err := net.SplitHostPort(host); err == nil {
+		return host
+	}
+	return net.JoinHostPort(host, "22")
+}
+
+func localAddresses() []string {
+	addresses := []string{}
+	if hostname, err := os.Hostname(); err == nil && hostname != "" {
+		addresses = append(addresses, hostname)
+	}
+	interfaces, err := net.InterfaceAddrs()
+	if err != nil {
+		return addresses
+	}
+	for _, address := range interfaces {
+		ip, _, err := net.ParseCIDR(address.String())
+		if err == nil && !ip.IsLoopback() {
+			addresses = append(addresses, ip.String())
+		}
+	}
+	return addresses
+}
+
+func fpolicyServerMatches(configuration string, addresses []string) bool {
+	for _, address := range addresses {
+		if strings.Contains(configuration, address) {
+			return true
+		}
+	}
+	return false
+}
+
+func printCDOTCheck(writer io.Writer, result cdotCheckResult) error {
+	tableWriter := newTableWriter(writer)
+	tableWriter.AppendHeader(table.Row{"Cluster", "SSH User", "FPolicy Policy", "FPolicy Endpoint"})
+	tableWriter.AppendRow(table.Row{result.Host, result.User, result.FPolicyPolicy, result.FPolicyEndpoint})
+	tableWriter.Render()
+	return nil
 }
 
 func cdotKeyFile(override string) (string, error) {
