@@ -13,7 +13,7 @@
 Build the binary with `xc build`, then start the daemon with a TCP listener that the FPolicy bridge can reach:
 
 ```sh
-bin/pathdiff daemon --db ./pathdiff.db --listen :9911
+bin/pathdiff daemon --db pathdiff_data --listen :9911
 ```
 
 The event listener accepts one JSON object per line. `timestamp` is RFC3339 and optional; omitted timestamps are assigned when the event is stored.

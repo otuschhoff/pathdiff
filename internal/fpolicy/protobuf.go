@@ -118,6 +118,88 @@ func ParseNotification(payload []byte) (store.Event, error) {
 // ParseXMLNotification decodes an XML notification using the field names in the
 // FPolicy event schema. Both XML elements and attributes are accepted.
 func ParseXMLNotification(payload []byte) (store.Event, error) {
+	message, err := ParseXMLMessage(payload)
+	if err != nil {
+		return store.Event{}, err
+	}
+	if message.Notification == nil {
+		return store.Event{}, fmt.Errorf("expected NotificationRequest")
+	}
+	return *message.Notification, nil
+}
+
+type XMLMessage struct {
+	SessionID    string
+	Negotiate    bool
+	Notification *store.Event
+}
+
+type xmlEnvelope struct {
+	Header struct {
+		SessionID string `xml:"SessionID"`
+	} `xml:"Header"`
+	NegotiateRequest    *struct{} `xml:"NegotiateRequest"`
+	NotificationRequest *struct {
+		Vserver    string `xml:"Vserver"`
+		FileID     uint64 `xml:"FileId"`
+		VolumeUUID string `xml:"VolumeUuid"`
+		Path       string `xml:"Path"`
+		Operation  string `xml:"Operation"`
+		Timestamp  int64  `xml:"Timestamp"`
+	} `xml:"NotificationRequest"`
+}
+
+// ParseXMLMessage decodes the documented FPolicy XML envelope and payloads.
+func ParseXMLMessage(payload []byte) (XMLMessage, error) {
+	var envelope xmlEnvelope
+	if err := xml.Unmarshal(payload, &envelope); err != nil {
+		return XMLMessage{}, err
+	}
+	message := XMLMessage{SessionID: envelope.Header.SessionID}
+	if envelope.NegotiateRequest != nil {
+		message.Negotiate = true
+		return message, nil
+	}
+	if notification := envelope.NotificationRequest; notification != nil {
+		if notification.Path == "" {
+			return XMLMessage{}, fmt.Errorf("notification path is required")
+		}
+		message.Notification = &store.Event{
+			Inode:      notification.FileID,
+			Path:       notification.Path,
+			Operation:  notification.Operation,
+			Timestamp:  time.UnixMicro(notification.Timestamp).UTC(),
+			Vserver:    notification.Vserver,
+			VolumeUUID: notification.VolumeUUID,
+		}
+		return message, nil
+	}
+	return XMLMessage{}, fmt.Errorf("unknown FPolicy XML message")
+}
+
+func NegotiateResponse(sessionID string) ([]byte, error) {
+	response := struct {
+		XMLName xml.Name `xml:"FPolicy"`
+		XMLNS   string   `xml:"xmlns,attr"`
+		Header  struct {
+			SessionID string `xml:"SessionID"`
+		} `xml:"Header"`
+		NegotiateResponse struct {
+			SelectedProtocol string `xml:"SelectedProtocol"`
+			Status           string `xml:"Status"`
+		} `xml:"NegotiateResponse"`
+	}{XMLNS: "http://www.netapp.com/fpolicy"}
+	response.Header.SessionID = sessionID
+	response.NegotiateResponse.SelectedProtocol = "1.0"
+	response.NegotiateResponse.Status = "SUCCESS"
+	payload, err := xml.Marshal(response)
+	if err != nil {
+		return nil, err
+	}
+	return append([]byte(xml.Header), payload...), nil
+}
+
+func decodeLegacyXMLNotification(payload []byte) (store.Event, error) {
 	decoder := xml.NewDecoder(bytes.NewReader(payload))
 	return DecodeXMLNotification(decoder)
 }
