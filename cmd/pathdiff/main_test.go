@@ -236,3 +236,26 @@ func TestDatabaseStatusFormatting(t *testing.T) {
 		t.Fatalf("unexpected database status output: %s", got)
 	}
 }
+
+func TestEngineSnapshotAndFormatting(t *testing.T) {
+	tracker := newSenderTracker(false)
+	tracker.senders["192.0.2.10"] = &senderStats{
+		active:         1,
+		connectedSince: time.Now().UTC().Add(-time.Minute),
+		totalEvents:    120,
+		localPort:      "9911",
+		nodeID:         "node-1",
+		svmID:          "svm-1",
+	}
+	engines := tracker.engines()
+	if len(engines) != 1 || engines[0].LIFIPv4 != "192.0.2.10" || engines[0].TotalEvents != 120 || engines[0].LocalPort != "9911" || engines[0].SVMID != "svm-1" || engines[0].AverageRate <= 0 {
+		t.Fatalf("unexpected engine snapshot: %#v", engines)
+	}
+	var output bytes.Buffer
+	if err := printEngines(&output, engines); err != nil {
+		t.Fatal(err)
+	}
+	if got := output.String(); !strings.Contains(got, "TOTAL EVENTS") || !strings.Contains(got, "192.0.2.10") || !strings.Contains(got, "node-1") {
+		t.Fatalf("unexpected engine table: %s", got)
+	}
+}

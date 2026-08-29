@@ -17,11 +17,14 @@ bin/pathdiff service start --db pathdiff_data --listen :9911
 bin/pathdiff service status
 bin/pathdiff service monitor --path /vol/finance/ --interval 2s
 bin/pathdiff service stop
+bin/pathdiff engine list
 ```
 
 On first start, `pathdiff` writes `~/.config/systemd/user/pathdiff.service`, reloads the user systemd manager, and starts it. Later `service start` calls start the registered unit without replacing its configuration. Add `--verbose` (or `-v`) to the first start to log sender connection, protocol, negotiation, keep-alive, and accepted-event state changes. While verbose mode is enabled, the daemon reports per-sender accepted-event throughput every 10 seconds.
 
 `service status` renders the systemd state, active FPolicy connection count, and registered event count. The internal `daemon run` entrypoint handles SIGINT and SIGTERM by stopping listeners, closing active sockets, waiting for workers, then closing Pebble.
+
+`engine list` renders active FPolicy engine connections with their connection time, total accepted events, average event rate, LIF IPv4 address, reverse-resolved hostname when available, local listener port, and `NodeId`/SVM ID when ONTAP supplies those fields during negotiation.
 
 When diagnosing an incompatible FPolicy session, add `--record-dir captures` to write the raw bytes from every event connection. Each capture has a timestamped `.in` file for bytes received from ONTAP and a matching `.out` file for bytes sent by `pathdiff`. Captures may contain file paths and user or client identifiers; protect and remove them appropriately.
 
