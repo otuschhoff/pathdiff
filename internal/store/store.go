@@ -7,6 +7,8 @@ import (
 	"errors"
 	"fmt"
 	"math"
+	"os"
+	"path/filepath"
 	"time"
 
 	"github.com/cockroachdb/pebble"
@@ -21,7 +23,8 @@ type Event struct {
 }
 
 type DB struct {
-	db *pebble.DB
+	db   *pebble.DB
+	path string
 }
 
 func Open(path string) (*DB, error) {
@@ -32,7 +35,7 @@ func Open(path string) (*DB, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &DB{db: db}, nil
+	return &DB{db: db, path: path}, nil
 }
 
 func (d *DB) Close() error {
@@ -136,6 +139,28 @@ func (d *DB) EventCount() (uint64, error) {
 		count++
 	}
 	return count, iter.Error()
+}
+
+type Stats struct {
+	Path string
+	Size uint64
+}
+
+func (d *DB) Stats() (Stats, error) {
+	var size uint64
+	err := filepath.Walk(d.path, func(_ string, info os.FileInfo, err error) error {
+		if err != nil {
+			return err
+		}
+		if !info.IsDir() {
+			size += uint64(info.Size())
+		}
+		return nil
+	})
+	if err != nil {
+		return Stats{}, err
+	}
+	return Stats{Path: d.path, Size: size}, nil
 }
 
 func (d *DB) EventsSince(since time.Time) ([]Event, error) {

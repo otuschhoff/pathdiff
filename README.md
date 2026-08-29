@@ -40,6 +40,7 @@ bin/pathdiff events --path /vol/finance/ --start 10d
 bin/pathdiff events --path /vol/finance/ --start 1M4d --end 2026-08-28
 bin/pathdiff path list firefox --start 10d
 bin/pathdiff path parent --path /vol/finance/ --sort timestamp --max 250
+bin/pathdiff db status
 bin/pathdiff db event reset
 ```
 
@@ -54,6 +55,8 @@ bin/pathdiff db event reset
 `path parent` accepts the same flags but coalesces changed paths by volume and parent directory, rendering `Last Change`, `Volume`, `CNT`, and `Parent`. `CNT` is the number of distinct changed child paths beneath that parent. Both views sort by volume then path by default; pass `--sort timestamp` to list newest changes first.
 
 `db event reset` removes all stored event records through the running daemon. It preserves configured volume MSID-to-name mappings.
+
+`db status` renders the live Pebble database path and its on-disk size through the daemon control socket.
 
 ## Implementation
 

@@ -209,7 +209,7 @@ func TestPrintParentPathsCoalescesDirectories(t *testing.T) {
 		t.Fatal(err)
 	}
 	got := output.String()
-	if strings.Count(got, "/vol/alpha") != 1 || strings.Count(got, "/vol/beta") != 1 || !strings.Contains(got, "2026-08-29T12:02:00Z") || !strings.Contains(got, "|   2 | /vol/alpha") || !strings.Contains(got, "|   1 | /vol/beta") {
+	if strings.Count(got, "/vol/alpha") != 1 || strings.Count(got, "/vol/beta") != 1 || !strings.Contains(got, "2026-08-29T12:02:00Z") || !strings.Contains(got, "   2 │ /vol/alpha") || !strings.Contains(got, "   1 │ /vol/beta") {
 		t.Fatalf("parent paths were not coalesced to latest changes: %s", got)
 	}
 }
@@ -221,5 +221,18 @@ func TestServiceFormatting(t *testing.T) {
 	unit := systemdUnit([]string{"/opt/pathdiff", "daemon", "run"})
 	if !strings.Contains(unit, "ExecStart=/opt/pathdiff daemon run") || !strings.Contains(unit, "Restart=on-failure") {
 		t.Fatalf("unexpected systemd unit: %s", unit)
+	}
+}
+
+func TestDatabaseStatusFormatting(t *testing.T) {
+	if got := formatBytes(1536); got != "1.5 KiB" {
+		t.Fatalf("formatBytes() = %q", got)
+	}
+	var output bytes.Buffer
+	if err := printDBStatus(&output, controlResponse{DBPath: "pathdiff_data", DBSize: 1536}); err != nil {
+		t.Fatal(err)
+	}
+	if got := output.String(); !strings.Contains(got, "PATH") || !strings.Contains(got, "pathdiff_data") || !strings.Contains(got, "1.5 KiB") {
+		t.Fatalf("unexpected database status output: %s", got)
 	}
 }
