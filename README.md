@@ -20,6 +20,10 @@ bin/pathdiff service stop
 bin/pathdiff engine list
 bin/pathdiff cdot node list
 bin/pathdiff cdot lif list
+bin/pathdiff cdot fpolicy list
+bin/pathdiff cdot fpolicy scope list
+bin/pathdiff cdot fpolicy start ncl1-1-vs-50
+bin/pathdiff cdot fpolicy stop ncl1-1-vs-50
 bin/pathdiff cdot pubkey generate
 bin/pathdiff cdot pubkey show
 bin/pathdiff cdot set-cluster cluster.example.test
@@ -31,6 +35,8 @@ On first start, `pathdiff` writes `~/.config/systemd/user/pathdiff.service`, rel
 `service status` renders the systemd state, active FPolicy connection count, registered event count, and average accepted FPolicy requests per second since daemon start. The internal `daemon run` entrypoint handles SIGINT and SIGTERM by stopping listeners, closing active sockets, waiting for workers, then closing Pebble.
 
 `cdot node list` and `cdot lif list` render live ONTAP inventory over SSH. `engine list` uses that inventory to resolve each active sender's node and SVM names, hides raw LIF IPv4 by default, and renders connection time, human-readable time since the last accepted event, total events, average event rate, FPolicy connection status when ONTAP permits the status query, hostname, and local listener port.
+
+`cdot fpolicy list [<svmWildcardSearchTerm>]` lists the SVM, external engine, target addresses, port, SSL option, engine type and format, policy class, and event class for FPolicy external-engine configurations. It shows `pathdiff*` policy or engine names by default; use `--all` (or `-a`) for every configured policy. `cdot fpolicy scope list` applies the same filter and lists policy scopes. `cdot fpolicy start [<svmWildcardSearchTerm> [<policyClass>]]` enables matching policy classes, while `cdot fpolicy stop` disables them using the same arguments and filtering. Both select the `pathdiff*` policy or engine by default, accept an explicit policy-class filter as their second argument, and use `--all` to operate on every matching policy.
 
 `cdot pubkey generate` creates a non-interactive Ed25519 keypair at `$XDG_DATA_HOME/pathdiff/cdot_ed25519`, or `~/.local/share/pathdiff/cdot_ed25519` when `XDG_DATA_HOME` is unset. It uses Go cryptography and SSH libraries rather than external SSH commands, prints the public-key path, and will not overwrite an existing key. Use `cdot pubkey show` to print the public key for adding to ONTAP. Future cDOT SSH operations default to user `pathdiff`; pass `cdot --user <user>` to override it.
 
