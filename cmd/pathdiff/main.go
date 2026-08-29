@@ -607,9 +607,23 @@ func newEventsCommand() *cobra.Command {
 }
 
 func newPathCommand() *cobra.Command {
+	paths := &cobra.Command{Use: "path", Short: "Query changed paths"}
+	paths.AddCommand(newPathListCommand(), newPathParentCommand())
+	return paths
+}
+
+func newPathListCommand() *cobra.Command {
+	return newPathQueryCommand("list [path-search]", "List paths changed during a time range", printPaths)
+}
+
+func newPathParentCommand() *cobra.Command {
+	return newPathQueryCommand("parent [path-search]", "List parent directories changed during a time range", printParentPaths)
+}
+
+func newPathQueryCommand(use, summary string, render func(io.Writer, []store.Event, string, int, string) error) *cobra.Command {
 	var controlPath, pathPrefix, startValue, endValue, sortBy string
 	var maxResults int
-	command := &cobra.Command{Use: "path [path-search]", Args: cobra.MaximumNArgs(1), Short: "List paths changed during a time range", RunE: func(command *cobra.Command, arguments []string) error {
+	command := &cobra.Command{Use: use, Args: cobra.MaximumNArgs(1), Short: summary, RunE: func(command *cobra.Command, arguments []string) error {
 		start, end, err := eventRange(startValue, endValue, time.Now().UTC())
 		if err != nil {
 			return err
@@ -622,7 +636,7 @@ func newPathCommand() *cobra.Command {
 		if len(arguments) == 1 {
 			search = normalizePathSearch(arguments[0])
 		}
-		return printPaths(command.OutOrStdout(), response.Events, search, maxResults, sortBy)
+		return render(command.OutOrStdout(), response.Events, search, maxResults, sortBy)
 	}}
 	command.Flags().StringVar(&controlPath, "control", defaultControl, "Unix control socket")
 	command.Flags().StringVar(&pathPrefix, "path", "", "path prefix")
@@ -649,6 +663,74 @@ func eventRange(startValue, endValue string, now time.Time) (time.Time, time.Tim
 }
 
 func printPaths(writer io.Writer, events []store.Event, wildcard string, maxResults int, sortBy string) error {
+	return printPathRows(writer, events, wildcard, maxResults, sortBy, "Path", func(event store.Event) string { return event.Path })
+}
+
+func printParentPaths(writer io.Writer, events []store.Event, wildcard string, maxResults int, sortBy string) error {
+	if maxResults < 1 {
+		return errors.New("max must be greater than zero")
+	}
+	if sortBy != "path" && sortBy != "timestamp" {
+		return fmt.Errorf("unsupported sort %q; use path or timestamp", sortBy)
+	}
+	type parentRow struct {
+		event    store.Event
+		children map[string]struct{}
+	}
+	parents := make(map[string]*parentRow)
+	for _, event := range events {
+		childPath := event.Path
+		parent := filepath.Dir(event.Path)
+		matched, err := wildcardMatch(wildcard, parent)
+		if err != nil {
+			return fmt.Errorf("invalid path wildcard %q: %w", wildcard, err)
+		}
+		if !matched {
+			continue
+		}
+		key := eventVolume(event) + "\x00" + parent
+		row := parents[key]
+		if row == nil {
+			event.Path = parent
+			row = &parentRow{event: event, children: make(map[string]struct{})}
+			parents[key] = row
+		}
+		row.children[childPath] = struct{}{}
+		if event.Timestamp.After(row.event.Timestamp) {
+			event.Path = parent
+			row.event = event
+		}
+	}
+	rows := make([]*parentRow, 0, len(parents))
+	for _, row := range parents {
+		rows = append(rows, row)
+	}
+	if len(rows) > maxResults {
+		_, err := fmt.Fprintf(writer, "%d changed parents match; increase --max and/or tighten the path search, --path prefix, or time range.\n", len(rows))
+		return err
+	}
+	sort.Slice(rows, func(left, right int) bool {
+		if sortBy == "timestamp" {
+			return rows[left].event.Timestamp.After(rows[right].event.Timestamp)
+		}
+		leftVolume, rightVolume := eventVolume(rows[left].event), eventVolume(rows[right].event)
+		if leftVolume == rightVolume {
+			return rows[left].event.Path < rows[right].event.Path
+		}
+		return leftVolume < rightVolume
+	})
+
+	tableWriter := table.NewWriter()
+	tableWriter.SetOutputMirror(writer)
+	tableWriter.AppendHeader(table.Row{"Last Change", "Volume", "CNT", "Parent"})
+	for _, row := range rows {
+		tableWriter.AppendRow(table.Row{row.event.Timestamp.UTC().Format(time.RFC3339Nano), eventVolume(row.event), len(row.children), row.event.Path})
+	}
+	tableWriter.Render()
+	return nil
+}
+
+func printPathRows(writer io.Writer, events []store.Event, wildcard string, maxResults int, sortBy, column string, pathFor func(store.Event) string) error {
 	if maxResults < 1 {
 		return errors.New("max must be greater than zero")
 	}
@@ -657,15 +739,17 @@ func printPaths(writer io.Writer, events []store.Event, wildcard string, maxResu
 	}
 	paths := make(map[string]store.Event)
 	for _, event := range events {
-		matched, err := wildcardMatch(wildcard, event.Path)
+		rowPath := pathFor(event)
+		matched, err := wildcardMatch(wildcard, rowPath)
 		if err != nil {
 			return fmt.Errorf("invalid path wildcard %q: %w", wildcard, err)
 		}
 		if !matched {
 			continue
 		}
-		key := eventVolume(event) + "\x00" + event.Path
+		key := eventVolume(event) + "\x00" + rowPath
 		if existing, found := paths[key]; !found || event.Timestamp.After(existing.Timestamp) {
+			event.Path = rowPath
 			paths[key] = event
 		}
 	}
@@ -674,7 +758,7 @@ func printPaths(writer io.Writer, events []store.Event, wildcard string, maxResu
 		results = append(results, event)
 	}
 	if len(results) > maxResults {
-		_, err := fmt.Fprintf(writer, "%d changed paths match; increase --max and/or tighten the path search, --path prefix, or time range.\n", len(results))
+		_, err := fmt.Fprintf(writer, "%d changed %ss match; increase --max and/or tighten the path search, --path prefix, or time range.\n", len(results), strings.ToLower(column))
 		return err
 	}
 	sort.Slice(results, func(left, right int) bool {
@@ -690,7 +774,7 @@ func printPaths(writer io.Writer, events []store.Event, wildcard string, maxResu
 
 	tableWriter := table.NewWriter()
 	tableWriter.SetOutputMirror(writer)
-	tableWriter.AppendHeader(table.Row{"Last Change", "Volume", "Path"})
+	tableWriter.AppendHeader(table.Row{"Last Change", "Volume", column})
 	for _, event := range results {
 		tableWriter.AppendRow(table.Row{event.Timestamp.UTC().Format(time.RFC3339Nano), eventVolume(event), event.Path})
 	}

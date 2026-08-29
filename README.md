@@ -35,8 +35,8 @@ bin/pathdiff events --path /vol/finance/ --start 2026-08-29T00:00:00Z --end 2026
 bin/pathdiff events firefox --start 10d --max 250
 bin/pathdiff events --path /vol/finance/ --start 10d
 bin/pathdiff events --path /vol/finance/ --start 1M4d --end 2026-08-28
-bin/pathdiff path firefox --start 10d
-bin/pathdiff path --path /vol/finance/ --sort timestamp --max 250
+bin/pathdiff path list firefox --start 10d
+bin/pathdiff path parent --path /vol/finance/ --sort timestamp --max 250
 bin/pathdiff db event reset
 bin/pathdiff monitor --path /vol/finance/ --interval 2s
 bin/pathdiff status
@@ -49,7 +49,9 @@ bin/pathdiff stop
 
 `events` renders matches as a table. Its optional first argument is a case-insensitive path search: `firefox` matches any path containing `firefox`. Include `*` or `?` for an explicit wildcard, where `*` matches across directories and `?` matches one character. `--max` defaults to `100`; when more matches exist, it prints the count instead of a partial table. Increase `--max` or tighten the wildcard, `--path`, or time range.
 
-`path` accepts the same optional path search and `--path`, `--start`, `--end`, `--max`, and `--control` flags as `events`. It coalesces repeated changes to each volume/path pair and renders `Last Change`, `Volume`, and `Path`. It sorts by volume then path by default; pass `--sort timestamp` to list newest changes first.
+`path list` accepts the same optional path search and `--path`, `--start`, `--end`, `--max`, and `--control` flags as `events`. It coalesces repeated changes to each volume/path pair and renders `Last Change`, `Volume`, and `Path`.
+
+`path parent` accepts the same flags but coalesces changed paths by volume and parent directory, rendering `Last Change`, `Volume`, `CNT`, and `Parent`. `CNT` is the number of distinct changed child paths beneath that parent. Both views sort by volume then path by default; pass `--sort timestamp` to list newest changes first.
 
 `db event reset` removes all stored event records through the running daemon. It preserves configured volume MSID-to-name mappings.
 

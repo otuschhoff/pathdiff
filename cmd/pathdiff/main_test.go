@@ -195,3 +195,21 @@ func TestPrintPathsLimitsCoalescedResults(t *testing.T) {
 		t.Fatalf("unexpected path limit output: %s", got)
 	}
 }
+
+func TestPrintParentPathsCoalescesDirectories(t *testing.T) {
+	base := time.Date(2026, 8, 29, 12, 0, 0, 0, time.UTC)
+	events := []store.Event{
+		{Path: "/vol/alpha/a.txt", Timestamp: base, VolumeName: "one"},
+		{Path: "/vol/alpha/b.txt", Timestamp: base.Add(time.Minute), VolumeName: "one"},
+		{Path: "/vol/alpha/a.txt", Timestamp: base.Add(2 * time.Minute), VolumeName: "one"},
+		{Path: "/vol/beta/c.txt", Timestamp: base, VolumeName: "one"},
+	}
+	var output bytes.Buffer
+	if err := printParentPaths(&output, events, "*", 100, "path"); err != nil {
+		t.Fatal(err)
+	}
+	got := output.String()
+	if strings.Count(got, "/vol/alpha") != 1 || strings.Count(got, "/vol/beta") != 1 || !strings.Contains(got, "2026-08-29T12:02:00Z") || !strings.Contains(got, "|   2 | /vol/alpha") || !strings.Contains(got, "|   1 | /vol/beta") {
+		t.Fatalf("parent paths were not coalesced to latest changes: %s", got)
+	}
+}
