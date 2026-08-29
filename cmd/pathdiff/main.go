@@ -15,6 +15,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -29,6 +30,8 @@ const (
 	defaultControl = "/tmp/pathdiff.sock"
 	defaultListen  = ":9911"
 )
+
+var captureSequence atomic.Uint64
 
 type controlRequest struct {
 	Command string    `json:"command"`
@@ -58,17 +61,18 @@ func newRootCommand() *cobra.Command {
 }
 
 func newDaemonCommand() *cobra.Command {
-	var dbPath, listenAddr, controlPath string
+	var dbPath, listenAddr, controlPath, recordDir string
 	command := &cobra.Command{Use: "daemon", Short: "Run the event receiver and query service", RunE: func(*cobra.Command, []string) error {
-		return runDaemon(dbPath, listenAddr, controlPath)
+		return runDaemon(dbPath, listenAddr, controlPath, recordDir)
 	}}
 	command.Flags().StringVar(&dbPath, "db", defaultDB, "Pebble database directory")
 	command.Flags().StringVar(&listenAddr, "listen", defaultListen, "FPolicy event listener address")
 	command.Flags().StringVar(&controlPath, "control", defaultControl, "Unix control socket")
+	command.Flags().StringVar(&recordDir, "record-dir", "", "directory for raw per-connection .in and .out captures")
 	return command
 }
 
-func runDaemon(dbPath, listenAddr, controlPath string) error {
+func runDaemon(dbPath, listenAddr, controlPath, recordDir string) error {
 	db, err := store.Open(dbPath)
 	if err != nil {
 		return fmt.Errorf("open database: %w", err)
@@ -101,7 +105,7 @@ func runDaemon(dbPath, listenAddr, controlPath string) error {
 	defer cancel()
 
 	var connections sync.WaitGroup
-	go acceptEvents(context, eventListener, db, &connections)
+	go acceptEvents(context, eventListener, db, recordDir, &connections)
 	go acceptControls(context, controlListener, db, cancel, &connections)
 	<-context.Done()
 	_ = eventListener.Close()
@@ -110,7 +114,7 @@ func runDaemon(dbPath, listenAddr, controlPath string) error {
 	return nil
 }
 
-func acceptEvents(context context.Context, listener net.Listener, db *store.DB, connections *sync.WaitGroup) {
+func acceptEvents(context context.Context, listener net.Listener, db *store.DB, recordDir string, connections *sync.WaitGroup) {
 	for {
 		connection, err := listener.Accept()
 		if err != nil {
@@ -123,10 +127,64 @@ func acceptEvents(context context.Context, listener net.Listener, db *store.DB, 
 		connections.Add(1)
 		go func() {
 			defer connections.Done()
-			defer connection.Close()
-			readEvents(connection, db)
+			activeConnection := connection
+			if recordDir != "" {
+				var err error
+				activeConnection, err = newTrafficRecorder(connection, recordDir)
+				if err != nil {
+					fmt.Fprintln(os.Stderr, "create traffic capture:", err)
+					_ = connection.Close()
+					return
+				}
+			}
+			defer activeConnection.Close()
+			readEvents(activeConnection, db)
 		}()
 	}
+}
+
+type trafficRecorder struct {
+	net.Conn
+	in, out *os.File
+}
+
+func newTrafficRecorder(connection net.Conn, directory string) (*trafficRecorder, error) {
+	if err := os.MkdirAll(directory, 0o700); err != nil {
+		return nil, err
+	}
+	prefix := fmt.Sprintf("%s-%06d", time.Now().UTC().Format("20060102T150405.000000000Z"), captureSequence.Add(1))
+	in, err := os.Create(filepath.Join(directory, prefix+".in"))
+	if err != nil {
+		return nil, err
+	}
+	out, err := os.Create(filepath.Join(directory, prefix+".out"))
+	if err != nil {
+		_ = in.Close()
+		return nil, err
+	}
+	return &trafficRecorder{Conn: connection, in: in, out: out}, nil
+}
+
+func (r *trafficRecorder) Read(payload []byte) (int, error) {
+	count, err := r.Conn.Read(payload)
+	if count > 0 {
+		_, _ = r.in.Write(payload[:count])
+	}
+	return count, err
+}
+
+func (r *trafficRecorder) Write(payload []byte) (int, error) {
+	count, err := r.Conn.Write(payload)
+	if count > 0 {
+		_, _ = r.out.Write(payload[:count])
+	}
+	return count, err
+}
+
+func (r *trafficRecorder) Close() error {
+	_ = r.in.Close()
+	_ = r.out.Close()
+	return r.Conn.Close()
 }
 
 func readEvents(connection net.Conn, db *store.DB) {
