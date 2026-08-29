@@ -1,11 +1,15 @@
 package main
 
 import (
+	"bytes"
 	"net"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
+
+	"pathdiff/internal/store"
 )
 
 func TestTrafficRecorder(t *testing.T) {
@@ -96,8 +100,9 @@ func TestParseTimeExpression(t *testing.T) {
 		{value: "", offset: -24 * time.Hour, want: now.Add(-24 * time.Hour)},
 		{value: "2026-08-28", want: time.Date(2026, 8, 28, 0, 0, 0, 0, time.UTC)},
 		{value: "10d", want: now.AddDate(0, 0, -10)},
+		{value: "1m", want: now.Add(-time.Minute)},
 		{value: "5h10m", want: now.Add(-(5*time.Hour + 10*time.Minute))},
-		{value: "1m4d", want: now.AddDate(0, -1, -4)},
+		{value: "1M4d", want: now.AddDate(0, -1, -4)},
 		{value: "2026-08-29T10:30:00Z", want: time.Date(2026, 8, 29, 10, 30, 0, 0, time.UTC)},
 	} {
 		got, err := parseTimeExpression("time", test.value, now, test.offset)
@@ -114,5 +119,40 @@ func TestParseTimeExpressionRejectsInvalidValue(t *testing.T) {
 	_, err := parseTimeExpression("start", "tomorrow", time.Now(), 0)
 	if err == nil {
 		t.Fatal("parseTimeExpression accepted an invalid value")
+	}
+}
+
+func TestPrintEventsFiltersAndRendersTable(t *testing.T) {
+	var output bytes.Buffer
+	events := []store.Event{
+		{Path: "/vol/finance/report.csv", Operation: "NFS_WR", Timestamp: time.Date(2026, 8, 29, 10, 0, 0, 0, time.UTC), VolumeMSID: "1", VolumeName: "asic_user"},
+		{Path: "/vol/engineering/main.go", Operation: "NFS_WR", Timestamp: time.Date(2026, 8, 29, 11, 0, 0, 0, time.UTC)},
+	}
+	if err := printEvents(&output, events, normalizePathSearch("FINANCE"), 100); err != nil {
+		t.Fatal(err)
+	}
+	got := output.String()
+	if !strings.Contains(got, "report.csv") || !strings.Contains(got, "asic_user") || strings.Contains(got, "main.go") {
+		t.Fatalf("unexpected table output: %s", got)
+	}
+}
+
+func TestNormalizePathSearch(t *testing.T) {
+	if got := normalizePathSearch("firefox"); got != "*firefox*" {
+		t.Fatalf("normalizePathSearch() = %q, want %q", got, "*firefox*")
+	}
+	if got := normalizePathSearch("*/firefox/*"); got != "*/firefox/*" {
+		t.Fatalf("normalizePathSearch() changed wildcard pattern to %q", got)
+	}
+}
+
+func TestPrintEventsLimitsResults(t *testing.T) {
+	var output bytes.Buffer
+	events := []store.Event{{Path: "/vol/a", Operation: "NFS_WR"}, {Path: "/vol/b", Operation: "NFS_WR"}}
+	if err := printEvents(&output, events, "*", 1); err != nil {
+		t.Fatal(err)
+	}
+	if got := output.String(); !strings.Contains(got, "2 results match") || !strings.Contains(got, "increase --max") {
+		t.Fatalf("unexpected limit output: %s", got)
 	}
 }
