@@ -57,3 +57,27 @@ func TestQueries(t *testing.T) {
 		}
 	}
 }
+
+func TestStoreScreenRequestsWithSameTimestamp(t *testing.T) {
+	db, err := Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = db.Close() })
+	timestamp := time.Date(2026, 8, 29, 12, 0, 0, 0, time.UTC)
+	for _, event := range []Event{
+		{Path: "/vol/data/a", Operation: "NFS_WR", Timestamp: timestamp, RequestID: 1},
+		{Path: "/vol/data/a", Operation: "NFS_WR", Timestamp: timestamp, RequestID: 2},
+	} {
+		if err := db.Store(event); err != nil {
+			t.Fatal(err)
+		}
+	}
+	events, err := db.EventsSince(timestamp)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(events) != 2 {
+		t.Fatalf("EventsSince() returned %d events, want 2", len(events))
+	}
+}

@@ -19,6 +19,8 @@ type Event struct {
 	Timestamp  time.Time `json:"timestamp"`
 	Vserver    string    `json:"vserver,omitempty"`
 	VolumeUUID string    `json:"volume_uuid,omitempty"`
+	RequestID  uint64    `json:"request_id,omitempty"`
+	VolumeMSID string    `json:"volume_msid,omitempty"`
 }
 
 type DB struct {
@@ -47,16 +49,26 @@ func timeBytes(t time.Time) []byte {
 	return buf
 }
 
-func timeKey(t time.Time, inode uint64) []byte {
+func timeKey(t time.Time, inode, requestID uint64) []byte {
 	key := append([]byte("t:"), timeBytes(t)...)
 	key = append(key, ':')
-	return append(key, fmt.Sprintf("%d", inode)...)
+	key = append(key, fmt.Sprintf("%d", inode)...)
+	if requestID != 0 {
+		key = append(key, ':')
+		key = append(key, fmt.Sprintf("%d", requestID)...)
+	}
+	return key
 }
 
-func pathKey(path string, t time.Time) []byte {
+func pathKey(path string, t time.Time, requestID uint64) []byte {
 	key := append([]byte("p:"), path...)
 	key = append(key, ':')
-	return append(key, timeBytes(t)...)
+	key = append(key, timeBytes(t)...)
+	if requestID != 0 {
+		key = append(key, ':')
+		key = append(key, fmt.Sprintf("%d", requestID)...)
+	}
+	return key
 }
 
 func pathPrefix(path string) []byte {
@@ -85,10 +97,10 @@ func (d *DB) Store(event Event) error {
 
 	batch := d.db.NewBatch()
 	defer batch.Close()
-	if err := batch.Set(timeKey(event.Timestamp, event.Inode), data, pebble.NoSync); err != nil {
+	if err := batch.Set(timeKey(event.Timestamp, event.Inode, event.RequestID), data, pebble.NoSync); err != nil {
 		return err
 	}
-	if err := batch.Set(pathKey(event.Path, event.Timestamp), data, pebble.NoSync); err != nil {
+	if err := batch.Set(pathKey(event.Path, event.Timestamp, event.RequestID), data, pebble.NoSync); err != nil {
 		return err
 	}
 	return batch.Commit(pebble.NoSync)

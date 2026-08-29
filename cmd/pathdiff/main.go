@@ -414,12 +414,30 @@ func readONTAPXMLEvents(reader *bufio.Reader, connection net.Conn, db *store.DB,
 			trackers.logf("sender=%s state=keep_alive", sender)
 			continue
 		}
+		if message.Type == "SCREEN_REQ" {
+			storeScreenEvent(message.Payload, connection, db, trackers, sender)
+			continue
+		}
 		if message.Type != "NOTIFY_REQ" {
 			trackers.logf("sender=%s state=message_ignored type=%s", sender, message.Type)
 			continue
 		}
 		storeXMLEvent(message.Payload, connection, db, trackers, sender)
 	}
+}
+
+func storeScreenEvent(payload []byte, connection net.Conn, db *store.DB, trackers *senderTracker, sender string) {
+	event, err := fpolicy.ParseScreenRequest(payload)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "decode ONTAP XML screen request from %s: %v\n", connection.RemoteAddr(), err)
+		return
+	}
+	if err := db.Store(event); err != nil {
+		fmt.Fprintln(os.Stderr, "store ONTAP XML screen request:", err)
+		return
+	}
+	trackers.eventStored(sender)
+	trackers.logf("sender=%s state=screen_request_stored request_id=%d operation=%s path=%q", sender, event.RequestID, event.Operation, event.Path)
 }
 
 func readXMLEvents(reader *bufio.Reader, connection net.Conn, db *store.DB, trackers *senderTracker, sender string) {
