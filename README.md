@@ -16,6 +16,8 @@ Build the binary with `xc build`, then start the daemon with a TCP listener that
 bin/pathdiff daemon --db pathdiff_data --listen :9911
 ```
 
+Add `--verbose` (or `-v`) to log sender connection, protocol, negotiation, keep-alive, and accepted-event state changes. While verbose mode is enabled, the daemon reports per-sender accepted-event throughput every 10 seconds.
+
 When diagnosing an incompatible FPolicy session, add `--record-dir captures` to write the raw bytes from every event connection. Each capture has a timestamped `.in` file for bytes received from ONTAP and a matching `.out` file for bytes sent by `pathdiff`. Captures may contain file paths and user or client identifiers; protect and remove them appropriately.
 
 The event listener accepts one JSON object per line. `timestamp` is RFC3339 and optional; omitted timestamps are assigned when the event is stored.

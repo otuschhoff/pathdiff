@@ -61,17 +61,19 @@ func newRootCommand() *cobra.Command {
 
 func newDaemonCommand() *cobra.Command {
 	var dbPath, listenAddr, controlPath, recordDir string
+	var verbose bool
 	command := &cobra.Command{Use: "daemon", Short: "Run the event receiver and query service", RunE: func(*cobra.Command, []string) error {
-		return runDaemon(dbPath, listenAddr, controlPath, recordDir)
+		return runDaemon(dbPath, listenAddr, controlPath, recordDir, verbose)
 	}}
 	command.Flags().StringVar(&dbPath, "db", defaultDB, "Pebble database directory")
 	command.Flags().StringVar(&listenAddr, "listen", defaultListen, "FPolicy event listener address")
 	command.Flags().StringVar(&controlPath, "control", defaultControl, "Unix control socket")
 	command.Flags().StringVar(&recordDir, "record-dir", "", "directory for raw per-connection .in and .out captures")
+	command.Flags().BoolVarP(&verbose, "verbose", "v", false, "log sender state changes and 10-second throughput reports")
 	return command
 }
 
-func runDaemon(dbPath, listenAddr, controlPath, recordDir string) error {
+func runDaemon(dbPath, listenAddr, controlPath, recordDir string, verbose bool) error {
 	db, err := store.Open(dbPath)
 	if err != nil {
 		return fmt.Errorf("open database: %w", err)
@@ -104,7 +106,9 @@ func runDaemon(dbPath, listenAddr, controlPath, recordDir string) error {
 	defer cancel()
 
 	var connections sync.WaitGroup
-	go acceptEvents(context, eventListener, db, recordDir, &connections)
+	trackers := newSenderTracker(verbose)
+	go trackers.reportEvery(context, 10*time.Second)
+	go acceptEvents(context, eventListener, db, recordDir, trackers, &connections)
 	go acceptControls(context, controlListener, db, cancel, &connections)
 	<-context.Done()
 	_ = eventListener.Close()
@@ -113,7 +117,7 @@ func runDaemon(dbPath, listenAddr, controlPath, recordDir string) error {
 	return nil
 }
 
-func acceptEvents(context context.Context, listener net.Listener, db *store.DB, recordDir string, connections *sync.WaitGroup) {
+func acceptEvents(context context.Context, listener net.Listener, db *store.DB, recordDir string, trackers *senderTracker, connections *sync.WaitGroup) {
 	for {
 		connection, err := listener.Accept()
 		if err != nil {
@@ -126,6 +130,9 @@ func acceptEvents(context context.Context, listener net.Listener, db *store.DB, 
 		connections.Add(1)
 		go func() {
 			defer connections.Done()
+			sender := senderName(connection.RemoteAddr())
+			trackers.connect(sender)
+			defer trackers.disconnect(sender)
 			activeConnection := connection
 			if recordDir != "" {
 				var err error
@@ -137,9 +144,110 @@ func acceptEvents(context context.Context, listener net.Listener, db *store.DB, 
 				}
 			}
 			defer activeConnection.Close()
-			readEvents(activeConnection, db)
+			readEvents(activeConnection, db, trackers, sender)
 		}()
 	}
+}
+
+type senderTracker struct {
+	verbose bool
+	mu      sync.Mutex
+	senders map[string]*senderStats
+}
+
+type senderStats struct {
+	active         int
+	protocol       string
+	intervalEvents uint64
+	totalEvents    uint64
+}
+
+func newSenderTracker(verbose bool) *senderTracker {
+	return &senderTracker{verbose: verbose, senders: make(map[string]*senderStats)}
+}
+
+func (t *senderTracker) connect(sender string) {
+	t.mu.Lock()
+	stats := t.sender(sender)
+	stats.active++
+	active := stats.active
+	t.mu.Unlock()
+	t.logf("sender=%s state=connected active_connections=%d", sender, active)
+}
+
+func (t *senderTracker) disconnect(sender string) {
+	t.mu.Lock()
+	stats := t.sender(sender)
+	if stats.active > 0 {
+		stats.active--
+	}
+	active := stats.active
+	t.mu.Unlock()
+	t.logf("sender=%s state=disconnected active_connections=%d", sender, active)
+}
+
+func (t *senderTracker) protocolDetected(sender, protocol string) {
+	t.mu.Lock()
+	stats := t.sender(sender)
+	changed := stats.protocol != protocol
+	stats.protocol = protocol
+	t.mu.Unlock()
+	if changed {
+		t.logf("sender=%s state=protocol_detected protocol=%s", sender, protocol)
+	}
+}
+
+func (t *senderTracker) eventStored(sender string) {
+	t.mu.Lock()
+	stats := t.sender(sender)
+	stats.intervalEvents++
+	stats.totalEvents++
+	t.mu.Unlock()
+}
+
+func (t *senderTracker) reportEvery(context context.Context, interval time.Duration) {
+	if !t.verbose {
+		return
+	}
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-context.Done():
+			return
+		case <-ticker.C:
+			t.mu.Lock()
+			for sender, stats := range t.senders {
+				events := stats.intervalEvents
+				stats.intervalEvents = 0
+				fmt.Fprintf(os.Stderr, "sender=%s state=throughput protocol=%s active_connections=%d events=%d interval=%s events_per_second=%.2f total_events=%d\n", sender, stats.protocol, stats.active, events, interval, float64(events)/interval.Seconds(), stats.totalEvents)
+			}
+			t.mu.Unlock()
+		}
+	}
+}
+
+func (t *senderTracker) sender(name string) *senderStats {
+	stats := t.senders[name]
+	if stats == nil {
+		stats = &senderStats{}
+		t.senders[name] = stats
+	}
+	return stats
+}
+
+func (t *senderTracker) logf(format string, arguments ...any) {
+	if t.verbose {
+		fmt.Fprintf(os.Stderr, format+"\n", arguments...)
+	}
+}
+
+func senderName(address net.Addr) string {
+	host, _, err := net.SplitHostPort(address.String())
+	if err == nil {
+		return host
+	}
+	return address.String()
 }
 
 type trafficRecorder struct {
@@ -186,7 +294,7 @@ func (r *trafficRecorder) Close() error {
 	return r.Conn.Close()
 }
 
-func readEvents(connection net.Conn, db *store.DB) {
+func readEvents(connection net.Conn, db *store.DB, trackers *senderTracker, sender string) {
 	reader := bufio.NewReader(connection)
 	first, err := reader.Peek(1)
 	if err != nil {
@@ -196,17 +304,20 @@ func readEvents(connection net.Conn, db *store.DB) {
 		return
 	}
 	if first[0] == '<' {
-		readXMLEvents(reader, connection, db)
+		trackers.protocolDetected(sender, "raw-xml")
+		readXMLEvents(reader, connection, db, trackers, sender)
 		return
 	}
 	if first[0] == 0x22 {
-		readONTAPXMLEvents(reader, connection, db)
+		trackers.protocolDetected(sender, "ontap-xml")
+		readONTAPXMLEvents(reader, connection, db, trackers, sender)
 		return
 	}
 	if first[0] != '{' {
 		fmt.Fprintf(os.Stderr, "reject event connection from %s: unsupported protocol prefix %#x\n", connection.RemoteAddr(), first[0])
 		return
 	}
+	trackers.protocolDetected(sender, "json-lines")
 
 	scanner := bufio.NewScanner(reader)
 	scanner.Buffer(make([]byte, 4096), 1024*1024)
@@ -222,14 +333,17 @@ func readEvents(connection net.Conn, db *store.DB) {
 		}
 		if err := db.Store(event); err != nil {
 			fmt.Fprintln(os.Stderr, "store event:", err)
+			continue
 		}
+		trackers.eventStored(sender)
+		trackers.logf("sender=%s state=event_stored inode=%d operation=%s path=%q", sender, event.Inode, event.Operation, event.Path)
 	}
 	if err := scanner.Err(); err != nil {
 		fmt.Fprintln(os.Stderr, "read event stream:", err)
 	}
 }
 
-func readONTAPXMLEvents(reader *bufio.Reader, connection net.Conn, db *store.DB) {
+func readONTAPXMLEvents(reader *bufio.Reader, connection net.Conn, db *store.DB, trackers *senderTracker, sender string) {
 	message, err := fpolicy.ReadONTAPXMLFrame(reader)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "read ONTAP XML handshake from %s: %v\n", connection.RemoteAddr(), err)
@@ -248,6 +362,7 @@ func readONTAPXMLEvents(reader *bufio.Reader, connection net.Conn, db *store.DB)
 		fmt.Fprintf(os.Stderr, "write ONTAP XML handshake response to %s: %v\n", connection.RemoteAddr(), err)
 		return
 	}
+	trackers.logf("sender=%s state=negotiated protocol=ontap-xml policy=%s vserver_uuid=%s", sender, message.PolicyName, message.VserverUUID)
 
 	for {
 		message, err := fpolicy.ReadONTAPXMLFrame(reader)
@@ -258,15 +373,19 @@ func readONTAPXMLEvents(reader *bufio.Reader, connection net.Conn, db *store.DB)
 			fmt.Fprintf(os.Stderr, "read ONTAP XML event from %s: %v\n", connection.RemoteAddr(), err)
 			return
 		}
-		if message.Type != "NOTIFY_REQ" {
-			fmt.Fprintf(os.Stderr, "ignore ONTAP XML message from %s: %s\n", connection.RemoteAddr(), message.Type)
+		if message.Type == "KEEP_ALIVE" {
+			trackers.logf("sender=%s state=keep_alive", sender)
 			continue
 		}
-		storeXMLEvent(message.Payload, connection, db)
+		if message.Type != "NOTIFY_REQ" {
+			trackers.logf("sender=%s state=message_ignored type=%s", sender, message.Type)
+			continue
+		}
+		storeXMLEvent(message.Payload, connection, db, trackers, sender)
 	}
 }
 
-func readXMLEvents(reader *bufio.Reader, connection net.Conn, db *store.DB) {
+func readXMLEvents(reader *bufio.Reader, connection net.Conn, db *store.DB, trackers *senderTracker, sender string) {
 	decoder := xml.NewDecoder(reader)
 	for {
 		event, err := fpolicy.DecodeXMLNotification(decoder)
@@ -279,11 +398,14 @@ func readXMLEvents(reader *bufio.Reader, connection net.Conn, db *store.DB) {
 		}
 		if err := db.Store(event); err != nil {
 			fmt.Fprintln(os.Stderr, "store XML event:", err)
+			continue
 		}
+		trackers.eventStored(sender)
+		trackers.logf("sender=%s state=event_stored inode=%d operation=%s path=%q", sender, event.Inode, event.Operation, event.Path)
 	}
 }
 
-func storeXMLEvent(payload []byte, connection net.Conn, db *store.DB) {
+func storeXMLEvent(payload []byte, connection net.Conn, db *store.DB, trackers *senderTracker, sender string) {
 	event, err := fpolicy.ParseXMLNotification(payload)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "decode XML event from %s: %v\n", connection.RemoteAddr(), err)
@@ -291,7 +413,10 @@ func storeXMLEvent(payload []byte, connection net.Conn, db *store.DB) {
 	}
 	if err := db.Store(event); err != nil {
 		fmt.Fprintln(os.Stderr, "store XML event:", err)
+		return
 	}
+	trackers.eventStored(sender)
+	trackers.logf("sender=%s state=event_stored inode=%d operation=%s path=%q", sender, event.Inode, event.Operation, event.Path)
 }
 
 func acceptControls(context context.Context, listener net.Listener, db *store.DB, stop context.CancelFunc, connections *sync.WaitGroup) {
