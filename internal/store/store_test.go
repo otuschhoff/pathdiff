@@ -72,3 +72,25 @@ func TestStoreDistinctPathsWithSameTimestamp(t *testing.T) {
 		t.Fatalf("EventsSince() returned %d events, want 2", len(events))
 	}
 }
+
+func TestVolumeNameMapping(t *testing.T) {
+	db, err := Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = db.Close() })
+	timestamp := time.Date(2026, 8, 29, 12, 0, 0, 0, time.UTC)
+	if err := db.Store(Event{Path: "/otusch/data", Operation: "NFS_WR", Timestamp: timestamp, VolumeMSID: "2163258291"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.SetVolumeName("2163258291", "asic_user"); err != nil {
+		t.Fatal(err)
+	}
+	events, err := db.EventsSince(timestamp)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(events) != 1 || events[0].VolumeMSID != "2163258291" || events[0].VolumeName != "asic_user" {
+		t.Fatalf("mapped events = %#v", events)
+	}
+}

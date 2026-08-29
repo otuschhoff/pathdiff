@@ -160,9 +160,10 @@ func ParseScreenRequest(payload []byte) (store.Event, error) {
 		return store.Event{}, fmt.Errorf("screen request has no UNIX_NAME access path")
 	}
 	return store.Event{
-		Path:      path,
-		Operation: textField(&root, "ReqType"),
-		Timestamp: time.UnixMicro(generationTime).UTC(),
+		Path:       path,
+		Operation:  textField(&root, "ReqType"),
+		Timestamp:  time.UnixMicro(generationTime).UTC(),
+		VolumeMSID: textField(&root, "VolMsid"),
 	}, nil
 }
 

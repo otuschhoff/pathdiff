@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/binary"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"math"
 	"time"
@@ -12,9 +13,11 @@ import (
 )
 
 type Event struct {
-	Path      string    `json:"path"`
-	Operation string    `json:"operation"`
-	Timestamp time.Time `json:"timestamp"`
+	Path       string    `json:"path"`
+	Operation  string    `json:"operation"`
+	Timestamp  time.Time `json:"timestamp"`
+	VolumeMSID string    `json:"volume_msid,omitempty"`
+	VolumeName string    `json:"volume_name,omitempty"`
 }
 
 type DB struct {
@@ -43,20 +46,24 @@ func timeBytes(t time.Time) []byte {
 	return buf
 }
 
-func timeKey(t time.Time, path, operation string) []byte {
+func timeKey(t time.Time, path, operation, volumeMSID string) []byte {
 	key := append([]byte("t:"), timeBytes(t)...)
 	key = append(key, ':')
 	key = append(key, path...)
 	key = append(key, ':')
-	return append(key, operation...)
+	key = append(key, operation...)
+	key = append(key, ':')
+	return append(key, volumeMSID...)
 }
 
-func pathKey(path string, t time.Time, operation string) []byte {
+func pathKey(path string, t time.Time, operation, volumeMSID string) []byte {
 	key := append([]byte("p:"), path...)
 	key = append(key, ':')
 	key = append(key, timeBytes(t)...)
 	key = append(key, ':')
-	return append(key, operation...)
+	key = append(key, operation...)
+	key = append(key, ':')
+	return append(key, volumeMSID...)
 }
 
 func pathPrefix(path string) []byte {
@@ -78,6 +85,7 @@ func (d *DB) Store(event Event) error {
 	if event.Timestamp.IsZero() {
 		event.Timestamp = time.Now().UTC()
 	}
+	event.VolumeName = ""
 	data, err := json.Marshal(event)
 	if err != nil {
 		return err
@@ -85,13 +93,23 @@ func (d *DB) Store(event Event) error {
 
 	batch := d.db.NewBatch()
 	defer batch.Close()
-	if err := batch.Set(timeKey(event.Timestamp, event.Path, event.Operation), data, pebble.NoSync); err != nil {
+	if err := batch.Set(timeKey(event.Timestamp, event.Path, event.Operation, event.VolumeMSID), data, pebble.NoSync); err != nil {
 		return err
 	}
-	if err := batch.Set(pathKey(event.Path, event.Timestamp, event.Operation), data, pebble.NoSync); err != nil {
+	if err := batch.Set(pathKey(event.Path, event.Timestamp, event.Operation, event.VolumeMSID), data, pebble.NoSync); err != nil {
 		return err
 	}
 	return batch.Commit(pebble.NoSync)
+}
+
+func (d *DB) SetVolumeName(msid, name string) error {
+	if msid == "" {
+		return fmt.Errorf("volume MSID is required")
+	}
+	if name == "" {
+		return fmt.Errorf("volume name is required")
+	}
+	return d.db.Set(append([]byte("v:"), msid...), []byte(name), pebble.NoSync)
 }
 
 func (d *DB) EventsSince(since time.Time) ([]Event, error) {
@@ -110,6 +128,9 @@ func (d *DB) EventsSince(since time.Time) ([]Event, error) {
 		var event Event
 		if err := json.Unmarshal(iter.Value(), &event); err != nil {
 			return nil, fmt.Errorf("decode stored event: %w", err)
+		}
+		if err := d.resolveVolumeName(&event); err != nil {
+			return nil, err
 		}
 		events = append(events, event)
 	}
@@ -136,7 +157,26 @@ func (d *DB) EventsByPath(path string, start, end time.Time) ([]Event, error) {
 		if event.Timestamp.Before(start) || event.Timestamp.After(end) {
 			continue
 		}
+		if err := d.resolveVolumeName(&event); err != nil {
+			return nil, err
+		}
 		events = append(events, event)
 	}
 	return events, iter.Error()
+}
+
+func (d *DB) resolveVolumeName(event *Event) error {
+	if event.VolumeMSID == "" {
+		return nil
+	}
+	name, closer, err := d.db.Get(append([]byte("v:"), event.VolumeMSID...))
+	if errors.Is(err, pebble.ErrNotFound) {
+		return nil
+	}
+	if err != nil {
+		return fmt.Errorf("look up volume name: %w", err)
+	}
+	defer closer.Close()
+	event.VolumeName = string(name)
+	return nil
 }
