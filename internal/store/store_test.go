@@ -94,3 +94,38 @@ func TestVolumeNameMapping(t *testing.T) {
 		t.Fatalf("mapped events = %#v", events)
 	}
 }
+
+func TestResetEventsPreservesVolumeMappings(t *testing.T) {
+	db, err := Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = db.Close() })
+	timestamp := time.Date(2026, 8, 29, 12, 0, 0, 0, time.UTC)
+	if err := db.SetVolumeName("2163258291", "asic_user"); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Store(Event{Path: "/vol/old", Operation: "NFS_WR", Timestamp: timestamp, VolumeMSID: "2163258291"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.ResetEvents(); err != nil {
+		t.Fatal(err)
+	}
+	events, err := db.EventsSince(timestamp)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(events) != 0 {
+		t.Fatalf("events after reset = %#v, want none", events)
+	}
+	if err := db.Store(Event{Path: "/vol/new", Operation: "NFS_WR", Timestamp: timestamp, VolumeMSID: "2163258291"}); err != nil {
+		t.Fatal(err)
+	}
+	events, err = db.EventsSince(timestamp)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(events) != 1 || events[0].VolumeName != "asic_user" {
+		t.Fatalf("volume mapping was not preserved: %#v", events)
+	}
+}

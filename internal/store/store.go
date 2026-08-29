@@ -112,6 +112,19 @@ func (d *DB) SetVolumeName(msid, name string) error {
 	return d.db.Set(append([]byte("v:"), msid...), []byte(name), pebble.NoSync)
 }
 
+// ResetEvents atomically removes time and path index entries without removing volume mappings.
+func (d *DB) ResetEvents() error {
+	batch := d.db.NewBatch()
+	defer batch.Close()
+	if err := batch.DeleteRange([]byte("t:"), []byte("u:"), pebble.NoSync); err != nil {
+		return err
+	}
+	if err := batch.DeleteRange([]byte("p:"), []byte("q:"), pebble.NoSync); err != nil {
+		return err
+	}
+	return batch.Commit(pebble.NoSync)
+}
+
 func (d *DB) EventsSince(since time.Time) ([]Event, error) {
 	iter, err := d.db.NewIter(&pebble.IterOptions{
 		LowerBound: []byte("t:"),
