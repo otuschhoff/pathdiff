@@ -142,8 +142,7 @@ func ParseXMLNotification(payload []byte) (store.Event, error) {
 	return *message.Notification, nil
 }
 
-// ParseScreenRequest extracts the audit fields available in an FPolicy screen
-// request. NFS screen requests do not include a file inode.
+// ParseScreenRequest extracts the path and operation from an FPolicy screen request.
 func ParseScreenRequest(payload []byte) (store.Event, error) {
 	var root xmlNode
 	if err := xml.Unmarshal(payload, &root); err != nil {
@@ -151,10 +150,6 @@ func ParseScreenRequest(payload []byte) (store.Event, error) {
 	}
 	if root.XMLName.Local != "FscreenReq" {
 		return store.Event{}, fmt.Errorf("expected FscreenReq, got %s", root.XMLName.Local)
-	}
-	requestID, err := parseUintField(&root, "ReqId")
-	if err != nil {
-		return store.Event{}, fmt.Errorf("parse request ID: %w", err)
 	}
 	generationTime, err := parseIntField(&root, "GenerationTime")
 	if err != nil {
@@ -165,11 +160,9 @@ func ParseScreenRequest(payload []byte) (store.Event, error) {
 		return store.Event{}, fmt.Errorf("screen request has no UNIX_NAME access path")
 	}
 	return store.Event{
-		Path:       path,
-		Operation:  textField(&root, "ReqType"),
-		Timestamp:  time.UnixMicro(generationTime).UTC(),
-		RequestID:  requestID,
-		VolumeMSID: textField(&root, "VolMsid"),
+		Path:      path,
+		Operation: textField(&root, "ReqType"),
+		Timestamp: time.UnixMicro(generationTime).UTC(),
 	}, nil
 }
 
@@ -189,10 +182,6 @@ func textField(node *xmlNode, name string) string {
 		}
 	}
 	return ""
-}
-
-func parseUintField(node *xmlNode, name string) (uint64, error) {
-	return strconv.ParseUint(textField(node, name), 10, 64)
 }
 
 func parseIntField(node *xmlNode, name string) (int64, error) {
@@ -223,12 +212,9 @@ type xmlEnvelope struct {
 	} `xml:"Header"`
 	NegotiateRequest    *struct{} `xml:"NegotiateRequest"`
 	NotificationRequest *struct {
-		Vserver    string `xml:"Vserver"`
-		FileID     uint64 `xml:"FileId"`
-		VolumeUUID string `xml:"VolumeUuid"`
-		Path       string `xml:"Path"`
-		Operation  string `xml:"Operation"`
-		Timestamp  int64  `xml:"Timestamp"`
+		Path      string `xml:"Path"`
+		Operation string `xml:"Operation"`
+		Timestamp int64  `xml:"Timestamp"`
 	} `xml:"NotificationRequest"`
 }
 
@@ -248,12 +234,9 @@ func ParseXMLMessage(payload []byte) (XMLMessage, error) {
 			return XMLMessage{}, fmt.Errorf("notification path is required")
 		}
 		message.Notification = &store.Event{
-			Inode:      notification.FileID,
-			Path:       notification.Path,
-			Operation:  notification.Operation,
-			Timestamp:  time.UnixMicro(notification.Timestamp).UTC(),
-			Vserver:    notification.Vserver,
-			VolumeUUID: notification.VolumeUUID,
+			Path:      notification.Path,
+			Operation: notification.Operation,
+			Timestamp: time.UnixMicro(notification.Timestamp).UTC(),
 		}
 		return message, nil
 	}
@@ -337,15 +320,6 @@ func DecodeXMLNotification(decoder *xml.Decoder) (store.Event, error) {
 func setXMLField(event *store.Event, name, value string) error {
 	value = strings.TrimSpace(value)
 	switch strings.ToLower(strings.ReplaceAll(name, "-", "_")) {
-	case "file_id", "inode":
-		if value == "" {
-			return nil
-		}
-		inode, err := strconv.ParseUint(value, 10, 64)
-		if err != nil {
-			return fmt.Errorf("parse inode: %w", err)
-		}
-		event.Inode = inode
 	case "path":
 		event.Path = value
 	case "operation":

@@ -43,7 +43,6 @@ type controlRequest struct {
 type controlResponse struct {
 	Error  string        `json:"error,omitempty"`
 	Status string        `json:"status,omitempty"`
-	Inodes []uint64      `json:"inodes,omitempty"`
 	Events []store.Event `json:"events,omitempty"`
 }
 
@@ -54,8 +53,8 @@ func main() {
 }
 
 func newRootCommand() *cobra.Command {
-	root := &cobra.Command{Use: "pathdiff", Short: "Store and inspect FPolicy inode path changes", SilenceUsage: true}
-	root.AddCommand(newDaemonCommand(), newInodesCommand(), newEventsCommand(), newMonitorCommand(), newControlCommand("status"), newControlCommand("stop"))
+	root := &cobra.Command{Use: "pathdiff", Short: "Store and inspect FPolicy path changes", SilenceUsage: true}
+	root.AddCommand(newDaemonCommand(), newEventsCommand(), newMonitorCommand(), newControlCommand("status"), newControlCommand("stop"))
 	return root
 }
 
@@ -373,7 +372,7 @@ func readEvents(connection net.Conn, db *store.DB, trackers *senderTracker, send
 			continue
 		}
 		trackers.eventStored(sender)
-		trackers.logf("sender=%s state=event_stored inode=%d operation=%s path=%q", sender, event.Inode, event.Operation, event.Path)
+		trackers.logf("sender=%s state=event_stored operation=%s path=%q", sender, event.Operation, event.Path)
 	}
 	if err := scanner.Err(); err != nil {
 		fmt.Fprintln(os.Stderr, "read event stream:", err)
@@ -437,7 +436,7 @@ func storeScreenEvent(payload []byte, connection net.Conn, db *store.DB, tracker
 		return
 	}
 	trackers.eventStored(sender)
-	trackers.logf("sender=%s state=screen_request_stored request_id=%d operation=%s path=%q", sender, event.RequestID, event.Operation, event.Path)
+	trackers.logf("sender=%s state=screen_request_stored operation=%s path=%q", sender, event.Operation, event.Path)
 }
 
 func readXMLEvents(reader *bufio.Reader, connection net.Conn, db *store.DB, trackers *senderTracker, sender string) {
@@ -456,7 +455,7 @@ func readXMLEvents(reader *bufio.Reader, connection net.Conn, db *store.DB, trac
 			continue
 		}
 		trackers.eventStored(sender)
-		trackers.logf("sender=%s state=event_stored inode=%d operation=%s path=%q", sender, event.Inode, event.Operation, event.Path)
+		trackers.logf("sender=%s state=event_stored operation=%s path=%q", sender, event.Operation, event.Path)
 	}
 }
 
@@ -471,7 +470,7 @@ func storeXMLEvent(payload []byte, connection net.Conn, db *store.DB, trackers *
 		return
 	}
 	trackers.eventStored(sender)
-	trackers.logf("sender=%s state=event_stored inode=%d operation=%s path=%q", sender, event.Inode, event.Operation, event.Path)
+	trackers.logf("sender=%s state=event_stored operation=%s path=%q", sender, event.Operation, event.Path)
 }
 
 func acceptControls(context context.Context, listener net.Listener, db *store.DB, stop context.CancelFunc, activeConnections *connectionRegistry, connections *sync.WaitGroup) {
@@ -507,8 +506,6 @@ func handleControl(connection net.Conn, db *store.DB, stop context.CancelFunc) {
 		case "stop":
 			response.Status = "stopping"
 			stop()
-		case "inodes":
-			response.Inodes, err = db.InodesSince(request.Since)
 		case "events":
 			response.Events, err = db.EventsByPath(request.Path, request.Start, request.End)
 		case "recent":
@@ -521,25 +518,6 @@ func handleControl(connection net.Conn, db *store.DB, stop context.CancelFunc) {
 		}
 	}
 	_ = json.NewEncoder(connection).Encode(response)
-}
-
-func newInodesCommand() *cobra.Command {
-	var controlPath, sinceValue string
-	command := &cobra.Command{Use: "inodes", Short: "List unique inodes changed since a timestamp", RunE: func(*cobra.Command, []string) error {
-		since, err := parseTime("since", sinceValue)
-		if err != nil {
-			return err
-		}
-		response, err := callControl(controlPath, controlRequest{Command: "inodes", Since: since})
-		if err != nil {
-			return err
-		}
-		return printResponse(response)
-	}}
-	command.Flags().StringVar(&controlPath, "control", defaultControl, "Unix control socket")
-	command.Flags().StringVar(&sinceValue, "since", "", "inclusive RFC3339 timestamp")
-	_ = command.MarkFlagRequired("since")
-	return command
 }
 
 func newEventsCommand() *cobra.Command {
@@ -575,7 +553,7 @@ func newEventsCommand() *cobra.Command {
 func newMonitorCommand() *cobra.Command {
 	var controlPath, sinceValue, path string
 	var interval time.Duration
-	command := &cobra.Command{Use: "monitor", Short: "Print newly observed inode path changes", RunE: func(command *cobra.Command, _ []string) error {
+	command := &cobra.Command{Use: "monitor", Short: "Print newly observed path changes", RunE: func(command *cobra.Command, _ []string) error {
 		if interval <= 0 {
 			return errors.New("interval must be greater than zero")
 		}
@@ -601,7 +579,7 @@ func newMonitorCommand() *cobra.Command {
 				if path != "" && !strings.HasPrefix(event.Path, path) {
 					continue
 				}
-				key := fmt.Sprintf("%d:%s:%s:%s", event.Inode, event.Path, event.Operation, event.Timestamp.UTC().Format(time.RFC3339Nano))
+				key := fmt.Sprintf("%s:%s:%s", event.Path, event.Operation, event.Timestamp.UTC().Format(time.RFC3339Nano))
 				if event.Timestamp.After(since) {
 					since = event.Timestamp
 					seen = make(map[string]struct{})

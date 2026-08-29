@@ -6,21 +6,15 @@ import (
 	"encoding/json"
 	"fmt"
 	"math"
-	"sort"
 	"time"
 
 	"github.com/cockroachdb/pebble"
 )
 
 type Event struct {
-	Inode      uint64    `json:"inode"`
-	Path       string    `json:"path"`
-	Operation  string    `json:"operation"`
-	Timestamp  time.Time `json:"timestamp"`
-	Vserver    string    `json:"vserver,omitempty"`
-	VolumeUUID string    `json:"volume_uuid,omitempty"`
-	RequestID  uint64    `json:"request_id,omitempty"`
-	VolumeMSID string    `json:"volume_msid,omitempty"`
+	Path      string    `json:"path"`
+	Operation string    `json:"operation"`
+	Timestamp time.Time `json:"timestamp"`
 }
 
 type DB struct {
@@ -49,26 +43,20 @@ func timeBytes(t time.Time) []byte {
 	return buf
 }
 
-func timeKey(t time.Time, inode, requestID uint64) []byte {
+func timeKey(t time.Time, path, operation string) []byte {
 	key := append([]byte("t:"), timeBytes(t)...)
 	key = append(key, ':')
-	key = append(key, fmt.Sprintf("%d", inode)...)
-	if requestID != 0 {
-		key = append(key, ':')
-		key = append(key, fmt.Sprintf("%d", requestID)...)
-	}
-	return key
+	key = append(key, path...)
+	key = append(key, ':')
+	return append(key, operation...)
 }
 
-func pathKey(path string, t time.Time, requestID uint64) []byte {
+func pathKey(path string, t time.Time, operation string) []byte {
 	key := append([]byte("p:"), path...)
 	key = append(key, ':')
 	key = append(key, timeBytes(t)...)
-	if requestID != 0 {
-		key = append(key, ':')
-		key = append(key, fmt.Sprintf("%d", requestID)...)
-	}
-	return key
+	key = append(key, ':')
+	return append(key, operation...)
 }
 
 func pathPrefix(path string) []byte {
@@ -97,40 +85,13 @@ func (d *DB) Store(event Event) error {
 
 	batch := d.db.NewBatch()
 	defer batch.Close()
-	if err := batch.Set(timeKey(event.Timestamp, event.Inode, event.RequestID), data, pebble.NoSync); err != nil {
+	if err := batch.Set(timeKey(event.Timestamp, event.Path, event.Operation), data, pebble.NoSync); err != nil {
 		return err
 	}
-	if err := batch.Set(pathKey(event.Path, event.Timestamp, event.RequestID), data, pebble.NoSync); err != nil {
+	if err := batch.Set(pathKey(event.Path, event.Timestamp, event.Operation), data, pebble.NoSync); err != nil {
 		return err
 	}
 	return batch.Commit(pebble.NoSync)
-}
-
-func (d *DB) InodesSince(since time.Time) ([]uint64, error) {
-	iter, err := d.db.NewIter(&pebble.IterOptions{
-		LowerBound: []byte("t:"),
-		UpperBound: []byte("u:"),
-	})
-	if err != nil {
-		return nil, err
-	}
-	defer iter.Close()
-
-	seek := append(append([]byte("t:"), timeBytes(since)...), ':')
-	seen := make(map[uint64]struct{})
-	var inodes []uint64
-	for iter.SeekGE(seek); iter.Valid(); iter.Next() {
-		var event Event
-		if err := json.Unmarshal(iter.Value(), &event); err != nil {
-			return nil, fmt.Errorf("decode stored event: %w", err)
-		}
-		if _, exists := seen[event.Inode]; !exists {
-			seen[event.Inode] = struct{}{}
-			inodes = append(inodes, event.Inode)
-		}
-	}
-	sort.Slice(inodes, func(left, right int) bool { return inodes[left] < inodes[right] })
-	return inodes, iter.Error()
 }
 
 func (d *DB) EventsSince(since time.Time) ([]Event, error) {

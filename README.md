@@ -4,7 +4,7 @@
 
 ## Objectives
 
-- Capture changed inode paths emitted by a cDOT FPolicy bridge.
+- Capture changed file paths and operations emitted by cDOT FPolicy.
 - Keep a durable, locally queryable history optimized for time and path lookups.
 - Provide daemon lifecycle, audit, backup, and live-monitoring workflows from one CLI.
 
@@ -25,13 +25,12 @@ When diagnosing an incompatible FPolicy session, add `--record-dir captures` to 
 The event listener accepts one JSON object per line. `timestamp` is RFC3339 and optional; omitted timestamps are assigned when the event is stored.
 
 ```json
-{"inode":12345,"path":"/vol/finance/report.csv","operation":"modify","timestamp":"2026-08-29T10:30:00Z"}
+{"path":"/vol/finance/report.csv","operation":"modify","timestamp":"2026-08-29T10:30:00Z"}
 ```
 
 Query the running daemon from another shell:
 
 ```sh
-bin/pathdiff inodes --since 2026-08-29T00:00:00Z
 bin/pathdiff events --path /vol/finance/ --start 2026-08-29T00:00:00Z --end 2026-08-30T00:00:00Z
 bin/pathdiff monitor --path /vol/finance/ --interval 2s
 bin/pathdiff status
@@ -42,13 +41,13 @@ bin/pathdiff stop
 
 ## Implementation
 
-The daemon accepts one JSON event per TCP line, validates that each event contains a path, and writes it through a single Pebble batch. Each event is indexed twice: a timestamp-first key supports ordered inode and monitoring queries, while a path-first key supports prefix and time-window audit queries. The local Unix control socket keeps database ownership in the daemon; all client commands query or control it through a compact JSON request/response protocol.
+The daemon accepts one JSON event per TCP line, validates that each event contains a path, and writes it through a single Pebble batch. Each event is indexed twice: a timestamp-first key supports ordered monitoring queries, while a path-first key supports prefix and time-window audit queries. The local Unix control socket keeps database ownership in the daemon; all client commands query or control it through a compact JSON request/response protocol.
 
 The receiver accepts JSON lines from adapters, raw XML notifications, and native ONTAP XML transport. Native ONTAP XML uses a `0x22` message-type byte, a 4-byte big-endian length, an XML header/body payload separated by a blank line, and a trailing NUL byte. It sends `NEGO_REQ`; `pathdiff` replies with the reference-compatible `NEGO_RESP` layout: `HandshakeResp` containing the request's `VsUUID`, `PolicyName`, `SessionId`, and scalar protocol version `1.2`. Header-only native messages such as `KEEP_ALIVE` have `ContentLen` `0` and no separator; `pathdiff` accepts and ignores them while keeping the session open.
 
-XML notifications extract inode, path, operation, timestamp, Vserver, and volume UUID fields. Unknown connection prefixes are rejected rather than guessed as another protocol.
+XML notifications extract path, operation, and timestamp fields. Unknown connection prefixes are rejected rather than guessed as another protocol.
 
-Native synchronous `SCREEN_REQ` messages are also stored as audit events. Their captured NFS payloads provide `ReqId`, `ReqType`, `GenerationTime`, a UNIX access path, and `VolMsid`, but no file inode; these events retain `inode` as `0` and include `request_id` and `volume_msid` in their JSON payload. `pathdiff` does not issue access allow/deny decisions for screen requests.
+Native synchronous `SCREEN_REQ` messages are also stored as audit events using their request type, generation time, and UNIX access path. `pathdiff` does not issue access allow/deny decisions for screen requests.
 
 ## Tasks
 
