@@ -84,17 +84,20 @@ func ReadONTAPXMLFrame(reader io.Reader) (ONTAPMessage, error) {
 	}
 
 	parts := bytes.SplitN(bytes.TrimPrefix(payload, []byte{'"'}), []byte("\n\n"), 2)
-	if len(parts) != 2 {
-		return ONTAPMessage{}, fmt.Errorf("missing ONTAP XML header/body separator")
-	}
 	var header struct {
 		NotificationType string `xml:"NotfType"`
 	}
 	if err := xml.Unmarshal(parts[0], &header); err != nil {
 		return ONTAPMessage{}, fmt.Errorf("decode ONTAP XML header: %w", err)
 	}
-	message := ONTAPMessage{Type: header.NotificationType, Payload: bytes.TrimSpace(parts[1])}
+	message := ONTAPMessage{Type: header.NotificationType}
+	if len(parts) == 2 {
+		message.Payload = bytes.TrimSpace(parts[1])
+	}
 	if message.Type == "NEGO_REQ" {
+		if len(message.Payload) == 0 {
+			return ONTAPMessage{}, fmt.Errorf("missing ONTAP negotiation payload")
+		}
 		var handshake struct {
 			VserverUUID string `xml:"VsUUID"`
 			PolicyName  string `xml:"PolicyName"`
@@ -112,39 +115,38 @@ func ReadONTAPXMLFrame(reader io.Reader) (ONTAPMessage, error) {
 
 func WriteONTAPXMLFrame(writer io.Writer, notificationType string, payload []byte) error {
 	header := fmt.Sprintf(`<?xml version="1.0"?><Header><NotfType>%s</NotfType><ContentLen>%d</ContentLen><DataFormat>XML</DataFormat></Header>`, notificationType, len(payload))
-	framePayload := append([]byte{'"'}, header...)
-	framePayload = append(framePayload, '\n', '\n')
-	framePayload = append(framePayload, payload...)
+	framePayload := append([]byte(header+"\n\n"), payload...)
 	if len(framePayload) > MaxFrameSize {
 		return fmt.Errorf("frame length %d exceeds %d bytes", len(framePayload), MaxFrameSize)
 	}
 	if _, err := writer.Write([]byte{ontapXMLMessageType}); err != nil {
 		return err
 	}
-	if err := writeSizedPayload(writer, framePayload); err != nil {
+	var length [4]byte
+	binary.BigEndian.PutUint32(length[:], uint32(len(framePayload)))
+	if _, err := writer.Write(length[:]); err != nil {
 		return err
 	}
-	_, err := writer.Write([]byte{0})
+	if _, err := writer.Write([]byte{ontapXMLMessageType}); err != nil {
+		return err
+	}
+	_, err := writer.Write(framePayload)
 	return err
 }
 
 func ONTAPNegotiateResponse(session, vserverUUID, policyName string) ([]byte, error) {
 	response := struct {
-		XMLName     xml.Name `xml:"Handshake"`
+		XMLName     xml.Name `xml:"HandshakeResp"`
 		VserverUUID string   `xml:"VsUUID"`
 		PolicyName  string   `xml:"PolicyName"`
 		Session     string   `xml:"SessionId"`
-		Version     struct {
-			Value string `xml:"Vers"`
-		} `xml:"ProtVersion"`
-		Status string `xml:"Status"`
-	}{VserverUUID: vserverUUID, PolicyName: policyName, Session: session, Status: "SUCCESS"}
-	response.Version.Value = "1.0"
+		Version     string   `xml:"ProtVersion"`
+	}{VserverUUID: vserverUUID, PolicyName: policyName, Session: session, Version: "1.2"}
 	payload, err := xml.Marshal(response)
 	if err != nil {
 		return nil, err
 	}
-	return append([]byte(xml.Header), payload...), nil
+	return append([]byte(`<?xml version="1.0"?>`), payload...), nil
 }
 
 func readByte(reader io.Reader) (byte, error) {
