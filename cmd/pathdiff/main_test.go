@@ -78,7 +78,6 @@ func TestTrafficRecorder(t *testing.T) {
 	if err := client.Close(); err != nil {
 		t.Fatal(err)
 	}
-
 	inFiles, err := filepath.Glob(filepath.Join(filepath.Dir(recorder.in.Name()), "*.in"))
 	if err != nil || len(inFiles) != 1 {
 		t.Fatalf("in capture files = %v, err = %v", inFiles, err)
@@ -95,6 +94,82 @@ func TestTrafficRecorder(t *testing.T) {
 	if err != nil || string(out) != "response" {
 		t.Fatalf("out capture = %q, err = %v", out, err)
 	}
+}
+
+func TestTrafficRecorderReportsCaptureFailures(t *testing.T) {
+	server, client := net.Pipe()
+	recorder, err := newTrafficRecorder(server, t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := recorder.in.Close(); err != nil {
+		t.Fatal(err)
+	}
+	writeDone := make(chan error, 1)
+	go func() {
+		_, err := client.Write([]byte("request"))
+		writeDone <- err
+	}()
+	buffer := make([]byte, len("request"))
+	count, err := recorder.Read(buffer)
+	if count != len(buffer) || err == nil || !strings.Contains(err.Error(), "record inbound traffic") {
+		t.Fatalf("Read() = %d, %v", count, err)
+	}
+	if err := <-writeDone; err != nil {
+		t.Fatal(err)
+	}
+	if err := recorder.out.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := recorder.Close(); err == nil || !strings.Contains(err.Error(), "close inbound traffic capture") || !strings.Contains(err.Error(), "close outbound traffic capture") {
+		t.Fatalf("Close() error = %v", err)
+	}
+	_ = client.Close()
+}
+
+type writeErrorConn struct {
+	net.Conn
+}
+
+func (writeErrorConn) Write([]byte) (int, error) {
+	return 0, errors.New("forced response write failure")
+}
+
+type errorWriter struct{}
+
+func (errorWriter) Write([]byte) (int, error) {
+	return 0, errors.New("forced output failure")
+}
+
+func TestAcceptRetryDelayIsBounded(t *testing.T) {
+	delay := time.Duration(0)
+	for range 10 {
+		delay = nextAcceptRetryDelay(delay)
+	}
+	if delay != 5*time.Second {
+		t.Fatalf("retry delay = %s, want 5s", delay)
+	}
+}
+
+func TestHandleControlReportsResponseWriteFailure(t *testing.T) {
+	db, err := store.Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = db.Close() })
+	server, client := net.Pipe()
+	handled := make(chan error, 1)
+	go func() {
+		handled <- handleControl(writeErrorConn{Conn: server}, db, nil, nil, nil, nil)
+	}()
+	if err := json.NewEncoder(client).Encode(controlRequest{Command: "db-status"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := <-handled; err == nil || !strings.Contains(err.Error(), `encode control response for "db-status"`) {
+		t.Fatalf("handleControl() error = %v", err)
+	}
+	_ = server.Close()
+	_ = client.Close()
 }
 
 func TestConnectionRegistryCloseAll(t *testing.T) {
@@ -866,6 +941,9 @@ func TestFPolicyCreatePlans(t *testing.T) {
 	}
 	if got := output.String(); !strings.Contains(got, "-primary-servers 192.0.2.10 -port 9912") || !strings.Contains(got, "-sequence-number 5") || strings.Contains(got, "finance") {
 		t.Fatalf("unexpected create commands: %s", got)
+	}
+	if err := printFPolicyCreateCommands(errorWriter{}, plans); err == nil || !strings.Contains(err.Error(), "write FPolicy create commands") {
+		t.Fatalf("writer error = %v", err)
 	}
 	fallback, err := fpolicyCreatePlans(svms, policies, nil, "engineering", false, endpoints)
 	if err != nil || len(fallback) != 1 || fallback[0].Sequence != 2 {
