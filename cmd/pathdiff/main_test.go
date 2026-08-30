@@ -617,6 +617,16 @@ func TestFPolicySequenceConflict(t *testing.T) {
 	}
 }
 
+func TestONTAPErrorDetail(t *testing.T) {
+	detail := ontapErrorDetail([]byte("Last login time: now\n\x1b[1B blob data\nError: The specified server is already\n connected.\n"))
+	if detail != "The specified server is already connected." {
+		t.Fatalf("ONTAP error detail = %q", detail)
+	}
+	if !fpolicyAlreadyConnected(detail) {
+		t.Fatal("already-connected response was not accepted")
+	}
+}
+
 func TestFPolicyEngineConnectCommand(t *testing.T) {
 	policy := fpolicyPolicy{SVM: "finance", Name: "pathdiff_policy", Targets: "192.0.2.10"}
 	if got := "vserver fpolicy engine-connect -vserver " + shellQuote(policy.SVM) + " -policy-name " + shellQuote(policy.Name) + " -node " + shellQuote("node-1") + " -server " + shellQuote("192.0.2.10"); got != "vserver fpolicy engine-connect -vserver \"finance\" -policy-name \"pathdiff_policy\" -node \"node-1\" -server \"192.0.2.10\"" {
