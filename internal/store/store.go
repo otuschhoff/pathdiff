@@ -2,6 +2,7 @@ package store
 
 import (
 	"bytes"
+	cryptorand "crypto/rand"
 	"encoding/binary"
 	"encoding/json"
 	"errors"
@@ -10,9 +11,11 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"runtime"
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/cockroachdb/pebble"
@@ -34,11 +37,18 @@ type DB struct {
 	db        *pebble.DB
 	path      string
 	cleanupMu sync.Mutex
+	scanSlots chan struct{}
+	eventID   [8]byte
+	eventSeq  atomic.Uint64
 }
 
 var retentionKey = []byte("c:retention")
 
 func Open(path string) (*DB, error) {
+	var eventID [8]byte
+	if _, err := cryptorand.Read(eventID[:]); err != nil {
+		return nil, fmt.Errorf("initialize event key sequence: %w", err)
+	}
 	db, err := pebble.Open(path, &pebble.Options{
 		MaxConcurrentCompactions: func() int { return 4 },
 		L0CompactionThreshold:    2,
@@ -46,7 +56,16 @@ func Open(path string) (*DB, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &DB{db: db, path: path}, nil
+	return &DB{db: db, path: path, scanSlots: make(chan struct{}, scanQueryLimit(runtime.GOMAXPROCS(0))), eventID: eventID}, nil
+}
+
+func scanQueryLimit(processors int) int {
+	return max(1, min(4, (processors-1)/2))
+}
+
+func (d *DB) beginScan() func() {
+	d.scanSlots <- struct{}{}
+	return func() { <-d.scanSlots }
 }
 
 func (d *DB) Close() error {
@@ -80,6 +99,24 @@ func pathKey(path string, t time.Time, operation, volumeMSID string) []byte {
 	return append(key, volumeMSID...)
 }
 
+const eventKeySuffixSize = 18
+
+func (d *DB) nextEventKeySuffix() []byte {
+	suffix := make([]byte, eventKeySuffixSize)
+	suffix[0] = ':'
+	suffix[1] = 0
+	copy(suffix[2:10], d.eventID[:])
+	binary.BigEndian.PutUint64(suffix[10:], d.eventSeq.Add(1))
+	return suffix
+}
+
+func eventKeySuffix(key []byte) []byte {
+	if len(key) >= eventKeySuffixSize && key[len(key)-eventKeySuffixSize] == ':' && key[len(key)-eventKeySuffixSize+1] == 0 {
+		return key[len(key)-eventKeySuffixSize:]
+	}
+	return nil
+}
+
 func pathPrefix(path string) []byte {
 	return append([]byte("p:"), path...)
 }
@@ -108,10 +145,11 @@ func (d *DB) Store(event Event) error {
 
 	batch := d.db.NewBatch()
 	defer batch.Close()
-	if err := batch.Set(timeKey(event.Timestamp, event.Path, event.Operation, event.VolumeMSID), data, pebble.NoSync); err != nil {
+	suffix := d.nextEventKeySuffix()
+	if err := batch.Set(append(timeKey(event.Timestamp, event.Path, event.Operation, event.VolumeMSID), suffix...), data, pebble.NoSync); err != nil {
 		return err
 	}
-	if err := batch.Set(pathKey(event.Path, event.Timestamp, event.Operation, event.VolumeMSID), data, pebble.NoSync); err != nil {
+	if err := batch.Set(append(pathKey(event.Path, event.Timestamp, event.Operation, event.VolumeMSID), suffix...), data, pebble.NoSync); err != nil {
 		return err
 	}
 	return batch.Commit(pebble.NoSync)
@@ -206,7 +244,8 @@ func (d *DB) DeleteEventsBefore(cutoff time.Time) (uint64, error) {
 		if err := batch.Delete(iter.Key(), pebble.NoSync); err != nil {
 			return deleted, err
 		}
-		if err := batch.Delete(pathKey(event.Path, event.Timestamp, event.Operation, event.VolumeMSID), pebble.NoSync); err != nil {
+		pathIndexKey := append(pathKey(event.Path, event.Timestamp, event.Operation, event.VolumeMSID), eventKeySuffix(iter.Key())...)
+		if err := batch.Delete(pathIndexKey, pebble.NoSync); err != nil {
 			return deleted, err
 		}
 		deleted++
@@ -227,6 +266,7 @@ func (d *DB) DeleteEventsBefore(cutoff time.Time) (uint64, error) {
 }
 
 func (d *DB) EventCount() (uint64, error) {
+	defer d.beginScan()()
 	iter, err := d.db.NewIter(&pebble.IterOptions{LowerBound: []byte("t:"), UpperBound: []byte("u:")})
 	if err != nil {
 		return 0, err
@@ -361,6 +401,11 @@ func (d *DB) listMappings(prefix string) ([]Mapping, error) {
 }
 
 func (d *DB) EventsSince(since time.Time) ([]Event, error) {
+	defer d.beginScan()()
+	volumeNames, svmNames, err := d.eventMappingNames()
+	if err != nil {
+		return nil, err
+	}
 	iter, err := d.db.NewIter(&pebble.IterOptions{
 		LowerBound: []byte("t:"),
 		UpperBound: []byte("u:"),
@@ -377,18 +422,19 @@ func (d *DB) EventsSince(since time.Time) ([]Event, error) {
 		if err := json.Unmarshal(iter.Value(), &event); err != nil {
 			return nil, fmt.Errorf("decode stored event: %w", err)
 		}
-		if err := d.resolveVolumeName(&event); err != nil {
-			return nil, err
-		}
-		if err := d.resolveSVMName(&event); err != nil {
-			return nil, err
-		}
+		event.VolumeName = volumeNames[event.VolumeMSID]
+		event.SVMName = svmNames[event.SVMID]
 		events = append(events, event)
 	}
 	return events, iter.Error()
 }
 
 func (d *DB) EventsByPath(path string, start, end time.Time) ([]Event, error) {
+	defer d.beginScan()()
+	volumeNames, svmNames, err := d.eventMappingNames()
+	if err != nil {
+		return nil, err
+	}
 	prefix := pathPrefix(path)
 	iter, err := d.db.NewIter(&pebble.IterOptions{
 		LowerBound: prefix,
@@ -408,18 +454,15 @@ func (d *DB) EventsByPath(path string, start, end time.Time) ([]Event, error) {
 		if event.Timestamp.Before(start) || event.Timestamp.After(end) {
 			continue
 		}
-		if err := d.resolveVolumeName(&event); err != nil {
-			return nil, err
-		}
-		if err := d.resolveSVMName(&event); err != nil {
-			return nil, err
-		}
+		event.VolumeName = volumeNames[event.VolumeMSID]
+		event.SVMName = svmNames[event.SVMID]
 		events = append(events, event)
 	}
 	return events, iter.Error()
 }
 
 func (d *DB) ParentSummariesByPath(path, wildcard string, start, end time.Time) ([]ParentSummary, error) {
+	defer d.beginScan()()
 	matcher, err := compilePathWildcard(wildcard)
 	if err != nil {
 		return nil, err
@@ -541,6 +584,9 @@ func decodePathIndexKey(key []byte) ([]byte, time.Time, []byte, error) {
 	if len(key) < 14 || !bytes.HasPrefix(key, []byte("p:")) {
 		return nil, time.Time{}, nil, fmt.Errorf("invalid path index key")
 	}
+	if suffix := eventKeySuffix(key); suffix != nil {
+		key = key[:len(key)-len(suffix)]
+	}
 	volumeSeparator := bytes.LastIndexByte(key, ':')
 	if volumeSeparator < 0 {
 		return nil, time.Time{}, nil, fmt.Errorf("invalid path index key")
@@ -587,34 +633,14 @@ func (d *DB) mappingNames(prefix string) (map[string]string, error) {
 	return names, nil
 }
 
-func (d *DB) resolveVolumeName(event *Event) error {
-	if event.VolumeMSID == "" {
-		return nil
-	}
-	name, closer, err := d.db.Get(append([]byte("v:"), event.VolumeMSID...))
-	if errors.Is(err, pebble.ErrNotFound) {
-		return nil
-	}
+func (d *DB) eventMappingNames() (map[string]string, map[string]string, error) {
+	volumeNames, err := d.mappingNames("v:")
 	if err != nil {
-		return fmt.Errorf("look up volume name: %w", err)
+		return nil, nil, err
 	}
-	defer closer.Close()
-	event.VolumeName = string(name)
-	return nil
-}
-
-func (d *DB) resolveSVMName(event *Event) error {
-	if event.SVMID == "" {
-		return nil
-	}
-	name, closer, err := d.db.Get(append([]byte("s:"), event.SVMID...))
-	if errors.Is(err, pebble.ErrNotFound) {
-		return nil
-	}
+	svmNames, err := d.mappingNames("s:")
 	if err != nil {
-		return fmt.Errorf("look up SVM name: %w", err)
+		return nil, nil, err
 	}
-	defer closer.Close()
-	event.SVMName = string(name)
-	return nil
+	return volumeNames, svmNames, nil
 }
