@@ -3533,6 +3533,7 @@ func newPathListCommand() *cobra.Command {
 
 func newPathParentCommand() *cobra.Command {
 	var controlPath, pathPrefix, startValue, endValue, sortBy string
+	var export pathExportOptions
 	var maxResults int
 	command := &cobra.Command{Use: "parent [path-search]", Args: cobra.MaximumNArgs(1), Short: "List parent directories changed during a time range", RunE: func(command *cobra.Command, arguments []string) error {
 		start, end, err := eventRange(startValue, endValue, time.Now().UTC())
@@ -3557,6 +3558,12 @@ func newPathParentCommand() *cobra.Command {
 				return err
 			}
 		}
+		if format, requestedFilename := export.selected(); format != "" {
+			if err := sortParentSummaries(response.Parents, sortBy); err != nil {
+				return err
+			}
+			return exportPathRecords(command.OutOrStdout(), response.Parents, format, requestedFilename, "parent", time.Now().UTC())
+		}
 		return printParentSummaries(command.OutOrStdout(), response.Parents, maxResults, sortBy)
 	}}
 	command.Flags().StringVar(&controlPath, "control", defaultControl, "Unix control socket")
@@ -3565,11 +3572,13 @@ func newPathParentCommand() *cobra.Command {
 	command.Flags().StringVar(&endValue, "end", "", "inclusive time; RFC3339, YYYY-MM-DD, or relative duration (default now)")
 	command.Flags().IntVar(&maxResults, "max", 100, "maximum paths to display")
 	command.Flags().StringVar(&sortBy, "sort", "path", "sort by path or timestamp")
+	addPathExportFlags(command, &export)
 	return command
 }
 
 func newPathQueryCommand(use, summary string, render func(io.Writer, []store.Event, string, int, string) error) *cobra.Command {
 	var controlPath, pathPrefix, startValue, endValue, sortBy string
+	var export pathExportOptions
 	var maxResults int
 	command := &cobra.Command{Use: use, Args: cobra.MaximumNArgs(1), Short: summary, RunE: func(command *cobra.Command, arguments []string) error {
 		start, end, err := eventRange(startValue, endValue, time.Now().UTC())
@@ -3584,6 +3593,13 @@ func newPathQueryCommand(use, summary string, render func(io.Writer, []store.Eve
 		if len(arguments) == 1 {
 			search = normalizePathSearch(arguments[0])
 		}
+		if format, requestedFilename := export.selected(); format != "" {
+			results, err := pathRows(response.Events, search, sortBy, func(event store.Event) string { return event.Path })
+			if err != nil {
+				return err
+			}
+			return exportPathRecords(command.OutOrStdout(), results, format, requestedFilename, "list", time.Now().UTC())
+		}
 		return render(command.OutOrStdout(), response.Events, search, maxResults, sortBy)
 	}}
 	command.Flags().StringVar(&controlPath, "control", defaultControl, "Unix control socket")
@@ -3592,7 +3608,87 @@ func newPathQueryCommand(use, summary string, render func(io.Writer, []store.Eve
 	command.Flags().StringVar(&endValue, "end", "", "inclusive time; RFC3339, YYYY-MM-DD, or relative duration (default now)")
 	command.Flags().IntVar(&maxResults, "max", 100, "maximum paths to display")
 	command.Flags().StringVar(&sortBy, "sort", "path", "sort by path or timestamp")
+	addPathExportFlags(command, &export)
 	return command
+}
+
+const automaticExportFilename = "auto"
+
+type pathExportOptions struct {
+	json  string
+	jsonl string
+}
+
+func addPathExportFlags(command *cobra.Command, export *pathExportOptions) {
+	command.Flags().StringVar(&export.json, "json", "", "export all matching records as a JSON array; use --json=<filename> to set the file")
+	command.Flags().StringVar(&export.jsonl, "jsonl", "", "export all matching records as JSON lines; use --jsonl=<filename> to set the file")
+	command.Flags().Lookup("json").NoOptDefVal = automaticExportFilename
+	command.Flags().Lookup("jsonl").NoOptDefVal = automaticExportFilename
+	command.MarkFlagsMutuallyExclusive("json", "jsonl")
+}
+
+func (export pathExportOptions) selected() (string, string) {
+	if export.json != "" {
+		return "json", export.json
+	}
+	if export.jsonl != "" {
+		return "jsonl", export.jsonl
+	}
+	return "", ""
+}
+
+func exportPathRecords[T any](writer io.Writer, records []T, format, requestedFilename, queryName string, now time.Time) (returnErr error) {
+	if format != "json" && format != "jsonl" {
+		return fmt.Errorf("unsupported path export format %q", format)
+	}
+	filename := pathExportFilename(requestedFilename, queryName, format, now)
+	if records == nil {
+		records = []T{}
+	}
+	directory := filepath.Dir(filename)
+	temporary, err := os.CreateTemp(directory, "."+filepath.Base(filename)+"-")
+	if err != nil {
+		return fmt.Errorf("create temporary %s export: %w", format, err)
+	}
+	temporaryName := temporary.Name()
+	defer func() {
+		if err := os.Remove(temporaryName); err != nil && !errors.Is(err, os.ErrNotExist) {
+			returnErr = errors.Join(returnErr, fmt.Errorf("remove temporary %s export: %w", format, err))
+		}
+	}()
+	if err := temporary.Chmod(0o644); err != nil {
+		return errors.Join(fmt.Errorf("set %s export permissions: %w", format, err), closeWithContext(temporary, format+" export"))
+	}
+	encoder := json.NewEncoder(temporary)
+	if format == "json" {
+		encoder.SetIndent("", "  ")
+		if err := encoder.Encode(records); err != nil {
+			return errors.Join(fmt.Errorf("encode JSON export: %w", err), closeWithContext(temporary, "JSON export"))
+		}
+	} else {
+		for _, record := range records {
+			if err := encoder.Encode(record); err != nil {
+				return errors.Join(fmt.Errorf("encode JSONL export: %w", err), closeWithContext(temporary, "JSONL export"))
+			}
+		}
+	}
+	if err := temporary.Close(); err != nil {
+		return fmt.Errorf("close %s export: %w", format, err)
+	}
+	if err := os.Rename(temporaryName, filename); err != nil {
+		return fmt.Errorf("publish %s export %q: %w", format, filename, err)
+	}
+	if _, err := fmt.Fprintf(writer, "Exported %d records to %s\n", len(records), filename); err != nil {
+		return fmt.Errorf("report %s export: %w", format, err)
+	}
+	return nil
+}
+
+func pathExportFilename(requestedFilename, queryName, format string, now time.Time) string {
+	if requestedFilename != automaticExportFilename {
+		return requestedFilename
+	}
+	return fmt.Sprintf("pathdiff-path-%s-%s.%s", queryName, now.UTC().Format("20060102T150405.000000000Z"), format)
 }
 
 func eventRange(startValue, endValue string, now time.Time) (time.Time, time.Time, error) {
@@ -3621,9 +3717,30 @@ func printParentSummaries(writer io.Writer, summaries []store.ParentSummary, max
 	if sortBy != "path" && sortBy != "timestamp" {
 		return fmt.Errorf("unsupported sort %q; use path or timestamp", sortBy)
 	}
-	if len(summaries) > maxResults {
-		_, err := fmt.Fprintf(writer, "%d changed parents match; increase --max and/or tighten the path search, --path prefix, or time range.\n", len(summaries))
+	if len(summaries) == 0 {
+		_, err := io.WriteString(writer, "No records found.\n")
 		return err
+	}
+	if len(summaries) > maxResults {
+		_, err := fmt.Fprintf(writer, "%s changed parents match; increase %s and/or tighten the path search, %s prefix, or time range.\n", highlightQueryHint(strconv.Itoa(len(summaries))), highlightQueryHint("--max"), highlightQueryHint("--path"))
+		return err
+	}
+	if err := sortParentSummaries(summaries, sortBy); err != nil {
+		return err
+	}
+
+	tableWriter := newTableWriter(writer)
+	tableWriter.AppendHeader(table.Row{"Last Change", "SVM", "Volume", "CNT", "Parent"})
+	for _, summary := range summaries {
+		tableWriter.AppendRow(table.Row{summary.Timestamp.UTC().Format(time.RFC3339Nano), parentSVM(summary), parentVolume(summary), summary.ChildCount, summary.Path})
+	}
+	tableWriter.Render()
+	return nil
+}
+
+func sortParentSummaries(summaries []store.ParentSummary, sortBy string) error {
+	if sortBy != "path" && sortBy != "timestamp" {
+		return fmt.Errorf("unsupported sort %q; use path or timestamp", sortBy)
 	}
 	sort.Slice(summaries, func(left, right int) bool {
 		if sortBy == "timestamp" {
@@ -3639,13 +3756,6 @@ func printParentSummaries(writer io.Writer, summaries []store.ParentSummary, max
 		}
 		return summaries[left].Path < summaries[right].Path
 	})
-
-	tableWriter := newTableWriter(writer)
-	tableWriter.AppendHeader(table.Row{"Last Change", "SVM", "Volume", "CNT", "Parent"})
-	for _, summary := range summaries {
-		tableWriter.AppendRow(table.Row{summary.Timestamp.UTC().Format(time.RFC3339Nano), parentSVM(summary), parentVolume(summary), summary.ChildCount, summary.Path})
-	}
-	tableWriter.Render()
 	return nil
 }
 
@@ -3696,15 +3806,34 @@ func printPathRows(writer io.Writer, events []store.Event, wildcard string, maxR
 	if maxResults < 1 {
 		return errors.New("max must be greater than zero")
 	}
+	results, err := pathRows(events, wildcard, sortBy, pathFor)
+	if err != nil {
+		return err
+	}
+	if len(results) > maxResults {
+		_, err := fmt.Fprintf(writer, "%s changed %ss match; increase %s and/or tighten the path search, %s prefix, or time range.\n", highlightQueryHint(strconv.Itoa(len(results))), strings.ToLower(column), highlightQueryHint("--max"), highlightQueryHint("--path"))
+		return err
+	}
+
+	tableWriter := newTableWriter(writer)
+	tableWriter.AppendHeader(table.Row{"Last Change", "Volume", column})
+	for _, event := range results {
+		tableWriter.AppendRow(table.Row{event.Timestamp.UTC().Format(time.RFC3339Nano), eventVolume(event), event.Path})
+	}
+	tableWriter.Render()
+	return nil
+}
+
+func pathRows(events []store.Event, wildcard, sortBy string, pathFor func(store.Event) string) ([]store.Event, error) {
 	if sortBy != "path" && sortBy != "timestamp" {
-		return fmt.Errorf("unsupported sort %q; use path or timestamp", sortBy)
+		return nil, fmt.Errorf("unsupported sort %q; use path or timestamp", sortBy)
 	}
 	paths := make(map[string]store.Event)
 	for _, event := range events {
 		rowPath := pathFor(event)
 		matched, err := wildcardMatch(wildcard, rowPath)
 		if err != nil {
-			return fmt.Errorf("invalid path wildcard %q: %w", wildcard, err)
+			return nil, fmt.Errorf("invalid path wildcard %q: %w", wildcard, err)
 		}
 		if !matched {
 			continue
@@ -3719,10 +3848,6 @@ func printPathRows(writer io.Writer, events []store.Event, wildcard string, maxR
 	for _, event := range paths {
 		results = append(results, event)
 	}
-	if len(results) > maxResults {
-		_, err := fmt.Fprintf(writer, "%d changed %ss match; increase --max and/or tighten the path search, --path prefix, or time range.\n", len(results), strings.ToLower(column))
-		return err
-	}
 	sort.Slice(results, func(left, right int) bool {
 		if sortBy == "timestamp" {
 			return results[left].Timestamp.After(results[right].Timestamp)
@@ -3733,14 +3858,7 @@ func printPathRows(writer io.Writer, events []store.Event, wildcard string, maxR
 		}
 		return leftVolume < rightVolume
 	})
-
-	tableWriter := newTableWriter(writer)
-	tableWriter.AppendHeader(table.Row{"Last Change", "Volume", column})
-	for _, event := range results {
-		tableWriter.AppendRow(table.Row{event.Timestamp.UTC().Format(time.RFC3339Nano), eventVolume(event), event.Path})
-	}
-	tableWriter.Render()
-	return nil
+	return results, nil
 }
 
 func eventVolume(event store.Event) string {
@@ -3765,7 +3883,7 @@ func printEvents(writer io.Writer, events []store.Event, wildcard string, maxRes
 		}
 	}
 	if len(matches) > maxResults {
-		_, err := fmt.Fprintf(writer, "%d results match; increase --max and/or tighten the path wildcard, --path prefix, or time range.\n", len(matches))
+		_, err := fmt.Fprintf(writer, "%s results match; increase %s and/or tighten the path wildcard, %s prefix, or time range.\n", highlightQueryHint(strconv.Itoa(len(matches))), highlightQueryHint("--max"), highlightQueryHint("--path"))
 		return err
 	}
 
@@ -3776,6 +3894,10 @@ func printEvents(writer io.Writer, events []store.Event, wildcard string, maxRes
 	}
 	tableWriter.Render()
 	return nil
+}
+
+func highlightQueryHint(value string) string {
+	return text.Colors{text.Bold, text.FgYellow, text.Underline}.Sprint(value)
 }
 
 func newTableWriter(writer io.Writer) table.Writer {

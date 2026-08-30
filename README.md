@@ -63,6 +63,9 @@ bin/pathdiff events --path /vol/finance/ --start 10d
 bin/pathdiff events --path /vol/finance/ --start 1M4d --end 2026-08-28
 bin/pathdiff path list firefox --start 10d
 bin/pathdiff path parent --path /vol/finance/ --sort timestamp --max 250
+bin/pathdiff path list firefox --json
+bin/pathdiff path list firefox --json=changed-paths.json
+bin/pathdiff path parent --path /vol/finance/ --jsonl=changed-parents.jsonl
 bin/pathdiff db status
 bin/pathdiff db event reset
 bin/pathdiff db retention show
@@ -80,6 +83,8 @@ bin/pathdiff cdot svm list
 `path list` accepts the same optional path search and `--path`, `--start`, `--end`, `--max`, and `--control` flags as `events`. It coalesces repeated changes to each volume/path pair and renders `Last Change`, `Volume`, and `Path`.
 
 `path parent` accepts the same flags but aggregates matching events inside the daemon and returns only parent summaries, avoiding transfer and retention of every matching event. It renders `Last Change`, `SVM`, `Volume`, `CNT`, and `Parent`, resolving SVM and volume names from persisted mappings or one bulk cDOT lookup. `CNT` is the number of distinct changed child paths beneath that parent. The parent view sorts by SVM, volume, and path by default; pass `--sort timestamp` to list newest changes first.
+
+Both `path list` and `path parent` accept `--json[=<filename>]` and `--jsonl[=<filename>]`. A bare flag creates a timestamped filename such as `pathdiff-path-list-20260830T103456.123456789Z.json`; use the `=<filename>` form to choose another path without ambiguity with the optional path-search argument. JSON exports contain one array, while JSONL exports contain one object per line. Export queries always write every matching, coalesced result and ignore the display-only `--max` limit. The two export flags are mutually exclusive.
 
 `db event reset` removes all stored event records through the running daemon. It preserves configured volume MSID-to-name mappings.
 

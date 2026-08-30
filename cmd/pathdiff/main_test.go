@@ -9,6 +9,7 @@ import (
 	"encoding/json"
 	"encoding/pem"
 	"errors"
+	"fmt"
 	"io"
 	"net"
 	"os"
@@ -21,6 +22,7 @@ import (
 	"pathdiff/internal/store"
 
 	"github.com/jedib0t/go-pretty/v6/text"
+	"github.com/spf13/cobra"
 	"golang.org/x/crypto/ssh"
 )
 
@@ -257,7 +259,7 @@ func TestPrintEventsLimitsResults(t *testing.T) {
 	if err := printEvents(&output, events, "*", 1); err != nil {
 		t.Fatal(err)
 	}
-	if got := output.String(); !strings.Contains(got, "2 results match") || !strings.Contains(got, "increase --max") {
+	if got := output.String(); !strings.Contains(got, highlightQueryHint("2")) || !strings.Contains(got, highlightQueryHint("--max")) || !strings.Contains(got, highlightQueryHint("--path")) {
 		t.Fatalf("unexpected limit output: %s", got)
 	}
 }
@@ -296,7 +298,7 @@ func TestPrintPathsLimitsCoalescedResults(t *testing.T) {
 	if err := printPaths(&output, events, "*", 1, "path"); err != nil {
 		t.Fatal(err)
 	}
-	if got := output.String(); !strings.Contains(got, "2 changed paths match") {
+	if got := output.String(); !strings.Contains(got, highlightQueryHint("2")) || !strings.Contains(got, highlightQueryHint("--max")) || !strings.Contains(got, highlightQueryHint("--path")) {
 		t.Fatalf("unexpected path limit output: %s", got)
 	}
 }
@@ -314,6 +316,222 @@ func TestPrintParentSummaries(t *testing.T) {
 	got := output.String()
 	if strings.Count(got, "/vol/alpha") != 1 || strings.Count(got, "/vol/beta") != 1 || !strings.Contains(got, "2026-08-29T12:02:00Z") || !strings.Contains(got, "svm-one") || !strings.Contains(got, "one") || !strings.Contains(got, "CNT") {
 		t.Fatalf("unexpected parent summaries: %s", got)
+	}
+}
+
+func TestPrintParentSummariesEmpty(t *testing.T) {
+	var output bytes.Buffer
+	if err := printParentSummaries(&output, nil, 100, "path"); err != nil {
+		t.Fatal(err)
+	}
+	if got, want := output.String(), "No records found.\n"; got != want {
+		t.Fatalf("empty parent summaries output = %q, want %q", got, want)
+	}
+}
+
+func TestPrintParentSummariesHighlightsLimitHints(t *testing.T) {
+	summaries := []store.ParentSummary{{Path: "/one"}, {Path: "/two"}}
+	var output bytes.Buffer
+	if err := printParentSummaries(&output, summaries, 1, "path"); err != nil {
+		t.Fatal(err)
+	}
+	got := output.String()
+	for _, value := range []string{"2", "--max", "--path"} {
+		if !strings.Contains(got, highlightQueryHint(value)) {
+			t.Errorf("limit output does not highlight %q: %q", value, got)
+		}
+	}
+}
+
+func TestPathExportFlags(t *testing.T) {
+	for _, newCommand := range []func() *cobra.Command{newPathListCommand, newPathParentCommand} {
+		command := newCommand()
+		if err := command.ParseFlags([]string{"--json"}); err != nil {
+			t.Fatal(err)
+		}
+		if value, err := command.Flags().GetString("json"); err != nil || value != automaticExportFilename {
+			t.Fatalf("bare --json = %q, %v", value, err)
+		}
+
+		command = newCommand()
+		if err := command.ParseFlags([]string{"--json=results.json"}); err != nil {
+			t.Fatal(err)
+		}
+		if value, err := command.Flags().GetString("json"); err != nil || value != "results.json" {
+			t.Fatalf("explicit --json = %q, %v", value, err)
+		}
+
+		command = newCommand()
+		if err := command.ParseFlags([]string{"--json", "--jsonl"}); err != nil {
+			t.Fatal(err)
+		}
+		if err := command.ValidateFlagGroups(); err == nil {
+			t.Fatal("--json and --jsonl were accepted together")
+		}
+	}
+}
+
+func TestExportPathRecordsJSONIncludesAllResults(t *testing.T) {
+	events := []store.Event{
+		{Path: "/vol/a", Timestamp: time.Date(2026, 8, 30, 12, 0, 0, 0, time.UTC)},
+		{Path: "/vol/b", Timestamp: time.Date(2026, 8, 30, 12, 1, 0, 0, time.UTC)},
+		{Path: "/vol/c", Timestamp: time.Date(2026, 8, 30, 12, 2, 0, 0, time.UTC)},
+	}
+	results, err := pathRows(events, "*", "path", func(event store.Event) string { return event.Path })
+	if err != nil {
+		t.Fatal(err)
+	}
+	filename := filepath.Join(t.TempDir(), "paths.json")
+	var output bytes.Buffer
+	if err := exportPathRecords(&output, results, "json", filename, "list", time.Time{}); err != nil {
+		t.Fatal(err)
+	}
+	data, err := os.ReadFile(filename)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var exported []store.Event
+	if err := json.Unmarshal(data, &exported); err != nil {
+		t.Fatal(err)
+	}
+	if len(exported) != 3 {
+		t.Fatalf("JSON export contains %d records, want all 3 despite a display max of 1", len(exported))
+	}
+	if !strings.Contains(output.String(), "Exported 3 records to "+filename) {
+		t.Fatalf("unexpected export output: %s", output.String())
+	}
+}
+
+func TestExportPathRecordsJSONL(t *testing.T) {
+	records := []store.ParentSummary{{Path: "/one"}, {Path: "/two"}}
+	filename := filepath.Join(t.TempDir(), "parents.jsonl")
+	if err := exportPathRecords(io.Discard, records, "jsonl", filename, "parent", time.Time{}); err != nil {
+		t.Fatal(err)
+	}
+	data, err := os.ReadFile(filename)
+	if err != nil {
+		t.Fatal(err)
+	}
+	lines := strings.Split(strings.TrimSpace(string(data)), "\n")
+	if len(lines) != 2 {
+		t.Fatalf("JSONL export has %d lines, want 2: %q", len(lines), data)
+	}
+	for _, line := range lines {
+		var summary store.ParentSummary
+		if err := json.Unmarshal([]byte(line), &summary); err != nil {
+			t.Fatalf("invalid JSONL record %q: %v", line, err)
+		}
+	}
+}
+
+func TestExportPathRecordsEmptyJSONArray(t *testing.T) {
+	filename := filepath.Join(t.TempDir(), "empty.json")
+	if err := exportPathRecords[store.Event](io.Discard, nil, "json", filename, "list", time.Time{}); err != nil {
+		t.Fatal(err)
+	}
+	data, err := os.ReadFile(filename)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.TrimSpace(string(data)) != "[]" {
+		t.Fatalf("empty JSON export = %q, want []", data)
+	}
+}
+
+func TestPathExportFilename(t *testing.T) {
+	now := time.Date(2026, 8, 30, 12, 34, 56, 123456789, time.FixedZone("test", 2*60*60))
+	if got, want := pathExportFilename(automaticExportFilename, "parent", "jsonl", now), "pathdiff-path-parent-20260830T103456.123456789Z.jsonl"; got != want {
+		t.Fatalf("automatic export filename = %q, want %q", got, want)
+	}
+	if got := pathExportFilename("custom.json", "list", "json", now); got != "custom.json" {
+		t.Fatalf("explicit export filename = %q", got)
+	}
+}
+
+func TestPathCommandsExportAllResultsBeyondMax(t *testing.T) {
+	base := time.Date(2026, 8, 30, 12, 0, 0, 0, time.UTC)
+	for _, test := range []struct {
+		name       string
+		command    func() *cobra.Command
+		response   controlResponse
+		flag       string
+		filename   string
+		wantRecord int
+	}{
+		{
+			name:       "list JSON",
+			command:    newPathListCommand,
+			response:   controlResponse{Events: []store.Event{{Path: "/one", Timestamp: base}, {Path: "/two", Timestamp: base}}},
+			flag:       "--json",
+			filename:   "paths.json",
+			wantRecord: 2,
+		},
+		{
+			name:       "parent JSONL",
+			command:    newPathParentCommand,
+			response:   controlResponse{Parents: []store.ParentSummary{{Path: "/one", Timestamp: base, VolumeName: "vol", SVMName: "svm"}, {Path: "/two", Timestamp: base, VolumeName: "vol", SVMName: "svm"}}},
+			flag:       "--jsonl",
+			filename:   "parents.jsonl",
+			wantRecord: 2,
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			directory := t.TempDir()
+			controlPath := filepath.Join(directory, "control.sock")
+			listener, err := net.Listen("unix", controlPath)
+			if err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(func() { _ = listener.Close() })
+			served := make(chan error, 1)
+			go func() {
+				connection, err := listener.Accept()
+				if err != nil {
+					served <- err
+					return
+				}
+				defer connection.Close()
+				var request controlRequest
+				if err := json.NewDecoder(connection).Decode(&request); err != nil {
+					served <- err
+					return
+				}
+				served <- json.NewEncoder(connection).Encode(test.response)
+			}()
+
+			filename := filepath.Join(directory, test.filename)
+			command := test.command()
+			var output bytes.Buffer
+			command.SetOut(&output)
+			command.SetErr(&output)
+			command.SetArgs([]string{"--control", controlPath, "--max", "1", test.flag + "=" + filename})
+			if err := command.Execute(); err != nil {
+				t.Fatal(err)
+			}
+			if err := <-served; err != nil {
+				t.Fatal(err)
+			}
+			data, err := os.ReadFile(filename)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if test.flag == "--json" {
+				var records []store.Event
+				if err := json.Unmarshal(data, &records); err != nil {
+					t.Fatal(err)
+				}
+				if len(records) != test.wantRecord {
+					t.Fatalf("exported %d records, want %d", len(records), test.wantRecord)
+				}
+			} else {
+				if lines := strings.Count(strings.TrimSpace(string(data)), "\n") + 1; lines != test.wantRecord {
+					t.Fatalf("exported %d JSONL records, want %d", lines, test.wantRecord)
+				}
+			}
+			if !strings.Contains(output.String(), fmt.Sprintf("Exported %d records", test.wantRecord)) {
+				t.Fatalf("unexpected command output: %s", output.String())
+			}
+		})
 	}
 }
 
