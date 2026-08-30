@@ -77,7 +77,7 @@ bin/pathdiff cdot svm list
 
 `path list` accepts the same optional path search and `--path`, `--start`, `--end`, `--max`, and `--control` flags as `events`. It coalesces repeated changes to each volume/path pair and renders `Last Change`, `Volume`, and `Path`.
 
-`path parent` accepts the same flags but coalesces changed paths by volume and parent directory, rendering `Last Change`, `Volume`, `CNT`, and `Parent`. `CNT` is the number of distinct changed child paths beneath that parent. Both views sort by volume then path by default; pass `--sort timestamp` to list newest changes first.
+`path parent` accepts the same flags but aggregates matching events inside the daemon and returns only parent summaries, avoiding transfer and retention of every matching event. It renders `Last Change`, `SVM`, `Volume`, `CNT`, and `Parent`, resolving SVM and volume names from persisted mappings or one bulk cDOT lookup. `CNT` is the number of distinct changed child paths beneath that parent. The parent view sorts by SVM, volume, and path by default; pass `--sort timestamp` to list newest changes first.
 
 `db event reset` removes all stored event records through the running daemon. It preserves configured volume MSID-to-name mappings.
 
