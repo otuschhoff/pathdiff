@@ -39,7 +39,7 @@ import (
 const (
 	defaultDB                = "pathdiff_data"
 	defaultControl           = "/tmp/pathdiff.sock"
-	defaultListen            = ":9911"
+	defaultListen            = ":9911-9999"
 	fpolicyPolicyShowCommand = "vserver fpolicy policy show"
 	fpolicyEngineShowCommand = "vserver fpolicy policy external-engine show -fields primary-servers,secondary-servers,port,ssl-option"
 )
@@ -123,11 +123,14 @@ func runDaemon(dbPath, listenAddr, controlPath, recordDir string, verbose bool) 
 	}
 	defer db.Close()
 
-	eventListener, err := net.Listen("tcp", listenAddr)
+	listenerEndpoints, err := parseListenAddresses(listenAddr)
 	if err != nil {
 		return fmt.Errorf("listen for events: %w", err)
 	}
-	defer eventListener.Close()
+	receiverEndpoints, err := resolveListenerEndpoints(listenerEndpoints)
+	if err != nil {
+		return err
+	}
 
 	if err := os.MkdirAll(filepath.Dir(controlPath), 0o755); err != nil {
 		return fmt.Errorf("create control socket directory: %w", err)
@@ -151,18 +154,237 @@ func runDaemon(dbPath, listenAddr, controlPath, recordDir string, verbose bool) 
 	var connections sync.WaitGroup
 	activeConnections := newConnectionRegistry()
 	trackers := newSenderTracker(verbose)
+	listenerManager := newFPolicyListenerManager(context, listenerEndpoints, receiverEndpoints, db, recordDir, trackers, activeConnections, &connections)
+	if err := listenerManager.Refresh(); err != nil {
+		return fmt.Errorf("discover FPolicy senders: %w", err)
+	}
+	defer listenerManager.Close()
 	go trackers.reportEvery(context, 10*time.Second)
-	go acceptEvents(context, eventListener, db, recordDir, trackers, activeConnections, &connections)
-	go acceptControls(context, controlListener, db, cancel, trackers, activeConnections, &connections)
+	go listenerManager.RefreshEvery(context, time.Minute)
+	go acceptControls(context, controlListener, db, cancel, trackers, activeConnections, &connections, listenerManager.Refresh)
 	<-context.Done()
-	_ = eventListener.Close()
+	listenerManager.Close()
 	_ = controlListener.Close()
 	activeConnections.CloseAll()
 	connections.Wait()
 	return nil
 }
 
-func acceptEvents(context context.Context, listener net.Listener, db *store.DB, recordDir string, trackers *senderTracker, activeConnections *connectionRegistry, connections *sync.WaitGroup) {
+func listenEventPorts(specification string) ([]net.Listener, error) {
+	addresses, err := parseListenAddresses(specification)
+	if err != nil {
+		return nil, err
+	}
+	listeners := make([]net.Listener, 0, len(addresses))
+	for _, address := range addresses {
+		listener, err := net.ListenTCP("tcp", address)
+		if err != nil {
+			closeListeners(listeners)
+			return nil, err
+		}
+		listeners = append(listeners, listener)
+	}
+	return listeners, nil
+}
+
+func closeListeners(listeners []net.Listener) {
+	for _, listener := range listeners {
+		_ = listener.Close()
+	}
+}
+
+type managedFPolicyListener struct {
+	listener net.Listener
+	sources  map[string]struct{}
+}
+
+type fpolicyListenerManager struct {
+	mu                sync.Mutex
+	context           context.Context
+	listenEndpoints   map[int]*net.TCPAddr
+	receiverEndpoints []*net.TCPAddr
+	db                *store.DB
+	recordDir         string
+	trackers          *senderTracker
+	connections       *connectionRegistry
+	waitGroup         *sync.WaitGroup
+	listeners         map[int]*managedFPolicyListener
+	enabledPolicies   map[string]struct{}
+}
+
+func newFPolicyListenerManager(context context.Context, listenEndpoints, receiverEndpoints []*net.TCPAddr, db *store.DB, recordDir string, trackers *senderTracker, connections *connectionRegistry, waitGroup *sync.WaitGroup) *fpolicyListenerManager {
+	endpoints := make(map[int]*net.TCPAddr, len(listenEndpoints))
+	for _, endpoint := range listenEndpoints {
+		endpoints[endpoint.Port] = endpoint
+	}
+	return &fpolicyListenerManager{context: context, listenEndpoints: endpoints, receiverEndpoints: receiverEndpoints, db: db, recordDir: recordDir, trackers: trackers, connections: connections, waitGroup: waitGroup, listeners: make(map[int]*managedFPolicyListener), enabledPolicies: make(map[string]struct{})}
+}
+
+func (m *fpolicyListenerManager) Refresh() error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	expected, err := discoverFPolicySenders(m.receiverEndpoints)
+	if err != nil {
+		return err
+	}
+	for port, managed := range m.listeners {
+		if sender := expected[port]; sender == nil || !sameSources(managed.sources, sender.Sources) {
+			_ = managed.listener.Close()
+			delete(m.listeners, port)
+		}
+	}
+	for port, sender := range expected {
+		if len(sender.Sources) == 0 || m.listeners[port] != nil {
+			continue
+		}
+		endpoint := m.listenEndpoints[port]
+		if endpoint == nil {
+			continue
+		}
+		listener, err := net.ListenTCP("tcp", endpoint)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "listen for FPolicy sender on %s: %v\n", endpoint, err)
+			continue
+		}
+		sources := copySources(sender.Sources)
+		m.listeners[port] = &managedFPolicyListener{listener: listener, sources: sources}
+		go acceptEvents(m.context, listener, sources, m.db, m.recordDir, m.trackers, m.connections, m.waitGroup)
+	}
+	for _, sender := range expected {
+		for _, policy := range sender.Policies {
+			key := policy.SVM + "\x00" + policy.Name
+			if _, enabled := m.enabledPolicies[key]; enabled {
+				continue
+			}
+			if err := tryEnableFPolicyPolicy(policy); err != nil {
+				fmt.Fprintf(os.Stderr, "enable FPolicy policy %s on %s: %v\n", policy.Name, policy.SVM, err)
+				continue
+			}
+			m.enabledPolicies[key] = struct{}{}
+		}
+	}
+	return nil
+}
+
+func (m *fpolicyListenerManager) RefreshEvery(context context.Context, interval time.Duration) {
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-context.Done():
+			return
+		case <-ticker.C:
+			if err := m.Refresh(); err != nil {
+				fmt.Fprintln(os.Stderr, "refresh FPolicy senders:", err)
+			}
+		}
+	}
+}
+
+func (m *fpolicyListenerManager) Close() {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	for port, listener := range m.listeners {
+		_ = listener.listener.Close()
+		delete(m.listeners, port)
+	}
+}
+
+func sameSources(left, right map[string]struct{}) bool {
+	if len(left) != len(right) {
+		return false
+	}
+	for source := range left {
+		if _, found := right[source]; !found {
+			return false
+		}
+	}
+	return true
+}
+
+func copySources(sources map[string]struct{}) map[string]struct{} {
+	copy := make(map[string]struct{}, len(sources))
+	for source := range sources {
+		copy[source] = struct{}{}
+	}
+	return copy
+}
+
+func tryEnableFPolicyPolicy(policy fpolicyPolicy) error {
+	host := defaultCDOTCluster()
+	keyFile, err := cdotKeyFile("")
+	if err != nil {
+		return err
+	}
+	knownHostsFile, err := cdotKnownHostsFile()
+	if err != nil {
+		return err
+	}
+	client, err := openCDOTClient(host, "pathdiff", keyFile, knownHostsFile, false)
+	if err != nil {
+		return err
+	}
+	defer client.Close()
+	output, err := runSSHCommand(client, "vserver fpolicy enable -vserver "+shellQuote(policy.SVM)+" -policy-name "+shellQuote(policy.Name), nil)
+	if err != nil && !strings.Contains(strings.ToLower(string(output)), "already enabled") {
+		return fmt.Errorf("%w: %s", err, strings.TrimSpace(string(output)))
+	}
+	return nil
+}
+
+func parseListenAddresses(specification string) ([]*net.TCPAddr, error) {
+	var addresses []*net.TCPAddr
+	for _, entry := range strings.Split(specification, ",") {
+		entry = strings.TrimSpace(entry)
+		match := regexp.MustCompile(`^(.*:)([0-9]+)-([0-9]+)$`).FindStringSubmatch(entry)
+		if len(match) == 0 {
+			address, err := net.ResolveTCPAddr("tcp", entry)
+			if err != nil {
+				return nil, fmt.Errorf("parse listener %q: %w", entry, err)
+			}
+			addresses = append(addresses, address)
+			continue
+		}
+		firstPort, _ := strconv.Atoi(match[2])
+		lastPort, _ := strconv.Atoi(match[3])
+		if firstPort > lastPort || lastPort > 65535 {
+			return nil, fmt.Errorf("invalid listener port range %q", entry)
+		}
+		for port := firstPort; port <= lastPort; port++ {
+			address, err := net.ResolveTCPAddr("tcp", match[1]+strconv.Itoa(port))
+			if err != nil {
+				return nil, fmt.Errorf("parse listener %q: %w", entry, err)
+			}
+			addresses = append(addresses, address)
+		}
+	}
+	if len(addresses) == 0 {
+		return nil, errors.New("at least one listener is required")
+	}
+	return addresses, nil
+}
+
+func resolveListenerEndpoints(listeners []*net.TCPAddr) ([]*net.TCPAddr, error) {
+	endpoints := make([]*net.TCPAddr, 0, len(listeners))
+	for _, listener := range listeners {
+		endpoint := *listener
+		if endpoint.IP == nil || endpoint.IP.IsUnspecified() {
+			for _, address := range localAddresses() {
+				if ip := net.ParseIP(address); ip != nil && ip.To4() != nil {
+					endpoint.IP = ip
+					break
+				}
+			}
+		}
+		if endpoint.IP == nil || endpoint.IP.To4() == nil {
+			return nil, fmt.Errorf("resolve pathdiff listener IPv4 address from %q", listener)
+		}
+		endpoints = append(endpoints, &endpoint)
+	}
+	return endpoints, nil
+}
+
+func acceptEvents(context context.Context, listener net.Listener, allowedSources map[string]struct{}, db *store.DB, recordDir string, trackers *senderTracker, activeConnections *connectionRegistry, connections *sync.WaitGroup) {
 	for {
 		connection, err := listener.Accept()
 		if err != nil {
@@ -170,6 +392,11 @@ func acceptEvents(context context.Context, listener net.Listener, db *store.DB, 
 				return
 			}
 			fmt.Fprintln(os.Stderr, "accept event connection:", err)
+			continue
+		}
+		if _, allowed := allowedSources[senderName(connection.RemoteAddr())]; !allowed {
+			fmt.Fprintf(os.Stderr, "reject unexpected FPolicy sender %s on %s\n", connection.RemoteAddr(), connection.LocalAddr())
+			_ = connection.Close()
 			continue
 		}
 		connections.Add(1)
@@ -595,7 +822,7 @@ func storeXMLEvent(payload []byte, connection net.Conn, db *store.DB, trackers *
 	trackers.logf("sender=%s state=event_stored operation=%s path=%q", sender, event.Operation, event.Path)
 }
 
-func acceptControls(context context.Context, listener net.Listener, db *store.DB, stop context.CancelFunc, trackers *senderTracker, activeConnections *connectionRegistry, connections *sync.WaitGroup) {
+func acceptControls(context context.Context, listener net.Listener, db *store.DB, stop context.CancelFunc, trackers *senderTracker, activeConnections *connectionRegistry, connections *sync.WaitGroup, refresh func() error) {
 	for {
 		connection, err := listener.Accept()
 		if err != nil {
@@ -611,12 +838,12 @@ func acceptControls(context context.Context, listener net.Listener, db *store.DB
 			activeConnections.Add(connection)
 			defer activeConnections.Remove(connection)
 			defer connection.Close()
-			handleControl(connection, db, stop, trackers)
+			handleControl(connection, db, stop, trackers, refresh)
 		}()
 	}
 }
 
-func handleControl(connection net.Conn, db *store.DB, stop context.CancelFunc, trackers *senderTracker) {
+func handleControl(connection net.Conn, db *store.DB, stop context.CancelFunc, trackers *senderTracker, refresh func() error) {
 	var request controlRequest
 	response := controlResponse{}
 	if err := json.NewDecoder(io.LimitReader(connection, 1024*1024)).Decode(&request); err != nil {
@@ -630,6 +857,11 @@ func handleControl(connection net.Conn, db *store.DB, stop context.CancelFunc, t
 			response.RequestRate = trackers.requestRate(time.Now().UTC())
 		case "engines":
 			response.Engines = trackers.engines()
+		case "fpolicy-refresh":
+			err = refresh()
+			if err == nil {
+				response.Status = "refreshed"
+			}
 		case "stop":
 			response.Status = "stopping"
 			stop()
@@ -852,7 +1084,7 @@ func newFPolicyCreateCommand() *cobra.Command {
 				return err
 			}
 		}
-		endpoint, err := pathdiffEndpoint()
+		endpoints, err := pathdiffEndpoints()
 		if err != nil {
 			return err
 		}
@@ -886,7 +1118,10 @@ func newFPolicyCreateCommand() *cobra.Command {
 			pattern = arguments[0]
 		}
 		policies := parseFPolicyPolicies(string(policyOutput), string(engineOutput))
-		plans := fpolicyCreatePlans(parseONTAPInstances(string(svmOutput)), policies, parseONTAPInstances(string(sequenceOutput)), pattern, endpoint)
+		plans, err := fpolicyCreatePlans(parseONTAPInstances(string(svmOutput)), policies, parseONTAPInstances(string(sequenceOutput)), pattern, len(arguments) == 0, endpoints)
+		if err != nil {
+			return err
+		}
 		if len(plans) == 0 {
 			return errors.New("no unconfigured data SVMs matched")
 		}
@@ -903,7 +1138,91 @@ type fpolicyCreatePlan struct {
 	Sequence int
 }
 
-func fpolicyCreatePlans(svms []map[string]string, policies []fpolicyPolicy, sequences []map[string]string, pattern string, endpoint *net.TCPAddr) []fpolicyCreatePlan {
+type expectedFPolicySender struct {
+	Port     int
+	Sources  map[string]struct{}
+	Policies []fpolicyPolicy
+}
+
+func discoverFPolicySenders(endpoints []*net.TCPAddr) (map[int]*expectedFPolicySender, error) {
+	host := defaultCDOTCluster()
+	if host == "" {
+		return nil, errors.New("cDOT host is required to discover FPolicy senders")
+	}
+	keyFile, err := cdotKeyFile("")
+	if err != nil {
+		return nil, err
+	}
+	knownHostsFile, err := cdotKnownHostsFile()
+	if err != nil {
+		return nil, err
+	}
+	client, err := openCDOTClient(host, "pathdiff", keyFile, knownHostsFile, false)
+	if err != nil {
+		return nil, err
+	}
+	defer client.Close()
+	policyOutput, err := runSSHCommand(client, fpolicyPolicyShowCommand+" -instance", nil)
+	if err != nil {
+		return nil, fmt.Errorf("query cDOT FPolicy policies: %w", err)
+	}
+	engineOutput, err := runSSHCommand(client, "vserver fpolicy policy external-engine show -instance", nil)
+	if err != nil {
+		return nil, fmt.Errorf("query cDOT FPolicy external engines: %w", err)
+	}
+	lifOutput, err := runSSHCommand(client, "network interface show -instance", nil)
+	if err != nil {
+		return nil, fmt.Errorf("query cDOT LIFs: %w", err)
+	}
+	endpointIPs := make(map[string]struct{}, len(endpoints))
+	endpointPorts := make(map[int]struct{}, len(endpoints))
+	for _, endpoint := range endpoints {
+		endpointIPs[endpoint.IP.String()] = struct{}{}
+		endpointPorts[endpoint.Port] = struct{}{}
+	}
+	expected := make(map[int]*expectedFPolicySender)
+	for _, policy := range parseFPolicyPolicies(string(policyOutput), string(engineOutput)) {
+		port, err := strconv.Atoi(policy.Port)
+		if err != nil {
+			continue
+		}
+		if _, found := endpointPorts[port]; !found || !fpolicyTargetsMatch(policy.Targets, endpointIPs) {
+			continue
+		}
+		sender := expected[port]
+		if sender == nil {
+			sender = &expectedFPolicySender{Port: port, Sources: make(map[string]struct{})}
+			expected[port] = sender
+		}
+		sender.Policies = append(sender.Policies, policy)
+	}
+	for _, record := range parseONTAPInstances(string(lifOutput)) {
+		address := instanceField(record, "Network Address")
+		if ip := net.ParseIP(address); ip == nil || ip.To4() == nil {
+			continue
+		}
+		for _, sender := range expected {
+			for _, policy := range sender.Policies {
+				if policy.SVM == instanceField(record, "Vserver") {
+					sender.Sources[address] = struct{}{}
+					break
+				}
+			}
+		}
+	}
+	return expected, nil
+}
+
+func fpolicyTargetsMatch(targets string, expected map[string]struct{}) bool {
+	for _, target := range strings.Split(targets, ",") {
+		if _, found := expected[strings.TrimSpace(target)]; found {
+			return true
+		}
+	}
+	return false
+}
+
+func fpolicyCreatePlans(svms []map[string]string, policies []fpolicyPolicy, sequences []map[string]string, pattern string, nfsOnly bool, endpoints []*net.TCPAddr) ([]fpolicyCreatePlan, error) {
 	configured := make(map[string]bool)
 	policyCount := make(map[string]int)
 	for _, policy := range policies {
@@ -921,6 +1240,13 @@ func fpolicyCreatePlans(svms []map[string]string, policies []fpolicyPolicy, sequ
 		}
 	}
 	var plans []fpolicyCreatePlan
+	usedPorts := make(map[string]bool)
+	for _, policy := range policies {
+		if wildcardContains(policy.Name, "pathdiff*") || wildcardContains(policy.Engine, "pathdiff*") {
+			usedPorts[policy.Port] = true
+		}
+	}
+	endpointIndex := 0
 	for _, record := range svms {
 		svm := instanceField(record, "Vserver")
 		if svm == "" || configured[svm] || !wildcardContains(svm, pattern) {
@@ -929,6 +1255,17 @@ func fpolicyCreatePlans(svms []map[string]string, policies []fpolicyPolicy, sequ
 		if vserverType := strings.ToLower(firstInstanceField(record, "Vserver Type", "Type")); vserverType != "" && vserverType != "data" {
 			continue
 		}
+		if nfsOnly && !fpolicySVMHasNFS(record) {
+			continue
+		}
+		for endpointIndex < len(endpoints) && usedPorts[strconv.Itoa(endpoints[endpointIndex].Port)] {
+			endpointIndex++
+		}
+		if endpointIndex == len(endpoints) {
+			return nil, errors.New("not enough configured pathdiff listener ports for matching SVMs")
+		}
+		endpoint := endpoints[endpointIndex]
+		endpointIndex++
 		sequence := nextSequence[svm]
 		if sequence == 0 {
 			sequence = policyCount[svm] + 1
@@ -936,10 +1273,19 @@ func fpolicyCreatePlans(svms []map[string]string, policies []fpolicyPolicy, sequ
 		plans = append(plans, fpolicyCreatePlan{SVM: svm, TargetIP: endpoint.IP.String(), Port: strconv.Itoa(endpoint.Port), Sequence: sequence})
 	}
 	sort.Slice(plans, func(left, right int) bool { return plans[left].SVM < plans[right].SVM })
-	return plans
+	return plans, nil
 }
 
-func pathdiffEndpoint() (*net.TCPAddr, error) {
+func fpolicySVMHasNFS(svm map[string]string) bool {
+	for _, protocol := range strings.Split(strings.ToLower(instanceField(svm, "Allowed Protocols")), ",") {
+		if strings.TrimSpace(protocol) == "nfs" {
+			return true
+		}
+	}
+	return false
+}
+
+func pathdiffEndpoints() ([]*net.TCPAddr, error) {
 	listenAddr := defaultListen
 	if unitPath, err := systemdUserUnitPath(); err == nil {
 		if unit, err := os.ReadFile(unitPath); err == nil {
@@ -950,22 +1296,25 @@ func pathdiffEndpoint() (*net.TCPAddr, error) {
 			}
 		}
 	}
-	host, port, err := net.SplitHostPort(listenAddr)
+	endpoints, err := parseListenAddresses(listenAddr)
 	if err != nil {
 		return nil, fmt.Errorf("parse pathdiff listener %q: %w", listenAddr, err)
 	}
-	if host == "" || host == "0.0.0.0" || host == "::" {
-		for _, address := range localAddresses() {
-			if ip := net.ParseIP(address); ip != nil && ip.To4() != nil {
-				host = ip.String()
-				break
+	for _, endpoint := range endpoints {
+		host := endpoint.IP.String()
+		if endpoint.IP == nil || endpoint.IP.IsUnspecified() {
+			for _, address := range localAddresses() {
+				if ip := net.ParseIP(address); ip != nil && ip.To4() != nil {
+					endpoint.IP = ip
+					break
+				}
 			}
 		}
+		if ip := net.ParseIP(host); endpoint.IP == nil || ip == nil || endpoint.IP.To4() == nil {
+			return nil, fmt.Errorf("resolve pathdiff listener IPv4 address from %q", listenAddr)
+		}
 	}
-	if ip := net.ParseIP(host); ip == nil || ip.To4() == nil {
-		return nil, fmt.Errorf("resolve pathdiff listener IPv4 address from %q", listenAddr)
-	}
-	return net.ResolveTCPAddr("tcp4", net.JoinHostPort(host, port))
+	return endpoints, nil
 }
 
 func printFPolicyCreateCommands(writer io.Writer, plans []fpolicyCreatePlan) error {
@@ -1997,8 +2346,21 @@ func printMappings(writer io.Writer, nameColumn, idColumn string, mappings []sto
 
 func newServiceCommand() *cobra.Command {
 	service := &cobra.Command{Use: "service", Short: "Manage the pathdiff systemd service"}
-	service.AddCommand(newServiceStartCommand(), newServiceStatusCommand(), newServiceStopCommand(), newServiceMonitorCommand())
+	service.AddCommand(newServiceStartCommand(), newServiceStatusCommand(), newServiceRefreshCommand(), newServiceStopCommand(), newServiceMonitorCommand())
 	return service
+}
+
+func newServiceRefreshCommand() *cobra.Command {
+	var controlPath string
+	command := &cobra.Command{Use: "refresh", Short: "Refresh cDOT FPolicy senders and listeners", RunE: func(command *cobra.Command, _ []string) error {
+		response, err := callControl(controlPath, controlRequest{Command: "fpolicy-refresh"})
+		if err != nil {
+			return err
+		}
+		return printResponse(response)
+	}}
+	command.Flags().StringVar(&controlPath, "control", defaultControl, "Unix control socket")
+	return command
 }
 
 func newServiceStartCommand() *cobra.Command {
@@ -2075,6 +2437,19 @@ func ensureSystemdUnit(dbPath, listenAddr, controlPath, recordDir string, verbos
 		return "", false, err
 	}
 	if _, err := os.Stat(unitPath); err == nil {
+		if listenAddr == defaultListen {
+			unit, readErr := os.ReadFile(unitPath)
+			if readErr != nil {
+				return "", false, readErr
+			}
+			if strings.Contains(string(unit), "--listen "+shellQuote(":9911")) {
+				updated := strings.Replace(string(unit), "--listen "+shellQuote(":9911"), "--listen "+shellQuote(defaultListen), 1)
+				if err := os.WriteFile(unitPath, []byte(updated), 0o644); err != nil {
+					return "", false, err
+				}
+				return unitPath, true, nil
+			}
+		}
 		return unitPath, false, nil
 	} else if !errors.Is(err, os.ErrNotExist) {
 		return "", false, err
