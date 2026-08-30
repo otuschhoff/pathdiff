@@ -7,6 +7,7 @@ import (
 	"crypto/x509"
 	"encoding/json"
 	"encoding/pem"
+	"io"
 	"net"
 	"os"
 	"path/filepath"
@@ -22,11 +23,12 @@ import (
 
 func TestFPolicyListenerManagerPorts(t *testing.T) {
 	manager := &fpolicyListenerManager{listeners: map[int]*managedFPolicyListener{
-		9912: {sources: map[string]struct{}{"192.0.2.11": {}, "192.0.2.10": {}}},
-		9911: {sources: map[string]struct{}{"192.0.2.12": {}}},
+		9912: {svms: []string{"svm-two"}, sources: map[string]struct{}{"192.0.2.11": {}, "192.0.2.10": {}}},
+		9911: {svms: []string{"svm-one"}, sources: map[string]struct{}{"192.0.2.12": {}}},
 	}}
+	manager.snapshotPortsLocked()
 	ports := manager.Ports()
-	if len(ports) != 2 || ports[0].Port != 9911 || ports[1].Port != 9912 || strings.Join(ports[1].Sources, ",") != "192.0.2.10,192.0.2.11" {
+	if len(ports) != 2 || ports[0].Port != 9911 || ports[1].Port != 9912 || strings.Join(ports[1].SVMs, ",") != "svm-two" || strings.Join(ports[1].Sources, ",") != "192.0.2.10,192.0.2.11" {
 		t.Fatalf("ports = %#v", ports)
 	}
 }
@@ -337,6 +339,23 @@ func TestEngineSnapshotAndFormatting(t *testing.T) {
 	}
 	if got := output.String(); !strings.Contains(got, "SVM") || !strings.Contains(got, "TOTAL EVENTS") || strings.Index(got, "SVM") > strings.Index(got, "NODE") || !strings.Contains(got, "43.1k") || !strings.Contains(got, "connected") || strings.Contains(got, "192.0.2.10") || !strings.Contains(got, "ncl1-1-ps-07") {
 		t.Fatalf("unexpected engine table: %s", got)
+	}
+}
+
+func TestEngineAndFPolicyTablesSortBySVM(t *testing.T) {
+	engines := []engineInfo{{SVMName: "zeta", LIFIPv4: "192.0.2.2"}, {SVMName: "Alpha", LIFIPv4: "192.0.2.1"}}
+	if err := printEngines(io.Discard, engines); err != nil {
+		t.Fatal(err)
+	}
+	if engines[0].SVMName != "Alpha" {
+		t.Fatalf("engines were not sorted by SVM: %#v", engines)
+	}
+	policies := []fpolicyPolicy{{SVM: "zeta", Name: "one"}, {SVM: "Alpha", Name: "two"}}
+	if err := printFPolicyPolicies(io.Discard, policies); err != nil {
+		t.Fatal(err)
+	}
+	if policies[0].SVM != "Alpha" {
+		t.Fatalf("policies were not sorted by SVM: %#v", policies)
 	}
 }
 

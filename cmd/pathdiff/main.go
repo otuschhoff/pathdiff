@@ -75,6 +75,7 @@ type controlResponse struct {
 
 type listenerPort struct {
 	Port    int      `json:"port"`
+	SVMs    []string `json:"svms"`
 	Sources []string `json:"sources"`
 }
 
@@ -162,13 +163,15 @@ func runDaemon(dbPath, listenAddr, controlPath, recordDir string, verbose bool) 
 	activeConnections := newConnectionRegistry()
 	trackers := newSenderTracker(verbose)
 	listenerManager := newFPolicyListenerManager(context, listenerEndpoints, receiverEndpoints, db, recordDir, trackers, activeConnections, &connections)
-	if err := listenerManager.Refresh(); err != nil {
-		return fmt.Errorf("discover FPolicy senders: %w", err)
-	}
 	defer listenerManager.Close()
 	go trackers.reportEvery(context, 10*time.Second)
-	go listenerManager.RefreshEvery(context, time.Minute)
 	go acceptControls(context, controlListener, db, cancel, trackers, activeConnections, &connections, listenerManager.Refresh, listenerManager.Ports)
+	go func() {
+		if err := listenerManager.Refresh(); err != nil {
+			fmt.Fprintln(os.Stderr, "discover FPolicy senders:", err)
+		}
+	}()
+	go listenerManager.RefreshEvery(context, time.Minute)
 	<-context.Done()
 	listenerManager.Close()
 	_ = controlListener.Close()
@@ -203,6 +206,7 @@ func closeListeners(listeners []net.Listener) {
 type managedFPolicyListener struct {
 	listener net.Listener
 	sources  map[string]struct{}
+	svms     []string
 }
 
 type fpolicyListenerManager struct {
@@ -218,6 +222,7 @@ type fpolicyListenerManager struct {
 	waitGroup         *sync.WaitGroup
 	listeners         map[int]*managedFPolicyListener
 	enabledPolicies   map[string]struct{}
+	portSnapshot      atomic.Value
 }
 
 func newFPolicyListenerManager(context context.Context, listenEndpoints, receiverEndpoints []*net.TCPAddr, db *store.DB, recordDir string, trackers *senderTracker, connections *connectionRegistry, waitGroup *sync.WaitGroup) *fpolicyListenerManager {
@@ -225,7 +230,9 @@ func newFPolicyListenerManager(context context.Context, listenEndpoints, receive
 	for _, endpoint := range listenEndpoints {
 		endpoints[endpoint.Port] = endpoint
 	}
-	return &fpolicyListenerManager{context: context, listenEndpoints: endpoints, receiverEndpoints: receiverEndpoints, db: db, recordDir: recordDir, trackers: trackers, connections: connections, waitGroup: waitGroup, listeners: make(map[int]*managedFPolicyListener), enabledPolicies: make(map[string]struct{})}
+	manager := &fpolicyListenerManager{context: context, listenEndpoints: endpoints, receiverEndpoints: receiverEndpoints, db: db, recordDir: recordDir, trackers: trackers, connections: connections, waitGroup: waitGroup, listeners: make(map[int]*managedFPolicyListener), enabledPolicies: make(map[string]struct{})}
+	manager.portSnapshot.Store([]listenerPort{})
+	return manager
 }
 
 func (m *fpolicyListenerManager) Refresh() error {
@@ -243,7 +250,8 @@ func (m *fpolicyListenerManager) Refresh() error {
 		}
 	}
 	for port, sender := range expected {
-		if m.listeners[port] != nil {
+		if managed := m.listeners[port]; managed != nil {
+			managed.svms = fpolicySenderSVMs(sender)
 			continue
 		}
 		endpoint := m.listenEndpoints[port]
@@ -256,9 +264,10 @@ func (m *fpolicyListenerManager) Refresh() error {
 			continue
 		}
 		sources := copySources(sender.Sources)
-		m.listeners[port] = &managedFPolicyListener{listener: listener, sources: sources}
+		m.listeners[port] = &managedFPolicyListener{listener: listener, sources: sources, svms: fpolicySenderSVMs(sender)}
 		go acceptEvents(m.context, listener, sources, m.db, m.recordDir, m.trackers, m.connections, m.waitGroup)
 	}
+	m.snapshotPortsLocked()
 	m.mu.Unlock()
 	for _, sender := range expected {
 		for _, policy := range sender.Policies {
@@ -303,11 +312,19 @@ func (m *fpolicyListenerManager) Close() {
 		_ = listener.listener.Close()
 		delete(m.listeners, port)
 	}
+	m.snapshotPortsLocked()
 }
 
 func (m *fpolicyListenerManager) Ports() []listenerPort {
+	if snapshot := m.portSnapshot.Load(); snapshot != nil {
+		return append([]listenerPort(nil), snapshot.([]listenerPort)...)
+	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	return m.snapshotPortsLocked()
+}
+
+func (m *fpolicyListenerManager) snapshotPortsLocked() []listenerPort {
 	ports := make([]listenerPort, 0, len(m.listeners))
 	for port, listener := range m.listeners {
 		sources := make([]string, 0, len(listener.sources))
@@ -315,10 +332,26 @@ func (m *fpolicyListenerManager) Ports() []listenerPort {
 			sources = append(sources, source)
 		}
 		sort.Strings(sources)
-		ports = append(ports, listenerPort{Port: port, Sources: sources})
+		ports = append(ports, listenerPort{Port: port, SVMs: append([]string(nil), listener.svms...), Sources: sources})
 	}
 	sort.Slice(ports, func(left, right int) bool { return ports[left].Port < ports[right].Port })
+	m.portSnapshot.Store(ports)
 	return ports
+}
+
+func fpolicySenderSVMs(sender *expectedFPolicySender) []string {
+	seen := make(map[string]struct{})
+	for _, policy := range sender.Policies {
+		if policy.SVM != "" {
+			seen[policy.SVM] = struct{}{}
+		}
+	}
+	svms := make([]string, 0, len(seen))
+	for svm := range seen {
+		svms = append(svms, svm)
+	}
+	sort.Slice(svms, func(left, right int) bool { return strings.ToLower(svms[left]) < strings.ToLower(svms[right]) })
+	return svms
 }
 
 func sameSources(left, right map[string]struct{}) bool {
@@ -1818,6 +1851,13 @@ func wildcardContains(value, pattern string) bool {
 }
 
 func printFPolicyPolicies(writer io.Writer, policies []fpolicyPolicy) error {
+	sort.Slice(policies, func(left, right int) bool {
+		leftSVM, rightSVM := strings.ToLower(policies[left].SVM), strings.ToLower(policies[right].SVM)
+		if leftSVM == rightSVM {
+			return strings.ToLower(policies[left].Name) < strings.ToLower(policies[right].Name)
+		}
+		return leftSVM < rightSVM
+	})
 	tableWriter := newTableWriter(writer)
 	tableWriter.AppendHeader(table.Row{"SVM", "Engine", "State", "Targets", "Port", "SSL", "Type", "Format", "Policy Class", "Event Class"})
 	for _, policy := range policies {
@@ -2255,7 +2295,13 @@ func generateCDOTKey(keyFile string) error {
 }
 
 func printEngines(writer io.Writer, engines []engineInfo) error {
-	sort.Slice(engines, func(left, right int) bool { return engines[left].LIFIPv4 < engines[right].LIFIPv4 })
+	sort.Slice(engines, func(left, right int) bool {
+		leftSVM, rightSVM := strings.ToLower(engineSVM(engines[left])), strings.ToLower(engineSVM(engines[right]))
+		if leftSVM == rightSVM {
+			return engines[left].LIFIPv4 < engines[right].LIFIPv4
+		}
+		return leftSVM < rightSVM
+	})
 	maxRate := 0.0
 	for _, engine := range engines {
 		if engine.AverageRate > maxRate {
@@ -2272,17 +2318,21 @@ func printEngines(writer io.Writer, engines []engineInfo) error {
 	tableWriter.AppendHeader(table.Row{"SVM", "Node", "LIF", "Port", "State", "Last Seen", "Since", "Avg Event/s", "Graph", "Total Events"})
 	for _, engine := range engines {
 		engine.LIFHostname = shortHostname(resolveHostname(engine.LIFIPv4))
-		node, svm := engine.NodeName, engine.SVMName
+		node, svm := engine.NodeName, engineSVM(engine)
 		if node == "" {
 			node = engine.NodeID
-		}
-		if svm == "" {
-			svm = engine.SVMID
 		}
 		tableWriter.AppendRow(table.Row{svm, node, engine.LIFHostname, engine.LocalPort, formatFPolicyState(engine.FPolicy), formatLastSeen(engine.LastSeen), engine.Since.UTC().Format(time.RFC3339), fmt.Sprintf("%.2f", engine.AverageRate), formatMetricGraphCell(engine.AverageRate, maxRate, 6), formatEventCount(engine.TotalEvents)})
 	}
 	tableWriter.Render()
 	return nil
+}
+
+func engineSVM(engine engineInfo) string {
+	if engine.SVMName != "" {
+		return engine.SVMName
+	}
+	return engine.SVMID
 }
 
 func formatMetricGraphCell(value, maxValue float64, width int) string {
@@ -2756,9 +2806,9 @@ func newServiceListPortsCommand() *cobra.Command {
 			return err
 		}
 		tableWriter := newTableWriter(command.OutOrStdout())
-		tableWriter.AppendHeader(table.Row{"Port", "Allowed LIF IPv4s"})
+		tableWriter.AppendHeader(table.Row{"Port", "SVM", "Allowed LIF IPv4s"})
 		for _, port := range response.ListenerPorts {
-			tableWriter.AppendRow(table.Row{port.Port, strings.Join(port.Sources, ", ")})
+			tableWriter.AppendRow(table.Row{port.Port, strings.Join(port.SVMs, ", "), strings.Join(port.Sources, ", ")})
 		}
 		tableWriter.Render()
 		return nil
