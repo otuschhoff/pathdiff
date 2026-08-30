@@ -137,12 +137,16 @@ func newDaemonCommand() *cobra.Command {
 	return daemon
 }
 
-func runDaemon(dbPath, listenAddr, controlPath, recordDir string, verbose bool) error {
+func runDaemon(dbPath, listenAddr, controlPath, recordDir string, verbose bool) (returnErr error) {
 	db, err := store.Open(dbPath)
 	if err != nil {
 		return fmt.Errorf("open database: %w", err)
 	}
-	defer db.Close()
+	defer func() {
+		if err := db.Close(); err != nil {
+			returnErr = errors.Join(returnErr, fmt.Errorf("close database: %w", err))
+		}
+	}()
 
 	listenerEndpoints, err := parseListenAddresses(listenAddr)
 	if err != nil {
@@ -164,8 +168,12 @@ func runDaemon(dbPath, listenAddr, controlPath, recordDir string, verbose bool) 
 		return fmt.Errorf("listen for control requests: %w", err)
 	}
 	defer func() {
-		_ = controlListener.Close()
-		_ = os.Remove(controlPath)
+		if err := controlListener.Close(); err != nil && !errors.Is(err, net.ErrClosed) {
+			returnErr = errors.Join(returnErr, fmt.Errorf("close control listener: %w", err))
+		}
+		if err := os.Remove(controlPath); err != nil && !errors.Is(err, os.ErrNotExist) {
+			returnErr = errors.Join(returnErr, fmt.Errorf("remove control socket: %w", err))
+		}
 	}()
 
 	fmt.Printf("pathdiff daemon: events=%s control=%s db=%s\n", listenAddr, controlPath, dbPath)
@@ -514,15 +522,21 @@ func resolveListenerEndpoints(listeners []*net.TCPAddr) ([]*net.TCPAddr, error) 
 
 func acceptEvents(context context.Context, listener net.Listener, allowedSources map[string]struct{}, db *store.DB, recordDir string, trackers *senderTracker, activeConnections *connectionRegistry, accepts, connections *sync.WaitGroup) {
 	defer accepts.Done()
+	var retryDelay time.Duration
 	for {
 		connection, err := listener.Accept()
 		if err != nil {
 			if context.Err() != nil || errors.Is(err, net.ErrClosed) {
 				return
 			}
-			fmt.Fprintln(os.Stderr, "accept event connection:", err)
+			retryDelay = nextAcceptRetryDelay(retryDelay)
+			fmt.Fprintf(os.Stderr, "accept event connection: %v; retrying in %s\n", err, retryDelay)
+			if !waitForRetry(context, retryDelay) {
+				return
+			}
 			continue
 		}
+		retryDelay = 0
 		if _, allowed := allowedSources[senderName(connection.RemoteAddr())]; !allowed {
 			fmt.Fprintf(os.Stderr, "reject unexpected FPolicy sender %s on %s\n", connection.RemoteAddr(), connection.LocalAddr())
 			_ = connection.Close()
@@ -546,9 +560,31 @@ func acceptEvents(context context.Context, listener net.Listener, allowedSources
 					return
 				}
 			}
-			defer activeConnection.Close()
+			defer func() {
+				if err := activeConnection.Close(); err != nil && !errors.Is(err, net.ErrClosed) {
+					fmt.Fprintf(os.Stderr, "close event connection from %s: %v\n", sender, err)
+				}
+			}()
 			readEvents(activeConnection, db, trackers, sender)
 		}()
+	}
+}
+
+func nextAcceptRetryDelay(current time.Duration) time.Duration {
+	if current == 0 {
+		return 100 * time.Millisecond
+	}
+	return min(current*2, 5*time.Second)
+}
+
+func waitForRetry(context context.Context, delay time.Duration) bool {
+	timer := time.NewTimer(delay)
+	defer timer.Stop()
+	select {
+	case <-context.Done():
+		return false
+	case <-timer.C:
+		return true
 	}
 }
 
@@ -783,17 +819,20 @@ type trafficRecorder struct {
 
 func newTrafficRecorder(connection net.Conn, directory string) (*trafficRecorder, error) {
 	if err := os.MkdirAll(directory, 0o700); err != nil {
-		return nil, err
+		return nil, fmt.Errorf("create traffic capture directory: %w", err)
 	}
 	prefix := fmt.Sprintf("%s-%06d", time.Now().UTC().Format("20060102T150405.000000000Z"), captureSequence.Add(1))
 	in, err := os.Create(filepath.Join(directory, prefix+".in"))
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("create inbound traffic capture: %w", err)
 	}
 	out, err := os.Create(filepath.Join(directory, prefix+".out"))
 	if err != nil {
-		_ = in.Close()
-		return nil, err
+		createErr := fmt.Errorf("create outbound traffic capture: %w", err)
+		if closeErr := in.Close(); closeErr != nil {
+			return nil, errors.Join(createErr, fmt.Errorf("close inbound traffic capture after setup failure: %w", closeErr))
+		}
+		return nil, createErr
 	}
 	return &trafficRecorder{Conn: connection, in: in, out: out}, nil
 }
@@ -801,7 +840,9 @@ func newTrafficRecorder(connection net.Conn, directory string) (*trafficRecorder
 func (r *trafficRecorder) Read(payload []byte) (int, error) {
 	count, err := r.Conn.Read(payload)
 	if count > 0 {
-		_, _ = r.in.Write(payload[:count])
+		if _, captureErr := r.in.Write(payload[:count]); captureErr != nil {
+			return count, errors.Join(err, fmt.Errorf("record inbound traffic: %w", captureErr))
+		}
 	}
 	return count, err
 }
@@ -809,15 +850,25 @@ func (r *trafficRecorder) Read(payload []byte) (int, error) {
 func (r *trafficRecorder) Write(payload []byte) (int, error) {
 	count, err := r.Conn.Write(payload)
 	if count > 0 {
-		_, _ = r.out.Write(payload[:count])
+		if _, captureErr := r.out.Write(payload[:count]); captureErr != nil {
+			return count, errors.Join(err, fmt.Errorf("record outbound traffic: %w", captureErr))
+		}
 	}
 	return count, err
 }
 
 func (r *trafficRecorder) Close() error {
-	_ = r.in.Close()
-	_ = r.out.Close()
-	return r.Conn.Close()
+	var closeErrors []error
+	if err := r.in.Close(); err != nil {
+		closeErrors = append(closeErrors, fmt.Errorf("close inbound traffic capture: %w", err))
+	}
+	if err := r.out.Close(); err != nil {
+		closeErrors = append(closeErrors, fmt.Errorf("close outbound traffic capture: %w", err))
+	}
+	if err := r.Conn.Close(); err != nil && !errors.Is(err, net.ErrClosed) {
+		closeErrors = append(closeErrors, fmt.Errorf("close recorded connection: %w", err))
+	}
+	return errors.Join(closeErrors...)
 }
 
 func readEvents(connection net.Conn, db *store.DB, trackers *senderTracker, sender string) {
@@ -973,27 +1024,35 @@ func annotateSenderEvent(event *store.Event, trackers *senderTracker, sender str
 
 func acceptControls(context context.Context, listener net.Listener, db *store.DB, stop context.CancelFunc, trackers *senderTracker, activeConnections *connectionRegistry, accepts, connections *sync.WaitGroup, refresh func() error, ports func() []listenerPort) {
 	defer accepts.Done()
+	var retryDelay time.Duration
 	for {
 		connection, err := listener.Accept()
 		if err != nil {
-			if context.Err() != nil {
+			if context.Err() != nil || errors.Is(err, net.ErrClosed) {
 				return
 			}
-			fmt.Fprintln(os.Stderr, "accept control connection:", err)
+			retryDelay = nextAcceptRetryDelay(retryDelay)
+			fmt.Fprintf(os.Stderr, "accept control connection: %v; retrying in %s\n", err, retryDelay)
+			if !waitForRetry(context, retryDelay) {
+				return
+			}
 			continue
 		}
+		retryDelay = 0
 		connections.Add(1)
 		go func() {
 			defer connections.Done()
 			activeConnections.Add(connection)
 			defer activeConnections.Remove(connection)
 			defer connection.Close()
-			handleControl(connection, db, stop, trackers, refresh, ports)
+			if err := handleControl(connection, db, stop, trackers, refresh, ports); err != nil {
+				fmt.Fprintf(os.Stderr, "handle control request from %s: %v\n", connection.RemoteAddr(), err)
+			}
 		}()
 	}
 }
 
-func handleControl(connection net.Conn, db *store.DB, stop context.CancelFunc, trackers *senderTracker, refresh func() error, ports func() []listenerPort) {
+func handleControl(connection net.Conn, db *store.DB, stop context.CancelFunc, trackers *senderTracker, refresh func() error, ports func() []listenerPort) error {
 	var request controlRequest
 	response := controlResponse{}
 	if err := json.NewDecoder(io.LimitReader(connection, 1024*1024)).Decode(&request); err != nil {
@@ -1076,7 +1135,10 @@ func handleControl(connection net.Conn, db *store.DB, stop context.CancelFunc, t
 			response.Error = err.Error()
 		}
 	}
-	_ = json.NewEncoder(connection).Encode(response)
+	if err := json.NewEncoder(connection).Encode(response); err != nil {
+		return fmt.Errorf("encode control response for %q: %w", request.Command, err)
+	}
+	return nil
 }
 
 func newDBCommand() *cobra.Command {
@@ -1598,15 +1660,19 @@ func pathdiffEndpoints() ([]*net.TCPAddr, error) {
 }
 
 func printFPolicyCreateCommands(writer io.Writer, plans []fpolicyCreatePlan) error {
+	var output strings.Builder
 	for index, plan := range plans {
 		if index > 0 {
-			_, _ = fmt.Fprintln(writer)
+			output.WriteByte('\n')
 		}
-		_, _ = fmt.Fprintf(writer, "vserver fpolicy policy external-engine create -vserver %s -engine-name pathdiff -primary-servers %s -port %s -ssl-option no-auth -extern-engine-type asynchronous -extern-engine-format xml\n", plan.SVM, plan.TargetIP, plan.Port)
-		_, _ = fmt.Fprintf(writer, "vserver fpolicy policy event create -vserver %s -event-name pathdiff_events -protocol nfsv3 -file-operations create,delete,write,rename,setattr -filters first-write,setattr-with-modify-time-change\n", plan.SVM)
-		_, _ = fmt.Fprintf(writer, "vserver fpolicy policy create -vserver %s -policy-name pathdiff_policy -events pathdiff_events -engine pathdiff -is-mandatory false\n", plan.SVM)
-		_, _ = fmt.Fprintf(writer, "vserver fpolicy policy scope create -vserver %s -policy-name pathdiff_policy -volumes-to-include *\n", plan.SVM)
-		_, _ = fmt.Fprintf(writer, "vserver fpolicy enable -vserver %s -policy-name pathdiff_policy -sequence-number %d\n", plan.SVM, plan.Sequence)
+		fmt.Fprintf(&output, "vserver fpolicy policy external-engine create -vserver %s -engine-name pathdiff -primary-servers %s -port %s -ssl-option no-auth -extern-engine-type asynchronous -extern-engine-format xml\n", plan.SVM, plan.TargetIP, plan.Port)
+		fmt.Fprintf(&output, "vserver fpolicy policy event create -vserver %s -event-name pathdiff_events -protocol nfsv3 -file-operations create,delete,write,rename,setattr -filters first-write,setattr-with-modify-time-change\n", plan.SVM)
+		fmt.Fprintf(&output, "vserver fpolicy policy create -vserver %s -policy-name pathdiff_policy -events pathdiff_events -engine pathdiff -is-mandatory false\n", plan.SVM)
+		fmt.Fprintf(&output, "vserver fpolicy policy scope create -vserver %s -policy-name pathdiff_policy -volumes-to-include *\n", plan.SVM)
+		fmt.Fprintf(&output, "vserver fpolicy enable -vserver %s -policy-name pathdiff_policy -sequence-number %d\n", plan.SVM, plan.Sequence)
+	}
+	if _, err := io.WriteString(writer, output.String()); err != nil {
+		return fmt.Errorf("write FPolicy create commands: %w", err)
 	}
 	return nil
 }
@@ -2462,7 +2528,7 @@ func defaultCDOTCluster() string {
 	return config.Cluster
 }
 
-func setCDOTCluster(cluster string) error {
+func setCDOTCluster(cluster string) (returnErr error) {
 	if cluster == "" {
 		return errors.New("cluster FQDN is required")
 	}
@@ -2482,14 +2548,16 @@ func setCDOTCluster(cluster string) error {
 		return err
 	}
 	temporaryPath := temporary.Name()
-	defer os.Remove(temporaryPath)
+	defer func() {
+		if err := os.Remove(temporaryPath); err != nil && !errors.Is(err, os.ErrNotExist) {
+			returnErr = errors.Join(returnErr, fmt.Errorf("remove temporary cDOT config: %w", err))
+		}
+	}()
 	if err := temporary.Chmod(0o600); err != nil {
-		_ = temporary.Close()
-		return err
+		return errors.Join(err, closeWithContext(temporary, "temporary cDOT config"))
 	}
 	if _, err := temporary.Write(append(data, '\n')); err != nil {
-		_ = temporary.Close()
-		return err
+		return errors.Join(err, closeWithContext(temporary, "temporary cDOT config"))
 	}
 	if err := temporary.Close(); err != nil {
 		return err
@@ -2615,36 +2683,43 @@ func generateCDOTKey(keyFile string) error {
 		return fmt.Errorf("create cDOT SSH private key: %w", err)
 	}
 	if err := pem.Encode(privateFile, &pem.Block{Type: "PRIVATE KEY", Bytes: privateDER}); err != nil {
-		_ = privateFile.Close()
-		_ = os.Remove(keyFile)
-		return fmt.Errorf("write cDOT SSH private key: %w", err)
+		return errors.Join(fmt.Errorf("write cDOT SSH private key: %w", err), closeWithContext(privateFile, "cDOT SSH private key"), removeWithContext(keyFile))
 	}
 	if err := privateFile.Close(); err != nil {
-		_ = os.Remove(keyFile)
-		return fmt.Errorf("close cDOT SSH private key: %w", err)
+		return errors.Join(fmt.Errorf("close cDOT SSH private key: %w", err), removeWithContext(keyFile))
 	}
 	sshPublicKey, err := ssh.NewPublicKey(publicKey)
 	if err != nil {
-		_ = os.Remove(keyFile)
-		return fmt.Errorf("encode cDOT SSH public key: %w", err)
+		return errors.Join(fmt.Errorf("encode cDOT SSH public key: %w", err), removeWithContext(keyFile))
 	}
 	publicFile, err := os.OpenFile(keyFile+".pub", os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o644)
 	if err != nil {
-		_ = os.Remove(keyFile)
-		return fmt.Errorf("create cDOT SSH public key: %w", err)
+		return errors.Join(fmt.Errorf("create cDOT SSH public key: %w", err), removeWithContext(keyFile))
 	}
 	if _, err := publicFile.Write(ssh.MarshalAuthorizedKey(sshPublicKey)); err != nil {
-		_ = publicFile.Close()
-		_ = os.Remove(keyFile + ".pub")
-		_ = os.Remove(keyFile)
-		return fmt.Errorf("write cDOT SSH public key: %w", err)
+		return errors.Join(fmt.Errorf("write cDOT SSH public key: %w", err), closeWithContext(publicFile, "cDOT SSH public key"), removeWithContext(keyFile+".pub", keyFile))
 	}
 	if err := publicFile.Close(); err != nil {
-		_ = os.Remove(keyFile + ".pub")
-		_ = os.Remove(keyFile)
-		return fmt.Errorf("close cDOT SSH public key: %w", err)
+		return errors.Join(fmt.Errorf("close cDOT SSH public key: %w", err), removeWithContext(keyFile+".pub", keyFile))
 	}
 	return nil
+}
+
+func closeWithContext(closer io.Closer, name string) error {
+	if err := closer.Close(); err != nil {
+		return fmt.Errorf("close %s: %w", name, err)
+	}
+	return nil
+}
+
+func removeWithContext(paths ...string) error {
+	var removeErrors []error
+	for _, path := range paths {
+		if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
+			removeErrors = append(removeErrors, fmt.Errorf("remove %s: %w", path, err))
+		}
+	}
+	return errors.Join(removeErrors...)
 }
 
 func printEngines(writer io.Writer, engines []engineInfo) error {
@@ -3964,14 +4039,14 @@ func callControl(controlPath string, request controlRequest) (controlResponse, e
 	}
 	defer connection.Close()
 	if err := json.NewEncoder(connection).Encode(request); err != nil {
-		return controlResponse{}, err
+		return controlResponse{}, fmt.Errorf("send daemon command %q: %w", request.Command, err)
 	}
 	var response controlResponse
 	if err := json.NewDecoder(connection).Decode(&response); err != nil {
-		return controlResponse{}, err
+		return controlResponse{}, fmt.Errorf("read daemon command %q response: %w", request.Command, err)
 	}
 	if response.Error != "" {
-		return controlResponse{}, errors.New(response.Error)
+		return controlResponse{}, fmt.Errorf("daemon command %q: %s", request.Command, response.Error)
 	}
 	return response, nil
 }
