@@ -45,7 +45,13 @@ const (
 	fpolicyEngineShowCommand = "vserver fpolicy policy external-engine show -fields primary-servers,secondary-servers,port,ssl-option"
 )
 
-var captureSequence atomic.Uint64
+var (
+	captureSequence    atomic.Uint64
+	listenRangePattern = regexp.MustCompile(`^(.*:)([0-9]+)-([0-9]+)$`)
+	unitListenPattern  = regexp.MustCompile(`--listen\s+("[^"]*"|\S+)`)
+	pingPacketsPattern = regexp.MustCompile(`(?i)(\d+)\s+packets?\s+(?:(?:are|were)\s+)?received`)
+	ansiEscapePattern  = regexp.MustCompile(`\x1b\[[0-?]*[ -/]*[@-~]`)
+)
 
 type controlRequest struct {
 	Command    string    `json:"command"`
@@ -159,13 +165,14 @@ func runDaemon(dbPath, listenAddr, controlPath, recordDir string, verbose bool) 
 	context, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer cancel()
 
-	var connections sync.WaitGroup
+	var accepts, connections sync.WaitGroup
 	activeConnections := newConnectionRegistry()
 	trackers := newSenderTracker(verbose)
-	listenerManager := newFPolicyListenerManager(context, listenerEndpoints, receiverEndpoints, db, recordDir, trackers, activeConnections, &connections)
+	listenerManager := newFPolicyListenerManager(context, listenerEndpoints, receiverEndpoints, db, recordDir, trackers, activeConnections, &accepts, &connections)
 	defer listenerManager.Close()
 	go trackers.reportEvery(context, 10*time.Second)
-	go acceptControls(context, controlListener, db, cancel, trackers, activeConnections, &connections, listenerManager.Refresh, listenerManager.Ports)
+	accepts.Add(1)
+	go acceptControls(context, controlListener, db, cancel, trackers, activeConnections, &accepts, &connections, listenerManager.Refresh, listenerManager.Ports)
 	go func() {
 		if err := listenerManager.Refresh(); err != nil {
 			fmt.Fprintln(os.Stderr, "discover FPolicy senders:", err)
@@ -175,6 +182,7 @@ func runDaemon(dbPath, listenAddr, controlPath, recordDir string, verbose bool) 
 	<-context.Done()
 	listenerManager.Close()
 	_ = controlListener.Close()
+	accepts.Wait()
 	activeConnections.CloseAll()
 	connections.Wait()
 	return nil
@@ -219,18 +227,19 @@ type fpolicyListenerManager struct {
 	recordDir         string
 	trackers          *senderTracker
 	connections       *connectionRegistry
+	acceptGroup       *sync.WaitGroup
 	waitGroup         *sync.WaitGroup
 	listeners         map[int]*managedFPolicyListener
 	enabledPolicies   map[string]struct{}
 	portSnapshot      atomic.Value
 }
 
-func newFPolicyListenerManager(context context.Context, listenEndpoints, receiverEndpoints []*net.TCPAddr, db *store.DB, recordDir string, trackers *senderTracker, connections *connectionRegistry, waitGroup *sync.WaitGroup) *fpolicyListenerManager {
+func newFPolicyListenerManager(context context.Context, listenEndpoints, receiverEndpoints []*net.TCPAddr, db *store.DB, recordDir string, trackers *senderTracker, connections *connectionRegistry, acceptGroup, waitGroup *sync.WaitGroup) *fpolicyListenerManager {
 	endpoints := make(map[int]*net.TCPAddr, len(listenEndpoints))
 	for _, endpoint := range listenEndpoints {
 		endpoints[endpoint.Port] = endpoint
 	}
-	manager := &fpolicyListenerManager{context: context, listenEndpoints: endpoints, receiverEndpoints: receiverEndpoints, db: db, recordDir: recordDir, trackers: trackers, connections: connections, waitGroup: waitGroup, listeners: make(map[int]*managedFPolicyListener), enabledPolicies: make(map[string]struct{})}
+	manager := &fpolicyListenerManager{context: context, listenEndpoints: endpoints, receiverEndpoints: receiverEndpoints, db: db, recordDir: recordDir, trackers: trackers, connections: connections, acceptGroup: acceptGroup, waitGroup: waitGroup, listeners: make(map[int]*managedFPolicyListener), enabledPolicies: make(map[string]struct{})}
 	manager.portSnapshot.Store([]listenerPort{})
 	return manager
 }
@@ -238,11 +247,28 @@ func newFPolicyListenerManager(context context.Context, listenEndpoints, receive
 func (m *fpolicyListenerManager) Refresh() error {
 	m.refreshMu.Lock()
 	defer m.refreshMu.Unlock()
-	expected, err := discoverFPolicySenders(m.receiverEndpoints)
+	if err := m.context.Err(); err != nil {
+		return err
+	}
+	expected, err := discoverFPolicySenders(m.context, m.receiverEndpoints)
 	if err != nil {
 		return err
 	}
+	if err := m.context.Err(); err != nil {
+		return err
+	}
+	expectedPolicies := make(map[string]struct{})
+	for _, sender := range expected {
+		for _, policy := range sender.Policies {
+			expectedPolicies[policy.SVM+"\x00"+policy.Name] = struct{}{}
+		}
+	}
 	m.mu.Lock()
+	for key := range m.enabledPolicies {
+		if _, expected := expectedPolicies[key]; !expected {
+			delete(m.enabledPolicies, key)
+		}
+	}
 	for port, managed := range m.listeners {
 		if sender := expected[port]; sender == nil || !sameSources(managed.sources, sender.Sources) {
 			_ = managed.listener.Close()
@@ -265,7 +291,8 @@ func (m *fpolicyListenerManager) Refresh() error {
 		}
 		sources := copySources(sender.Sources)
 		m.listeners[port] = &managedFPolicyListener{listener: listener, sources: sources, svms: fpolicySenderSVMs(sender)}
-		go acceptEvents(m.context, listener, sources, m.db, m.recordDir, m.trackers, m.connections, m.waitGroup)
+		m.acceptGroup.Add(1)
+		go acceptEvents(m.context, listener, sources, m.db, m.recordDir, m.trackers, m.connections, m.acceptGroup, m.waitGroup)
 	}
 	m.snapshotPortsLocked()
 	m.mu.Unlock()
@@ -313,6 +340,8 @@ func (m *fpolicyListenerManager) RefreshEvery(context context.Context, interval 
 }
 
 func (m *fpolicyListenerManager) Close() {
+	m.refreshMu.Lock()
+	defer m.refreshMu.Unlock()
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	for port, listener := range m.listeners {
@@ -403,7 +432,7 @@ func parseListenAddresses(specification string) ([]*net.TCPAddr, error) {
 	var addresses []*net.TCPAddr
 	for _, entry := range strings.Split(specification, ",") {
 		entry = strings.TrimSpace(entry)
-		match := regexp.MustCompile(`^(.*:)([0-9]+)-([0-9]+)$`).FindStringSubmatch(entry)
+		match := listenRangePattern.FindStringSubmatch(entry)
 		if len(match) == 0 {
 			address, err := net.ResolveTCPAddr("tcp", entry)
 			if err != nil {
@@ -451,11 +480,12 @@ func resolveListenerEndpoints(listeners []*net.TCPAddr) ([]*net.TCPAddr, error) 
 	return endpoints, nil
 }
 
-func acceptEvents(context context.Context, listener net.Listener, allowedSources map[string]struct{}, db *store.DB, recordDir string, trackers *senderTracker, activeConnections *connectionRegistry, connections *sync.WaitGroup) {
+func acceptEvents(context context.Context, listener net.Listener, allowedSources map[string]struct{}, db *store.DB, recordDir string, trackers *senderTracker, activeConnections *connectionRegistry, accepts, connections *sync.WaitGroup) {
+	defer accepts.Done()
 	for {
 		connection, err := listener.Accept()
 		if err != nil {
-			if context.Err() != nil {
+			if context.Err() != nil || errors.Is(err, net.ErrClosed) {
 				return
 			}
 			fmt.Fprintln(os.Stderr, "accept event connection:", err)
@@ -524,10 +554,11 @@ func (r *connectionRegistry) CloseAll() {
 }
 
 type senderTracker struct {
-	verbose   bool
-	startedAt time.Time
-	mu        sync.Mutex
-	senders   map[string]*senderStats
+	verbose     bool
+	startedAt   time.Time
+	mu          sync.Mutex
+	totalEvents uint64
+	senders     map[string]*senderStats
 }
 
 type senderStats struct {
@@ -593,6 +624,9 @@ func (t *senderTracker) disconnect(sender string) {
 		stats.active--
 	}
 	active := stats.active
+	if active == 0 {
+		delete(t.senders, sender)
+	}
 	t.mu.Unlock()
 	t.logf("sender=%s state=disconnected active_connections=%d", sender, active)
 }
@@ -615,6 +649,7 @@ func (t *senderTracker) eventStored(sender string) {
 	stats.totalEvents++
 	stats.sessionEvents++
 	stats.lastSeen = time.Now().UTC()
+	t.totalEvents++
 	t.mu.Unlock()
 }
 
@@ -638,15 +673,11 @@ func (t *senderTracker) connectionCount() int {
 func (t *senderTracker) requestRate(now time.Time) float64 {
 	t.mu.Lock()
 	defer t.mu.Unlock()
-	var total uint64
-	for _, stats := range t.senders {
-		total += stats.totalEvents
-	}
 	elapsed := now.Sub(t.startedAt).Seconds()
 	if elapsed <= 0 {
 		return 0
 	}
-	return float64(total) / elapsed
+	return float64(t.totalEvents) / elapsed
 }
 
 func (t *senderTracker) engines() []engineInfo {
@@ -908,7 +939,8 @@ func annotateSenderEvent(event *store.Event, trackers *senderTracker, sender str
 	event.LIFIPv4 = sender
 }
 
-func acceptControls(context context.Context, listener net.Listener, db *store.DB, stop context.CancelFunc, trackers *senderTracker, activeConnections *connectionRegistry, connections *sync.WaitGroup, refresh func() error, ports func() []listenerPort) {
+func acceptControls(context context.Context, listener net.Listener, db *store.DB, stop context.CancelFunc, trackers *senderTracker, activeConnections *connectionRegistry, accepts, connections *sync.WaitGroup, refresh func() error, ports func() []listenerPort) {
+	defer accepts.Done()
 	for {
 		connection, err := listener.Accept()
 		if err != nil {
@@ -1260,7 +1292,7 @@ type fpolicyLIF struct {
 	Address string
 }
 
-func discoverFPolicySenders(endpoints []*net.TCPAddr) (map[int]*expectedFPolicySender, error) {
+func discoverFPolicySenders(context context.Context, endpoints []*net.TCPAddr) (map[int]*expectedFPolicySender, error) {
 	host := defaultCDOTCluster()
 	if host == "" {
 		return nil, errors.New("cDOT host is required to discover FPolicy senders")
@@ -1278,15 +1310,15 @@ func discoverFPolicySenders(endpoints []*net.TCPAddr) (map[int]*expectedFPolicyS
 		return nil, err
 	}
 	defer client.Close()
-	policyOutput, err := runSSHCommand(client, fpolicyPolicyShowCommand+" -instance", nil)
+	policyOutput, err := runSSHCommandContext(context, client, fpolicyPolicyShowCommand+" -instance", nil)
 	if err != nil {
 		return nil, fmt.Errorf("query cDOT FPolicy policies: %w", err)
 	}
-	engineOutput, err := runSSHCommand(client, "vserver fpolicy policy external-engine show -instance", nil)
+	engineOutput, err := runSSHCommandContext(context, client, "vserver fpolicy policy external-engine show -instance", nil)
 	if err != nil {
 		return nil, fmt.Errorf("query cDOT FPolicy external engines: %w", err)
 	}
-	lifOutput, err := runSSHCommand(client, "network interface show -instance", nil)
+	lifOutput, err := runSSHCommandContext(context, client, "network interface show -instance", nil)
 	if err != nil {
 		return nil, fmt.Errorf("query cDOT LIFs: %w", err)
 	}
@@ -1415,7 +1447,7 @@ func pathdiffEndpoints() ([]*net.TCPAddr, error) {
 	listenAddr := defaultListen
 	if unitPath, err := systemdUserUnitPath(); err == nil {
 		if unit, err := os.ReadFile(unitPath); err == nil {
-			if match := regexp.MustCompile(`--listen\s+("[^"]*"|\S+)`).FindStringSubmatch(string(unit)); len(match) == 2 {
+			if match := unitListenPattern.FindStringSubmatch(string(unit)); len(match) == 2 {
 				if value, err := strconv.Unquote(match[1]); err == nil {
 					listenAddr = value
 					if listenAddr == ":9911" {
@@ -1729,7 +1761,7 @@ func receiverCanPingLIF(context context.Context, address string) bool {
 }
 
 func fpolicyPingSucceeded(output []byte) bool {
-	match := regexp.MustCompile(`(?i)(\d+)\s+packets?\s+(?:(?:are|were)\s+)?received`).FindStringSubmatch(string(output))
+	match := pingPacketsPattern.FindStringSubmatch(string(output))
 	if len(match) != 2 {
 		return false
 	}
@@ -1794,7 +1826,7 @@ func fpolicyAlreadyConnected(output string) bool {
 }
 
 func ontapErrorDetail(output []byte) string {
-	ansi := regexp.MustCompile(`\x1b\[[0-?]*[ -/]*[@-~]`).ReplaceAll(output, nil)
+	ansi := ansiEscapePattern.ReplaceAll(output, nil)
 	lines := make([]string, 0)
 	for _, line := range strings.Split(string(ansi), "\n") {
 		line = strings.TrimSpace(line)
@@ -2221,6 +2253,39 @@ func runSSHCommand(client *ssh.Client, command string, debugWriter io.Writer) ([
 		_, _ = fmt.Fprintf(debugWriter, "ssh result:\n%s\n", output)
 	}
 	return output, err
+}
+
+func runSSHCommandContext(context context.Context, client *ssh.Client, command string, debugWriter io.Writer) ([]byte, error) {
+	if err := context.Err(); err != nil {
+		return nil, err
+	}
+	if debugWriter != nil {
+		_, _ = fmt.Fprintf(debugWriter, "ssh exec: %s\n", command)
+	}
+	session, err := client.NewSession()
+	if err != nil {
+		return nil, err
+	}
+	type result struct {
+		output []byte
+		err    error
+	}
+	results := make(chan result, 1)
+	go func() {
+		output, err := session.CombinedOutput(command)
+		results <- result{output: output, err: err}
+	}()
+	select {
+	case result := <-results:
+		_ = session.Close()
+		if debugWriter != nil {
+			_, _ = fmt.Fprintf(debugWriter, "ssh result:\n%s\n", result.output)
+		}
+		return result.output, result.err
+	case <-context.Done():
+		_ = session.Close()
+		return nil, context.Err()
+	}
 }
 
 func cdotHostKeyCallback(knownHostsFile, address string, acceptNewHostKey bool) (ssh.HostKeyCallback, error) {
@@ -3526,7 +3591,11 @@ func newMonitorCommand() *cobra.Command {
 		}
 		ticker := time.NewTicker(interval)
 		defer ticker.Stop()
-		seen := make(map[string]struct{})
+		type eventKey struct {
+			path, operation string
+			timestamp       time.Time
+		}
+		seen := make(map[eventKey]struct{})
 		for {
 			response, err := callControl(controlPath, controlRequest{Command: "recent", Since: since})
 			if err != nil {
@@ -3537,10 +3606,10 @@ func newMonitorCommand() *cobra.Command {
 				if path != "" && !strings.HasPrefix(event.Path, path) {
 					continue
 				}
-				key := fmt.Sprintf("%s:%s:%s", event.Path, event.Operation, event.Timestamp.UTC().Format(time.RFC3339Nano))
+				key := eventKey{path: event.Path, operation: event.Operation, timestamp: event.Timestamp.UTC()}
 				if event.Timestamp.After(since) {
 					since = event.Timestamp
-					seen = make(map[string]struct{})
+					clear(seen)
 				}
 				if _, exists := seen[key]; exists {
 					continue
