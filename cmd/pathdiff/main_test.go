@@ -14,6 +14,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -380,9 +381,12 @@ func TestEngineSessionMetricsResetAfterDisconnect(t *testing.T) {
 	tracker.connect("192.0.2.10", address)
 	tracker.eventStored("192.0.2.10")
 	tracker.disconnect("192.0.2.10")
+	if len(tracker.senders) != 0 {
+		t.Fatalf("disconnected sender was retained: %#v", tracker.senders)
+	}
 	tracker.connect("192.0.2.10", address)
 	engine := tracker.engines()[0]
-	if engine.TotalEvents != 0 || !engine.LastSeen.IsZero() || engine.AverageRate != 0 || tracker.senders["192.0.2.10"].totalEvents != 1 {
+	if engine.TotalEvents != 0 || !engine.LastSeen.IsZero() || engine.AverageRate != 0 || tracker.totalEvents != 1 {
 		t.Fatalf("session metrics were not reset: %#v", engine)
 	}
 	if formatEventRate(0) != text.FgHiBlack.Sprint("-") || formatEngineEventCount(0) != text.FgHiBlack.Sprint("-") {
@@ -418,10 +422,32 @@ func TestFormatEventCount(t *testing.T) {
 func TestSenderTrackerRequestRate(t *testing.T) {
 	tracker := newSenderTracker(false)
 	tracker.startedAt = time.Date(2026, 8, 29, 12, 0, 0, 0, time.UTC)
-	tracker.senders["192.0.2.10"] = &senderStats{totalEvents: 90}
-	tracker.senders["192.0.2.11"] = &senderStats{totalEvents: 30}
+	tracker.totalEvents = 120
 	if got := tracker.requestRate(tracker.startedAt.Add(2 * time.Minute)); got != 1 {
 		t.Fatalf("requestRate() = %f, want 1", got)
+	}
+}
+
+func TestAcceptEventsReturnsWhenListenerCloses(t *testing.T) {
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var accepts, connections sync.WaitGroup
+	accepts.Add(1)
+	go acceptEvents(context.Background(), listener, nil, nil, "", nil, nil, &accepts, &connections)
+	if err := listener.Close(); err != nil {
+		t.Fatal(err)
+	}
+	done := make(chan struct{})
+	go func() {
+		accepts.Wait()
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("accept loop did not return after its listener closed")
 	}
 }
 
