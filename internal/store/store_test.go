@@ -1,7 +1,9 @@
 package store
 
 import (
+	"fmt"
 	"os"
+	"sync"
 	"testing"
 	"time"
 )
@@ -46,6 +48,87 @@ func TestQueries(t *testing.T) {
 	for _, event := range events {
 		if event.Path == "/vol/database/c" {
 			t.Fatalf("path-prefix query included sibling path: %#v", event)
+		}
+	}
+}
+
+func TestConcurrentIngestionDuringPathQueries(t *testing.T) {
+	db, err := Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = db.Close() })
+
+	base := time.Date(2026, 8, 30, 12, 0, 0, 0, time.UTC)
+	for index := range 5000 {
+		if err := db.Store(Event{Path: fmt.Sprintf("/seed/parent-%04d/file", index), Operation: "write", Timestamp: base}); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	stopQueries := make(chan struct{})
+	queryStarted := make(chan struct{})
+	queryDone := make(chan error, 1)
+	go func() {
+		close(queryStarted)
+		for {
+			select {
+			case <-stopQueries:
+				queryDone <- nil
+				return
+			default:
+				if _, err := db.ParentSummariesByPath("/seed", "*", base.Add(-time.Second), base.Add(time.Second)); err != nil {
+					queryDone <- err
+					return
+				}
+			}
+		}
+	}()
+	<-queryStarted
+
+	const writers = 4
+	const eventsPerWriter = 500
+	var writes sync.WaitGroup
+	writeErrors := make(chan error, writers)
+	for writer := range writers {
+		writes.Add(1)
+		go func() {
+			defer writes.Done()
+			for index := range eventsPerWriter {
+				event := Event{Path: fmt.Sprintf("/live/writer-%d/file-%04d", writer, index), Operation: "write", Timestamp: base.Add(time.Duration(index+1) * time.Microsecond)}
+				if err := db.Store(event); err != nil {
+					writeErrors <- err
+					return
+				}
+			}
+		}()
+	}
+	writes.Wait()
+	close(writeErrors)
+	close(stopQueries)
+	if err := <-queryDone; err != nil {
+		t.Fatal(err)
+	}
+	for err := range writeErrors {
+		t.Fatal(err)
+	}
+
+	events, err := db.EventsByPath("/live/", base, base.Add(time.Second))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, want := len(events), writers*eventsPerWriter; got != want {
+		t.Fatalf("EventsByPath() returned %d concurrently stored events, want %d", got, want)
+	}
+}
+
+func TestScanQueryLimitReservesCapacity(t *testing.T) {
+	for _, test := range []struct {
+		processors int
+		want       int
+	}{{1, 1}, {2, 1}, {4, 1}, {8, 3}, {32, 4}} {
+		if got := scanQueryLimit(test.processors); got != test.want {
+			t.Errorf("scanQueryLimit(%d) = %d, want %d", test.processors, got, test.want)
 		}
 	}
 }
@@ -181,6 +264,63 @@ func TestStoreDistinctPathsWithSameTimestamp(t *testing.T) {
 	}
 	if len(events) != 2 {
 		t.Fatalf("EventsSince() returned %d events, want 2", len(events))
+	}
+}
+
+func TestStorePreservesIdenticalConcurrentEvents(t *testing.T) {
+	db, err := Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = db.Close() })
+	timestamp := time.Date(2026, 8, 30, 12, 0, 0, 123456000, time.UTC)
+	event := Event{Path: "/vol/data/file", Operation: "NFS_WR", Timestamp: timestamp, VolumeMSID: "10"}
+
+	const eventCount = 100
+	var stores sync.WaitGroup
+	storeErrors := make(chan error, eventCount)
+	for range eventCount {
+		stores.Add(1)
+		go func() {
+			defer stores.Done()
+			if err := db.Store(event); err != nil {
+				storeErrors <- err
+			}
+		}()
+	}
+	stores.Wait()
+	close(storeErrors)
+	for err := range storeErrors {
+		t.Fatal(err)
+	}
+
+	events, err := db.EventsSince(timestamp)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(events) != eventCount {
+		t.Fatalf("EventsSince() returned %d identical events, want %d", len(events), eventCount)
+	}
+	summaries, err := db.ParentSummariesByPath("/vol", "*", timestamp, timestamp)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(summaries) != 1 || summaries[0].ChildCount != 1 {
+		t.Fatalf("ParentSummariesByPath() = %#v, want one unique child", summaries)
+	}
+	deleted, err := db.DeleteEventsBefore(timestamp.Add(time.Microsecond))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if deleted != eventCount {
+		t.Fatalf("DeleteEventsBefore() deleted %d events, want %d", deleted, eventCount)
+	}
+	events, err = db.EventsByPath("/vol", timestamp, timestamp)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(events) != 0 {
+		t.Fatalf("EventsByPath() returned %d events after retention", len(events))
 	}
 }
 

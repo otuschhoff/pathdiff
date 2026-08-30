@@ -909,8 +909,8 @@ func readEvents(connection net.Conn, db *store.DB, trackers *senderTracker, send
 			continue
 		}
 		if err := db.Store(event); err != nil {
-			fmt.Fprintln(os.Stderr, "store event:", err)
-			continue
+			fmt.Fprintf(os.Stderr, "store event from %s; closing sender connection: %v\n", sender, err)
+			return
 		}
 		trackers.eventStored(sender)
 		trackers.logf("sender=%s state=event_stored operation=%s path=%q", sender, event.Operation, event.Path)
@@ -956,30 +956,35 @@ func readONTAPXMLEvents(reader *bufio.Reader, connection net.Conn, db *store.DB,
 			continue
 		}
 		if message.Type == "SCREEN_REQ" {
-			storeScreenEvent(message.Payload, connection, db, trackers, sender)
+			if !storeScreenEvent(message.Payload, connection, db, trackers, sender) {
+				return
+			}
 			continue
 		}
 		if message.Type != "NOTIFY_REQ" {
 			trackers.logf("sender=%s state=message_ignored type=%s", sender, message.Type)
 			continue
 		}
-		storeXMLEvent(message.Payload, connection, db, trackers, sender)
+		if !storeXMLEvent(message.Payload, connection, db, trackers, sender) {
+			return
+		}
 	}
 }
 
-func storeScreenEvent(payload []byte, connection net.Conn, db *store.DB, trackers *senderTracker, sender string) {
+func storeScreenEvent(payload []byte, connection net.Conn, db *store.DB, trackers *senderTracker, sender string) bool {
 	event, err := fpolicy.ParseScreenRequest(payload)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "decode ONTAP XML screen request from %s: %v\n", connection.RemoteAddr(), err)
-		return
+		return true
 	}
 	annotateSenderEvent(&event, trackers, sender)
 	if err := db.Store(event); err != nil {
-		fmt.Fprintln(os.Stderr, "store ONTAP XML screen request:", err)
-		return
+		fmt.Fprintf(os.Stderr, "store ONTAP XML screen request from %s; closing sender connection: %v\n", sender, err)
+		return false
 	}
 	trackers.eventStored(sender)
 	trackers.logf("sender=%s state=screen_request_stored operation=%s path=%q", sender, event.Operation, event.Path)
+	return true
 }
 
 func readXMLEvents(reader *bufio.Reader, connection net.Conn, db *store.DB, trackers *senderTracker, sender string) {
@@ -994,27 +999,28 @@ func readXMLEvents(reader *bufio.Reader, connection net.Conn, db *store.DB, trac
 			return
 		}
 		if err := db.Store(event); err != nil {
-			fmt.Fprintln(os.Stderr, "store XML event:", err)
-			continue
+			fmt.Fprintf(os.Stderr, "store XML event from %s; closing sender connection: %v\n", sender, err)
+			return
 		}
 		trackers.eventStored(sender)
 		trackers.logf("sender=%s state=event_stored operation=%s path=%q", sender, event.Operation, event.Path)
 	}
 }
 
-func storeXMLEvent(payload []byte, connection net.Conn, db *store.DB, trackers *senderTracker, sender string) {
+func storeXMLEvent(payload []byte, connection net.Conn, db *store.DB, trackers *senderTracker, sender string) bool {
 	event, err := fpolicy.ParseXMLNotification(payload)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "decode XML event from %s: %v\n", connection.RemoteAddr(), err)
-		return
+		return true
 	}
 	annotateSenderEvent(&event, trackers, sender)
 	if err := db.Store(event); err != nil {
-		fmt.Fprintln(os.Stderr, "store XML event:", err)
-		return
+		fmt.Fprintf(os.Stderr, "store XML event from %s; closing sender connection: %v\n", sender, err)
+		return false
 	}
 	trackers.eventStored(sender)
 	trackers.logf("sender=%s state=event_stored operation=%s path=%q", sender, event.Operation, event.Path)
+	return true
 }
 
 func annotateSenderEvent(event *store.Event, trackers *senderTracker, sender string) {
