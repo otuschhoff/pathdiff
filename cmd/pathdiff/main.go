@@ -279,7 +279,7 @@ func (m *fpolicyListenerManager) Refresh() error {
 			}
 			m.mu.Unlock()
 			if err := tryEnableFPolicyPolicy(policy); err != nil {
-				fmt.Fprintf(os.Stderr, "enable FPolicy policy %s on %s: %v\n", policy.Name, policy.SVM, err)
+				fmt.Fprintf(os.Stderr, "FPolicy activation failed for SVM %s policy %s: %v; will retry on the next cDOT refresh\n", policy.SVM, policy.Name, err)
 				continue
 			}
 			m.mu.Lock()
@@ -1577,7 +1577,7 @@ func enableFPolicyPolicy(client *ssh.Client, policy fpolicyPolicy, debugWriter i
 	disableCommand := "vserver fpolicy disable -vserver " + shellQuote(policy.SVM) + " -policy-name " + shellQuote(policy.Name)
 	disableOutput, err := runSSHCommand(client, disableCommand, debugWriter)
 	if err != nil && !strings.Contains(strings.ToLower(string(disableOutput)), "not enabled") {
-		return fmt.Errorf("stop FPolicy policy %s on %s before starting: %w: %s", policy.Name, policy.SVM, err, strings.TrimSpace(string(disableOutput)))
+		return fmt.Errorf("could not disable the existing policy before restart: %s", ontapErrorDetail(disableOutput))
 	}
 	enabled := false
 	for sequence := 1; sequence <= 1000; sequence++ {
@@ -1588,11 +1588,11 @@ func enableFPolicyPolicy(client *ssh.Client, policy fpolicyPolicy, debugWriter i
 			break
 		}
 		if !fpolicySequenceConflict(string(output)) {
-			return fmt.Errorf("start FPolicy policy %s on %s: %w: %s", policy.Name, policy.SVM, err, strings.TrimSpace(string(output)))
+			return fmt.Errorf("could not enable with sequence number %d: %s", sequence, ontapErrorDetail(output))
 		}
 	}
 	if !enabled {
-		return fmt.Errorf("start FPolicy policy %s on %s: no free sequence number found", policy.Name, policy.SVM)
+		return errors.New("no free sequence number was found after trying 1 through 1000")
 	}
 	if err := connectFPolicyEngine(client, policy, debugWriter); err != nil {
 		return err
@@ -1603,7 +1603,7 @@ func enableFPolicyPolicy(client *ssh.Client, policy fpolicyPolicy, debugWriter i
 func connectFPolicyEngine(client *ssh.Client, policy fpolicyPolicy, debugWriter io.Writer) error {
 	nodeOutput, err := runSSHCommand(client, "node show -instance", debugWriter)
 	if err != nil {
-		return fmt.Errorf("list nodes for FPolicy policy %s on %s: %w", policy.Name, policy.SVM, err)
+		return fmt.Errorf("could not list cluster nodes before connecting the external engine: %s", ontapErrorDetail(nodeOutput))
 	}
 	for _, node := range parseONTAPInstances(string(nodeOutput)) {
 		name := instanceField(node, "Node")
@@ -1617,8 +1617,8 @@ func connectFPolicyEngine(client *ssh.Client, policy fpolicyPolicy, debugWriter 
 			}
 			remoteCommand := "vserver fpolicy engine-connect -vserver " + shellQuote(policy.SVM) + " -policy-name " + shellQuote(policy.Name) + " -node " + shellQuote(name) + " -server " + shellQuote(server)
 			output, err := runSSHCommand(client, remoteCommand, debugWriter)
-			if err != nil && !strings.Contains(strings.ToLower(string(output)), "already connected") {
-				return fmt.Errorf("connect FPolicy engine for policy %s on %s node %s server %s: %w: %s", policy.Name, policy.SVM, name, server, err, strings.TrimSpace(string(output)))
+			if err != nil && !fpolicyAlreadyConnected(string(output)) {
+				return fmt.Errorf("could not connect node %s to receiver %s: %s", name, server, ontapErrorDetail(output))
 			}
 		}
 	}
@@ -1631,17 +1631,41 @@ func waitForFPolicyConnection(client *ssh.Client, policy fpolicyPolicy, debugWri
 		remoteCommand := "vserver fpolicy show-engine -vserver " + shellQuote(policy.SVM) + " -policy-name " + shellQuote(policy.Name) + " -fields vserver,policy-name,server-status"
 		output, err := runSSHCommand(client, remoteCommand, debugWriter)
 		if err != nil {
-			return fmt.Errorf("check FPolicy connection for policy %s on %s: %w: %s", policy.Name, policy.SVM, err, strings.TrimSpace(string(output)))
+			return fmt.Errorf("could not read engine connection state: %s", ontapErrorDetail(output))
 		}
 		statuses := parseFPolicyEngineStates(string(output))[policy.SVM+"\x00"+policy.Name]
 		if fpolicyEngineConnected(statuses) {
 			return nil
 		}
 		if time.Now().After(deadline) {
-			return fmt.Errorf("wait for FPolicy policy %s on %s to connect: timed out after %s", policy.Name, policy.SVM, timeout)
+			return fmt.Errorf("receiver handshake did not complete within %s", timeout)
 		}
 		time.Sleep(time.Second)
 	}
+}
+
+func fpolicyAlreadyConnected(output string) bool {
+	output = strings.ToLower(output)
+	return strings.Contains(output, "already connected") || (strings.Contains(output, "specified server") && strings.Contains(output, "connected"))
+}
+
+func ontapErrorDetail(output []byte) string {
+	ansi := regexp.MustCompile(`\x1b\[[0-?]*[ -/]*[@-~]`).ReplaceAll(output, nil)
+	lines := make([]string, 0)
+	for _, line := range strings.Split(string(ansi), "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" || strings.HasPrefix(line, "Last login time:") || strings.Contains(line, "blob data") {
+			continue
+		}
+		lines = append(lines, line)
+	}
+	detail := strings.Join(strings.Fields(strings.Join(lines, " ")), " ")
+	detail = strings.TrimPrefix(detail, "Error: command failed: ")
+	detail = strings.TrimPrefix(detail, "Error: ")
+	if detail == "" {
+		return "ONTAP returned no error detail"
+	}
+	return detail
 }
 
 func fpolicyEngineConnected(statuses []string) bool {
