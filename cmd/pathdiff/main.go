@@ -1249,6 +1249,12 @@ type expectedFPolicySender struct {
 	Policies []fpolicyPolicy
 }
 
+type fpolicyLIF struct {
+	Name    string
+	SVM     string
+	Address string
+}
+
 func discoverFPolicySenders(endpoints []*net.TCPAddr) (map[int]*expectedFPolicySender, error) {
 	host := defaultCDOTCluster()
 	if host == "" {
@@ -1301,21 +1307,31 @@ func discoverFPolicySenders(endpoints []*net.TCPAddr) (map[int]*expectedFPolicyS
 		}
 		sender.Policies = append(sender.Policies, policy)
 	}
-	for _, record := range parseONTAPInstances(string(lifOutput)) {
-		address := instanceField(record, "Network Address")
-		if ip := net.ParseIP(address); ip == nil || ip.To4() == nil {
-			continue
-		}
+	for _, lif := range fpolicyClientLIFs(parseONTAPInstances(string(lifOutput))) {
 		for _, sender := range expected {
 			for _, policy := range sender.Policies {
-				if policy.SVM == instanceField(record, "Vserver") {
-					sender.Sources[address] = struct{}{}
+				if policy.SVM == lif.SVM {
+					sender.Sources[lif.Address] = struct{}{}
 					break
 				}
 			}
 		}
 	}
 	return expected, nil
+}
+
+func fpolicyClientLIFs(records []map[string]string) []fpolicyLIF {
+	var lifs []fpolicyLIF
+	for _, record := range records {
+		address := instanceField(record, "Network Address")
+		ip := net.ParseIP(address)
+		lif := fpolicyLIF{Name: instanceField(record, "Logical Interface Name"), SVM: instanceField(record, "Vserver"), Address: address}
+		if lif.Name == "" || lif.SVM == "" || ip == nil || ip.To4() == nil || !strings.Contains(strings.ToLower(instanceField(record, "Service List")), "data-fpolicy-client") || !strings.EqualFold(instanceField(record, "Operational Status"), "up") {
+			continue
+		}
+		lifs = append(lifs, lif)
+	}
+	return lifs
 }
 
 func fpolicyTargetsMatch(targets string, expected map[string]struct{}) bool {
@@ -1585,6 +1601,9 @@ func enableFPolicyPolicy(context context.Context, client *ssh.Client, policy fpo
 	if err := context.Err(); err != nil {
 		return err
 	}
+	if err := verifyFPolicyReachability(context, client, policy, debugWriter); err != nil {
+		return err
+	}
 	disableCommand := "vserver fpolicy disable -vserver " + shellQuote(policy.SVM) + " -policy-name " + shellQuote(policy.Name)
 	disableOutput, err := runSSHCommand(client, disableCommand, debugWriter)
 	if err != nil && !strings.Contains(strings.ToLower(string(disableOutput)), "not enabled") {
@@ -1612,6 +1631,39 @@ func enableFPolicyPolicy(context context.Context, client *ssh.Client, policy fpo
 		return err
 	}
 	return waitForFPolicyConnection(context, client, policy, debugWriter, 30*time.Second)
+}
+
+func verifyFPolicyReachability(context context.Context, client *ssh.Client, policy fpolicyPolicy, debugWriter io.Writer) error {
+	output, err := runSSHCommand(client, "network interface show -instance", debugWriter)
+	if err != nil {
+		return fmt.Errorf("could not list FPolicy-client LIFs before activation: %s", ontapErrorDetail(output))
+	}
+	var lifs []fpolicyLIF
+	for _, lif := range fpolicyClientLIFs(parseONTAPInstances(string(output))) {
+		if lif.SVM == policy.SVM {
+			lifs = append(lifs, lif)
+		}
+	}
+	if len(lifs) == 0 {
+		return errors.New("no operational data-fpolicy-client LIF was found; activation will not be attempted")
+	}
+	for _, target := range strings.Split(policy.Targets, ",") {
+		target = strings.TrimSpace(target)
+		if target == "" {
+			continue
+		}
+		for _, lif := range lifs {
+			if err := context.Err(); err != nil {
+				return err
+			}
+			pingCommand := "network ping -lif " + shellQuote(lif.Name) + " -vserver " + shellQuote(lif.SVM) + " -destination " + shellQuote(target) + " -count 1 -wait 1 -wait-response 1000"
+			pingOutput, err := runSSHCommand(client, pingCommand, debugWriter)
+			if err != nil {
+				return fmt.Errorf("receiver %s is unreachable from FPolicy LIF %s (%s): %s; activation will not be attempted", target, lif.Name, lif.Address, ontapErrorDetail(pingOutput))
+			}
+		}
+	}
+	return nil
 }
 
 func connectFPolicyEngine(client *ssh.Client, policy fpolicyPolicy, debugWriter io.Writer) error {
@@ -2806,18 +2858,25 @@ func instanceField(record map[string]string, field string) string {
 func parseONTAPInstances(output string) []map[string]string {
 	var records []map[string]string
 	current := map[string]string{}
+	lastField := ""
 	for _, line := range strings.Split(output, "\n") {
-		line = strings.TrimSpace(line)
-		if line == "" {
+		trimmed := strings.TrimSpace(line)
+		if trimmed == "" {
 			if len(current) > 0 {
 				records = append(records, current)
 				current = map[string]string{}
+				lastField = ""
 			}
 			continue
 		}
-		field, value, found := strings.Cut(line, ":")
+		field, value, found := strings.Cut(trimmed, ":")
 		if found && strings.TrimSpace(field) != "" {
 			current[strings.TrimSpace(field)] = strings.TrimSpace(value)
+			lastField = strings.TrimSpace(field)
+			continue
+		}
+		if lastField != "" && len(line) > 0 && (line[0] == ' ' || line[0] == '\t') {
+			current[lastField] = strings.TrimSpace(current[lastField] + " " + trimmed)
 		}
 	}
 	if len(current) > 0 {

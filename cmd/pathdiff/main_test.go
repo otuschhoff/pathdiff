@@ -636,6 +636,25 @@ func TestFPolicySequenceConflict(t *testing.T) {
 	}
 }
 
+func TestFPolicyClientLIFs(t *testing.T) {
+	lifs := fpolicyClientLIFs([]map[string]string{
+		{"Logical Interface Name": "data", "Vserver Name": "finance", "Network Address": "192.0.2.10", "Service List": "data-nfs, data-fpolicy-client", "Operational Status": "up"},
+		{"Logical Interface Name": "management", "Vserver Name": "finance", "Network Address": "192.0.2.11", "Service List": "management-ssh", "Operational Status": "up"},
+		{"Logical Interface Name": "down", "Vserver Name": "finance", "Network Address": "192.0.2.12", "Service List": "data-fpolicy-client", "Operational Status": "down"},
+	})
+	if len(lifs) != 1 || lifs[0] != (fpolicyLIF{Name: "data", SVM: "finance", Address: "192.0.2.10"}) {
+		t.Fatalf("FPolicy client LIFs = %#v", lifs)
+	}
+}
+
+func TestParseONTAPInstancesPreservesWrappedServiceList(t *testing.T) {
+	records := parseONTAPInstances("Vserver Name: finance\nLogical Interface Name: data\nService List: data-core, data-nfs,\n              data-fpolicy-client\nNetwork Address: 192.0.2.10\nOperational Status: up\n")
+	lifs := fpolicyClientLIFs(records)
+	if len(lifs) != 1 || !strings.Contains(instanceField(records[0], "Service List"), "data-fpolicy-client") {
+		t.Fatalf("wrapped service list was not preserved: %#v", records)
+	}
+}
+
 func TestONTAPErrorDetail(t *testing.T) {
 	detail := ontapErrorDetail([]byte("Last login time: now\n\x1b[1B blob data\nError: The specified server is already\n connected.\n"))
 	if detail != "The specified server is already connected." {
