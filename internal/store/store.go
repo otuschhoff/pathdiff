@@ -187,6 +187,25 @@ func (d *DB) SetSVMName(id, name string) error {
 	return d.db.Set(append([]byte("s:"), id...), []byte(name), pebble.NoSync)
 }
 
+func (d *DB) MarkFPolicyLIFUnreachable(svm, lif, address string) error {
+	if svm == "" || lif == "" || address == "" {
+		return errors.New("SVM, LIF, and address are required")
+	}
+	return d.db.Set([]byte("r:"+svm+"\x00"+lif), []byte(address), pebble.NoSync)
+}
+
+func (d *DB) FPolicyLIFUnreachable(svm, lif, address string) (bool, error) {
+	value, closer, err := d.db.Get([]byte("r:" + svm + "\x00" + lif))
+	if errors.Is(err, pebble.ErrNotFound) {
+		return false, nil
+	}
+	if err != nil {
+		return false, fmt.Errorf("look up unreachable FPolicy LIF: %w", err)
+	}
+	defer closer.Close()
+	return string(value) == address, nil
+}
+
 func (d *DB) ListSVMMappings() ([]Mapping, error) {
 	return d.listMappings("s:")
 }

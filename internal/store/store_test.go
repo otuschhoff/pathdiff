@@ -179,3 +179,20 @@ func TestListMappings(t *testing.T) {
 		t.Fatalf("SVM mappings = %#v", svms)
 	}
 }
+
+func TestFPolicyLIFUnreachable(t *testing.T) {
+	db, err := Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	if err := db.MarkFPolicyLIFUnreachable("finance", "finance_data", "192.0.2.10"); err != nil {
+		t.Fatal(err)
+	}
+	if unreachable, err := db.FPolicyLIFUnreachable("finance", "finance_data", "192.0.2.10"); err != nil || !unreachable {
+		t.Fatalf("same address unreachable = %t, err = %v", unreachable, err)
+	}
+	if unreachable, err := db.FPolicyLIFUnreachable("finance", "finance_data", "192.0.2.11"); err != nil || unreachable {
+		t.Fatalf("changed address unreachable = %t, err = %v", unreachable, err)
+	}
+}
