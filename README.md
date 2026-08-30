@@ -15,6 +15,7 @@ Build the binary with `xc build`, then register and start the per-user systemd s
 ```sh
 bin/pathdiff service start --db pathdiff_data --listen :9911
 bin/pathdiff service status
+bin/pathdiff service refresh
 bin/pathdiff service monitor --path /vol/finance/ --interval 2s
 bin/pathdiff service stop
 bin/pathdiff engine list
@@ -31,9 +32,9 @@ bin/pathdiff cdot set-cluster cluster.example.test
 bin/pathdiff cdot check --host cluster.example.test
 ```
 
-On first start, `pathdiff` writes `~/.config/systemd/user/pathdiff.service`, reloads the user systemd manager, and starts it. Later `service start` calls start the registered unit without replacing its configuration. Add `--verbose` (or `-v`) to the first start to log sender connection, protocol, negotiation, keep-alive, and accepted-event state changes. While verbose mode is enabled, the daemon reports per-sender accepted-event throughput every 10 seconds.
+On first start, `pathdiff` writes `~/.config/systemd/user/pathdiff.service`, reloads the user systemd manager, and starts it. The default listener range is `:9911-9999`, allowing each FPolicy SVM to use a distinct TCP destination port. Later `service start` calls start the registered unit without replacing custom configuration; a legacy default `:9911` unit is upgraded automatically to the default range. Add `--verbose` (or `-v`) to the first start to log sender connection, protocol, negotiation, keep-alive, and accepted-event state changes. While verbose mode is enabled, the daemon reports per-sender accepted-event throughput every 10 seconds.
 
-`service status` renders the systemd state, active FPolicy connection count, registered event count, and average accepted FPolicy requests per second since daemon start. The internal `daemon run` entrypoint handles SIGINT and SIGTERM by stopping listeners, closing active sockets, waiting for workers, then closing Pebble.
+`service status` renders the systemd state, active FPolicy connection count, registered event count, and average accepted FPolicy requests per second since daemon start. The daemon discovers cDOT external engines that target its local IPv4 addresses, listens only on their configured ports, and accepts each port only from LIF IPv4s on the policy's SVM. It refreshes that configuration every minute, adds newly configured senders, attempts to enable their policies, and removes ports that are no longer configured. Run `service refresh` to request the same cDOT reconciliation immediately. The internal `daemon run` entrypoint handles SIGINT and SIGTERM by stopping listeners, closing active sockets, waiting for workers, then closing Pebble.
 
 `cdot node list` and `cdot lif list` render live ONTAP inventory over SSH. `engine list` uses that inventory to resolve each active sender's node and SVM names, hides raw LIF IPv4 by default, and renders connection time, human-readable time since the last accepted event, total events, average event rate, FPolicy connection status when ONTAP permits the status query, hostname, and local listener port.
 

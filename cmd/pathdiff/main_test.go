@@ -426,28 +426,52 @@ func TestFPolicyActionCommands(t *testing.T) {
 	}
 }
 
+func TestServiceRefreshCommand(t *testing.T) {
+	service := newServiceCommand()
+	command, _, err := service.Find([]string{"refresh"})
+	if err != nil || command == nil || command.Use != "refresh" {
+		t.Fatalf("refresh command = %#v, err = %v", command, err)
+	}
+	if controlPath, err := command.Flags().GetString("control"); err != nil || controlPath != defaultControl {
+		t.Fatalf("refresh control path = %q, err = %v", controlPath, err)
+	}
+}
+
 func TestFPolicyCreatePlans(t *testing.T) {
 	svms := []map[string]string{
-		{"Vserver": "finance", "Vserver Type": "data"},
-		{"Vserver": "engineering", "Vserver Type": "data"},
+		{"Vserver": "finance", "Vserver Type": "data", "Allowed Protocols": "nfs, cifs"},
+		{"Vserver": "engineering", "Vserver Type": "data", "Allowed Protocols": "nfs"},
+		{"Vserver": "cifs", "Vserver Type": "data", "Allowed Protocols": "cifs"},
 		{"Vserver": "admin", "Vserver Type": "admin"},
 	}
-	policies := []fpolicyPolicy{{SVM: "finance", Name: "pathdiff_policy", Engine: "pathdiff"}, {SVM: "engineering", Name: "existing_policy", Engine: "other"}}
+	policies := []fpolicyPolicy{{SVM: "finance", Name: "pathdiff_policy", Engine: "pathdiff", Port: "9911"}, {SVM: "engineering", Name: "existing_policy", Engine: "other"}}
 	sequences := []map[string]string{{"Vserver": "engineering", "Sequence Number": "4"}}
-	plans := fpolicyCreatePlans(svms, policies, sequences, "*", &net.TCPAddr{IP: net.ParseIP("192.0.2.10"), Port: 9911})
-	if len(plans) != 1 || plans[0] != (fpolicyCreatePlan{SVM: "engineering", TargetIP: "192.0.2.10", Port: "9911", Sequence: 5}) {
+	endpoints := []*net.TCPAddr{{IP: net.ParseIP("192.0.2.10"), Port: 9911}, {IP: net.ParseIP("192.0.2.10"), Port: 9912}, {IP: net.ParseIP("192.0.2.10"), Port: 9913}}
+	plans, err := fpolicyCreatePlans(svms, policies, sequences, "*", true, endpoints)
+	if err != nil || len(plans) != 1 || plans[0] != (fpolicyCreatePlan{SVM: "engineering", TargetIP: "192.0.2.10", Port: "9912", Sequence: 5}) {
 		t.Fatalf("plans = %#v", plans)
 	}
 	var output bytes.Buffer
 	if err := printFPolicyCreateCommands(&output, plans); err != nil {
 		t.Fatal(err)
 	}
-	if got := output.String(); !strings.Contains(got, "-primary-servers 192.0.2.10 -port 9911") || !strings.Contains(got, "-sequence-number 5") || strings.Contains(got, "finance") {
+	if got := output.String(); !strings.Contains(got, "-primary-servers 192.0.2.10 -port 9912") || !strings.Contains(got, "-sequence-number 5") || strings.Contains(got, "finance") {
 		t.Fatalf("unexpected create commands: %s", got)
 	}
-	fallback := fpolicyCreatePlans(svms, policies, nil, "engineering", &net.TCPAddr{IP: net.ParseIP("192.0.2.10"), Port: 9911})
-	if len(fallback) != 1 || fallback[0].Sequence != 2 {
+	fallback, err := fpolicyCreatePlans(svms, policies, nil, "engineering", false, endpoints)
+	if err != nil || len(fallback) != 1 || fallback[0].Sequence != 2 {
 		t.Fatalf("fallback sequence plans = %#v", fallback)
+	}
+	explicit, err := fpolicyCreatePlans(svms, policies, nil, "cifs", false, endpoints)
+	if err != nil || len(explicit) != 1 || explicit[0].SVM != "cifs" {
+		t.Fatalf("explicit non-NFS plans = %#v", explicit)
+	}
+}
+
+func TestParseListenAddresses(t *testing.T) {
+	addresses, err := parseListenAddresses(":9911-9913")
+	if err != nil || len(addresses) != 3 || addresses[0].Port != 9911 || addresses[2].Port != 9913 {
+		t.Fatalf("addresses = %#v, err = %v", addresses, err)
 	}
 }
 
