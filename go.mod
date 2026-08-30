@@ -1,4 +1,4 @@
-module pathdiff
+module github.com/otuschhoff/pathdiff
 
 go 1.23.0
 
