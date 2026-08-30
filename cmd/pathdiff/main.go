@@ -46,11 +46,12 @@ const (
 )
 
 var (
-	captureSequence    atomic.Uint64
-	listenRangePattern = regexp.MustCompile(`^(.*:)([0-9]+)-([0-9]+)$`)
-	unitListenPattern  = regexp.MustCompile(`--listen\s+("[^"]*"|\S+)`)
-	pingPacketsPattern = regexp.MustCompile(`(?i)(\d+)\s+packets?\s+(?:(?:are|were)\s+)?received`)
-	ansiEscapePattern  = regexp.MustCompile(`\x1b\[[0-?]*[ -/]*[@-~]`)
+	captureSequence     atomic.Uint64
+	listenRangePattern  = regexp.MustCompile(`^(.*:)([0-9]+)-([0-9]+)$`)
+	unitListenPattern   = regexp.MustCompile(`--listen\s+("[^"]*"|\S+)`)
+	pingPacketsPattern  = regexp.MustCompile(`(?i)(\d+)\s+packets?\s+(?:(?:are|were)\s+)?received`)
+	ansiEscapePattern   = regexp.MustCompile(`\x1b\[[0-?]*[ -/]*[@-~]`)
+	retentionDayPattern = regexp.MustCompile(`^([0-9]+)d$`)
 )
 
 type controlRequest struct {
@@ -65,6 +66,7 @@ type controlRequest struct {
 	VolumeName string                `json:"volume_name,omitempty"`
 	SVMID      string                `json:"svm_id,omitempty"`
 	SVMName    string                `json:"svm_name,omitempty"`
+	Retention  time.Duration         `json:"retention,omitempty"`
 }
 
 type controlResponse struct {
@@ -80,6 +82,8 @@ type controlResponse struct {
 	Engines       []engineInfo          `json:"engines,omitempty"`
 	Mappings      []store.Mapping       `json:"mappings,omitempty"`
 	ListenerPorts []listenerPort        `json:"listener_ports,omitempty"`
+	Retention     time.Duration         `json:"retention,omitempty"`
+	DeletedEvents uint64                `json:"deleted_events,omitempty"`
 }
 
 type listenerPort struct {
@@ -168,7 +172,7 @@ func runDaemon(dbPath, listenAddr, controlPath, recordDir string, verbose bool) 
 	context, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer cancel()
 
-	var accepts, connections sync.WaitGroup
+	var accepts, background, connections sync.WaitGroup
 	activeConnections := newConnectionRegistry()
 	trackers := newSenderTracker(verbose)
 	listenerManager := newFPolicyListenerManager(context, listenerEndpoints, receiverEndpoints, db, recordDir, trackers, activeConnections, &accepts, &connections)
@@ -182,13 +186,38 @@ func runDaemon(dbPath, listenAddr, controlPath, recordDir string, verbose bool) 
 		}
 	}()
 	go listenerManager.RefreshEvery(context, time.Minute)
+	background.Add(1)
+	go func() {
+		defer background.Done()
+		enforceRetentionEvery(context, db, time.Minute)
+	}()
 	<-context.Done()
 	listenerManager.Close()
 	_ = controlListener.Close()
 	accepts.Wait()
 	activeConnections.CloseAll()
 	connections.Wait()
+	background.Wait()
 	return nil
+}
+
+func enforceRetentionEvery(context context.Context, db *store.DB, interval time.Duration) {
+	apply := func() {
+		if _, err := db.ApplyRetention(time.Now().UTC()); err != nil {
+			fmt.Fprintln(os.Stderr, "apply event retention:", err)
+		}
+	}
+	apply()
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-context.Done():
+			return
+		case <-ticker.C:
+			apply()
+		}
+	}
 }
 
 func listenEventPorts(specification string) ([]net.Listener, error) {
@@ -1024,6 +1053,17 @@ func handleControl(connection net.Conn, db *store.DB, stop context.CancelFunc, t
 			if err == nil {
 				response.Status = "reset"
 			}
+		case "retention-show":
+			response.Retention, _, err = db.Retention()
+		case "retention-set":
+			err = db.SetRetention(request.Retention)
+			if err == nil {
+				response.DeletedEvents, err = db.ApplyRetention(time.Now().UTC())
+			}
+			if err == nil {
+				response.Retention = request.Retention
+				response.Status = "updated"
+			}
 		case "db-status":
 			var stats store.Stats
 			stats, err = db.Stats()
@@ -1061,9 +1101,74 @@ func newDBCommand() *cobra.Command {
 	}}
 	reset.Flags().StringVar(&controlPath, "control", defaultControl, "Unix control socket")
 	event.AddCommand(reset)
+	retention := newDBRetentionCommand()
 	database.AddCommand(status)
 	database.AddCommand(event)
+	database.AddCommand(retention)
 	return database
+}
+
+func newDBRetentionCommand() *cobra.Command {
+	var controlPath string
+	retention := &cobra.Command{Use: "retention", Short: "Manage event retention"}
+	retention.PersistentFlags().StringVar(&controlPath, "control", defaultControl, "Unix control socket")
+	show := &cobra.Command{Use: "show", Args: cobra.NoArgs, Short: "Show the current retention policy", RunE: func(command *cobra.Command, _ []string) error {
+		response, err := callControl(controlPath, controlRequest{Command: "retention-show"})
+		if err != nil {
+			return err
+		}
+		return printRetention(command.OutOrStdout(), response, false)
+	}}
+	set := &cobra.Command{Use: "set <duration>", Args: cobra.ExactArgs(1), Short: "Set the event retention duration", RunE: func(command *cobra.Command, arguments []string) error {
+		duration, err := parseRetentionDuration(arguments[0])
+		if err != nil {
+			return err
+		}
+		response, err := callControl(controlPath, controlRequest{Command: "retention-set", Retention: duration})
+		if err != nil {
+			return err
+		}
+		return printRetention(command.OutOrStdout(), response, true)
+	}}
+	retention.AddCommand(show, set)
+	return retention
+}
+
+func parseRetentionDuration(value string) (time.Duration, error) {
+	if match := retentionDayPattern.FindStringSubmatch(value); len(match) == 2 {
+		days, err := strconv.ParseUint(match[1], 10, 64)
+		if err != nil || days == 0 || days > uint64(math.MaxInt64/int64(24*time.Hour)) {
+			return 0, fmt.Errorf("invalid retention duration %q", value)
+		}
+		return time.Duration(days) * 24 * time.Hour, nil
+	}
+	duration, err := time.ParseDuration(value)
+	if err != nil || duration <= 0 {
+		return 0, fmt.Errorf("invalid retention duration %q", value)
+	}
+	return duration, nil
+}
+
+func printRetention(writer io.Writer, response controlResponse, includeDeleted bool) error {
+	value := "disabled"
+	if response.Retention > 0 {
+		if response.Retention%(24*time.Hour) == 0 {
+			value = fmt.Sprintf("%dd", response.Retention/(24*time.Hour))
+		} else {
+			value = response.Retention.String()
+		}
+	}
+	tableWriter := newTableWriter(writer)
+	header := table.Row{"Retention"}
+	row := table.Row{value}
+	if includeDeleted {
+		header = append(header, "Expired Events Deleted")
+		row = append(row, response.DeletedEvents)
+	}
+	tableWriter.AppendHeader(header)
+	tableWriter.AppendRow(row)
+	tableWriter.Render()
+	return nil
 }
 
 func newEngineCommand() *cobra.Command {

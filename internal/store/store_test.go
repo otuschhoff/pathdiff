@@ -241,6 +241,70 @@ func TestResetEventsPreservesVolumeMappings(t *testing.T) {
 	}
 }
 
+func TestRetentionPersistsAndDeletesBothIndexes(t *testing.T) {
+	path := t.TempDir()
+	db, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Date(2026, 8, 30, 12, 0, 0, 0, time.UTC)
+	if _, enabled, err := db.Retention(); err != nil || enabled {
+		t.Fatalf("default retention = enabled %t, err %v", enabled, err)
+	}
+	if err := db.SetRetention(24 * time.Hour); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.SetVolumeName("10", "home"); err != nil {
+		t.Fatal(err)
+	}
+	for _, event := range []Event{
+		{Path: "/old/file", Operation: "write", Timestamp: now.Add(-25 * time.Hour), VolumeMSID: "10"},
+		{Path: "/cutoff/file", Operation: "write", Timestamp: now.Add(-24 * time.Hour), VolumeMSID: "10"},
+		{Path: "/recent/file", Operation: "write", Timestamp: now.Add(-time.Hour), VolumeMSID: "10"},
+	} {
+		if err := db.Store(event); err != nil {
+			t.Fatal(err)
+		}
+	}
+	deleted, err := db.ApplyRetention(now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if deleted != 1 {
+		t.Fatalf("ApplyRetention() deleted %d events, want 1", deleted)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	db, err = Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = db.Close() })
+	retention, enabled, err := db.Retention()
+	if err != nil || !enabled || retention != 24*time.Hour {
+		t.Fatalf("persisted retention = %s, enabled %t, err %v", retention, enabled, err)
+	}
+	events, err := db.EventsSince(now.Add(-24 * time.Hour))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(events) != 2 || events[0].Path != "/cutoff/file" || events[1].Path != "/recent/file" {
+		t.Fatalf("time index after retention = %#v", events)
+	}
+	events, err = db.EventsByPath("/old", time.Time{}, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(events) != 0 {
+		t.Fatalf("path index retained expired events: %#v", events)
+	}
+	mappings, err := db.ListVolumeMappings()
+	if err != nil || len(mappings) != 1 || mappings[0].Name != "home" {
+		t.Fatalf("volume mappings after retention = %#v, err %v", mappings, err)
+	}
+}
+
 func TestStats(t *testing.T) {
 	path := t.TempDir()
 	db, err := Open(path)

@@ -10,7 +10,9 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/cockroachdb/pebble"
@@ -29,9 +31,12 @@ type Event struct {
 }
 
 type DB struct {
-	db   *pebble.DB
-	path string
+	db        *pebble.DB
+	path      string
+	cleanupMu sync.Mutex
 }
+
+var retentionKey = []byte("c:retention")
 
 func Open(path string) (*DB, error) {
 	db, err := pebble.Open(path, &pebble.Options{
@@ -133,6 +138,92 @@ func (d *DB) ResetEvents() error {
 		return err
 	}
 	return batch.Commit(pebble.NoSync)
+}
+
+func (d *DB) Retention() (time.Duration, bool, error) {
+	value, closer, err := d.db.Get(retentionKey)
+	if errors.Is(err, pebble.ErrNotFound) {
+		return 0, false, nil
+	}
+	if err != nil {
+		return 0, false, fmt.Errorf("read retention policy: %w", err)
+	}
+	defer closer.Close()
+	nanoseconds, err := strconv.ParseInt(string(value), 10, 64)
+	if err != nil || nanoseconds <= 0 {
+		return 0, false, fmt.Errorf("invalid persisted retention policy %q", value)
+	}
+	return time.Duration(nanoseconds), true, nil
+}
+
+func (d *DB) SetRetention(retention time.Duration) error {
+	if retention <= 0 {
+		return errors.New("retention duration must be greater than zero")
+	}
+	return d.db.Set(retentionKey, []byte(strconv.FormatInt(int64(retention), 10)), pebble.Sync)
+}
+
+func (d *DB) ApplyRetention(now time.Time) (uint64, error) {
+	retention, enabled, err := d.Retention()
+	if err != nil || !enabled {
+		return 0, err
+	}
+	return d.DeleteEventsBefore(now.Add(-retention))
+}
+
+func (d *DB) DeleteEventsBefore(cutoff time.Time) (uint64, error) {
+	d.cleanupMu.Lock()
+	defer d.cleanupMu.Unlock()
+	upperBound := append([]byte("t:"), timeBytes(cutoff)...)
+	iter, err := d.db.NewIter(&pebble.IterOptions{LowerBound: []byte("t:"), UpperBound: upperBound})
+	if err != nil {
+		return 0, err
+	}
+	defer iter.Close()
+	batch := d.db.NewBatch()
+	defer func() { _ = batch.Close() }()
+	var deleted uint64
+	pending := 0
+	flush := func() error {
+		if pending == 0 {
+			return nil
+		}
+		if err := batch.Commit(pebble.NoSync); err != nil {
+			return err
+		}
+		if err := batch.Close(); err != nil {
+			return err
+		}
+		batch = d.db.NewBatch()
+		pending = 0
+		return nil
+	}
+	for iter.First(); iter.Valid(); iter.Next() {
+		var event Event
+		if err := json.Unmarshal(iter.Value(), &event); err != nil {
+			return deleted, fmt.Errorf("decode expired event: %w", err)
+		}
+		if err := batch.Delete(iter.Key(), pebble.NoSync); err != nil {
+			return deleted, err
+		}
+		if err := batch.Delete(pathKey(event.Path, event.Timestamp, event.Operation, event.VolumeMSID), pebble.NoSync); err != nil {
+			return deleted, err
+		}
+		deleted++
+		pending++
+		if pending == 10000 {
+			if err := flush(); err != nil {
+				return deleted, err
+			}
+		}
+	}
+	if err := iter.Error(); err != nil {
+		return deleted, err
+	}
+	if err := flush(); err != nil {
+		return deleted, err
+	}
+	return deleted, nil
 }
 
 func (d *DB) EventCount() (uint64, error) {
