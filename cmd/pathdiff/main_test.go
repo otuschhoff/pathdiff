@@ -5,6 +5,7 @@ import (
 	"crypto/ed25519"
 	"crypto/rand"
 	"crypto/x509"
+	"encoding/json"
 	"encoding/pem"
 	"net"
 	"os"
@@ -257,18 +258,45 @@ func TestServiceFormatting(t *testing.T) {
 func TestPrintMonitorEvents(t *testing.T) {
 	events := []store.Event{{Path: "/vol/finance/report.csv", Operation: "write", Timestamp: time.Date(2026, 8, 30, 12, 0, 0, 0, time.UTC), VolumeName: "finance", SVMName: "ncl1-1-vs-50", NodeID: "node-1", LIFIPv4: "192.0.2.10"}}
 	var output bytes.Buffer
-	if err := printMonitorEvents(&output, events, monitorOptions{ShowNode: true, ShowLIF: true}); err != nil {
+	if err := printMonitorEvents(&output, events, monitorOptions{ShowNode: true, ShowLIF: true, ShowOperation: true}); err != nil {
 		t.Fatal(err)
 	}
 	if got := output.String(); !strings.Contains(got, "VOLUME") || !strings.Contains(got, "SVM") || !strings.Contains(got, "NODE") || !strings.Contains(got, "LIF") || !strings.Contains(got, "finance") || !strings.Contains(got, "192.0.2.10") {
 		t.Fatalf("unexpected monitor output: %s", got)
 	}
 	output.Reset()
-	if err := printMonitorEvents(&output, events, monitorOptions{HideTimestamp: true, HideOperation: true, HideVolume: true, HideSVM: true}); err != nil {
+	if err := printMonitorEvents(&output, events, monitorOptions{HideTimestamp: true, HideVolume: true, HideSVM: true}); err != nil {
 		t.Fatal(err)
 	}
 	if got := output.String(); strings.Contains(got, "TIMESTAMP") || strings.Contains(got, "OPERATION") || strings.Contains(got, "VOLUME") || strings.Contains(got, "SVM") || !strings.Contains(got, "PATH") {
 		t.Fatalf("unexpected hidden monitor output: %s", got)
+	}
+}
+
+func TestNewestMonitorEventsByPath(t *testing.T) {
+	base := time.Date(2026, 8, 30, 12, 0, 0, 0, time.UTC)
+	events := newestMonitorEventsByPath([]store.Event{{Path: "/one", Operation: "create", Timestamp: base}, {Path: "/one", Operation: "write", Timestamp: base.Add(time.Second)}, {Path: "/two", Timestamp: base}})
+	if len(events) != 2 || events[1].Path != "/one" || events[1].Operation != "write" {
+		t.Fatalf("newest monitor events = %#v", events)
+	}
+}
+
+func TestResolveMonitorEvent(t *testing.T) {
+	event := store.Event{VolumeMSID: "2163258291"}
+	resolveMonitorEvent(&event, map[string]monitorVolume{"2163258291": {Name: "home", SVM: "ncl1-1-vs-50"}})
+	if event.VolumeName != "home" || event.SVMName != "ncl1-1-vs-50" {
+		t.Fatalf("resolved event = %#v", event)
+	}
+}
+
+func TestMonitorJSONOutput(t *testing.T) {
+	event := store.Event{Path: "/vol/finance/report.csv", VolumeName: "finance", SVMName: "ncl1-1-vs-50"}
+	var output bytes.Buffer
+	if err := json.NewEncoder(&output).Encode(event); err != nil {
+		t.Fatal(err)
+	}
+	if got := output.String(); !strings.Contains(got, `"volume_name":"finance"`) || !strings.Contains(got, `"svm_name":"ncl1-1-vs-50"`) {
+		t.Fatalf("unexpected monitor JSON: %s", got)
 	}
 }
 
@@ -321,6 +349,15 @@ func TestEngineStatusFormatting(t *testing.T) {
 	}
 	if got := formatLastSeen(time.Time{}); got != text.FgYellow.Sprint("never") {
 		t.Fatalf("formatLastSeen(zero) = %q", got)
+	}
+}
+
+func TestFormatMetricGraphCell(t *testing.T) {
+	if got := formatMetricGraphCell(5, 10, 6); !strings.Contains(got, "▄▄▄") || !strings.HasSuffix(got, "   ") {
+		t.Fatalf("metric graph = %q", got)
+	}
+	if got := formatMetricGraphCell(0, 10, 6); got != "      " {
+		t.Fatalf("zero metric graph = %q", got)
 	}
 }
 

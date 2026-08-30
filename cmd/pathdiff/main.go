@@ -12,6 +12,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"net"
 	"os"
 	"os/exec"
@@ -2255,6 +2256,12 @@ func generateCDOTKey(keyFile string) error {
 
 func printEngines(writer io.Writer, engines []engineInfo) error {
 	sort.Slice(engines, func(left, right int) bool { return engines[left].LIFIPv4 < engines[right].LIFIPv4 })
+	maxRate := 0.0
+	for _, engine := range engines {
+		if engine.AverageRate > maxRate {
+			maxRate = engine.AverageRate
+		}
+	}
 	tableWriter := newTableWriter(writer)
 	tableWriter.SetColumnConfigs([]table.ColumnConfig{
 		{Name: "Port", Align: text.AlignRight, AlignHeader: text.AlignRight},
@@ -2262,7 +2269,7 @@ func printEngines(writer io.Writer, engines []engineInfo) error {
 		{Name: "Avg Event/s", Align: text.AlignRight, AlignHeader: text.AlignRight},
 		{Name: "Total Events", Align: text.AlignRight, AlignHeader: text.AlignRight},
 	})
-	tableWriter.AppendHeader(table.Row{"SVM", "Node", "LIF", "Port", "State", "Last Seen", "Since", "Avg Event/s", "Total Events"})
+	tableWriter.AppendHeader(table.Row{"SVM", "Node", "LIF", "Port", "State", "Last Seen", "Since", "Avg Event/s", "Graph", "Total Events"})
 	for _, engine := range engines {
 		engine.LIFHostname = shortHostname(resolveHostname(engine.LIFIPv4))
 		node, svm := engine.NodeName, engine.SVMName
@@ -2272,10 +2279,34 @@ func printEngines(writer io.Writer, engines []engineInfo) error {
 		if svm == "" {
 			svm = engine.SVMID
 		}
-		tableWriter.AppendRow(table.Row{svm, node, engine.LIFHostname, engine.LocalPort, formatFPolicyState(engine.FPolicy), formatLastSeen(engine.LastSeen), engine.Since.UTC().Format(time.RFC3339), fmt.Sprintf("%.2f", engine.AverageRate), formatEventCount(engine.TotalEvents)})
+		tableWriter.AppendRow(table.Row{svm, node, engine.LIFHostname, engine.LocalPort, formatFPolicyState(engine.FPolicy), formatLastSeen(engine.LastSeen), engine.Since.UTC().Format(time.RFC3339), fmt.Sprintf("%.2f", engine.AverageRate), formatMetricGraphCell(engine.AverageRate, maxRate, 6), formatEventCount(engine.TotalEvents)})
 	}
 	tableWriter.Render()
 	return nil
+}
+
+func formatMetricGraphCell(value, maxValue float64, width int) string {
+	if width <= 0 {
+		return ""
+	}
+	if value <= 0 || maxValue <= 0 {
+		return strings.Repeat(" ", width)
+	}
+	filled := int(math.Round(value * float64(width) / maxValue))
+	if filled < 1 {
+		filled = 1
+	}
+	if filled > width {
+		filled = width
+	}
+	shade := 238
+	if maxValue > 1 {
+		shade = 238 + int(math.Round((value-1)*17.0/(maxValue-1)))
+	}
+	if shade > 255 {
+		shade = 255
+	}
+	return fmt.Sprintf("\033[38;5;%dm%s\033[0m", shade, strings.Repeat("▄", filled)) + strings.Repeat(" ", width-filled)
 }
 
 func formatLastSeen(lastSeen time.Time) string {
@@ -3235,7 +3266,7 @@ func normalizePathSearch(search string) string {
 func newMonitorCommand() *cobra.Command {
 	var controlPath, sinceValue, path string
 	var interval time.Duration
-	var showNode, showLIF, hideOperation, hideTimestamp, hideSVM, hideVolume bool
+	var showNode, showLIF, showOperation, hideTimestamp, hideSVM, hideVolume, jsonOutput bool
 	command := &cobra.Command{Use: "monitor", Short: "Print newly observed path changes", RunE: func(command *cobra.Command, _ []string) error {
 		if interval <= 0 {
 			return errors.New("interval must be greater than zero")
@@ -3250,6 +3281,10 @@ func newMonitorCommand() *cobra.Command {
 		}
 		context, cancel := signal.NotifyContext(command.Context(), os.Interrupt, syscall.SIGTERM)
 		defer cancel()
+		volumes, err := queryMonitorVolumes()
+		if err != nil {
+			return err
+		}
 		ticker := time.NewTicker(interval)
 		defer ticker.Stop()
 		seen := make(map[string]struct{})
@@ -3272,11 +3307,20 @@ func newMonitorCommand() *cobra.Command {
 					continue
 				}
 				seen[key] = struct{}{}
+				resolveMonitorEvent(&event, volumes)
 				events = append(events, event)
 			}
 			if len(events) > 0 {
-				if err := printMonitorEvents(command.OutOrStdout(), events, monitorOptions{ShowNode: showNode, ShowLIF: showLIF, HideOperation: hideOperation, HideTimestamp: hideTimestamp, HideSVM: hideSVM, HideVolume: hideVolume}); err != nil {
-					return err
+				if jsonOutput {
+					for _, event := range events {
+						if err := json.NewEncoder(command.OutOrStdout()).Encode(event); err != nil {
+							return err
+						}
+					}
+				} else {
+					if err := printMonitorEvents(command.OutOrStdout(), newestMonitorEventsByPath(events), monitorOptions{ShowNode: showNode, ShowLIF: showLIF, ShowOperation: showOperation, HideTimestamp: hideTimestamp, HideSVM: hideSVM, HideVolume: hideVolume}); err != nil {
+						return err
+					}
 				}
 			}
 			select {
@@ -3292,16 +3336,79 @@ func newMonitorCommand() *cobra.Command {
 	command.Flags().DurationVar(&interval, "interval", time.Second, "poll interval")
 	command.Flags().BoolVar(&showNode, "show-node", false, "include the ONTAP node ID")
 	command.Flags().BoolVar(&showLIF, "show-lif", false, "include the sender LIF IPv4")
-	command.Flags().BoolVar(&hideOperation, "hide-op", false, "hide the operation column")
+	command.Flags().BoolVar(&showOperation, "show-op", false, "include the operation column")
 	command.Flags().BoolVar(&hideTimestamp, "hide-timestamp", false, "hide the timestamp column")
 	command.Flags().BoolVar(&hideSVM, "hide-svm", false, "hide the SVM column")
 	command.Flags().BoolVar(&hideVolume, "hide-volume", false, "hide the volume column")
+	command.Flags().BoolVar(&jsonOutput, "json", false, "output resolved events as JSON lines")
 	return command
 }
 
+type monitorVolume struct {
+	Name string
+	SVM  string
+}
+
+func queryMonitorVolumes() (map[string]monitorVolume, error) {
+	host := defaultCDOTCluster()
+	if host == "" {
+		return nil, errors.New("cDOT host is required to resolve monitor volume and SVM names")
+	}
+	keyFile, err := cdotKeyFile("")
+	if err != nil {
+		return nil, err
+	}
+	knownHostsFile, err := cdotKnownHostsFile()
+	if err != nil {
+		return nil, err
+	}
+	client, err := openCDOTClient(host, "pathdiff", keyFile, knownHostsFile, false)
+	if err != nil {
+		return nil, err
+	}
+	defer client.Close()
+	output, err := runSSHCommand(client, "volume show -fields vserver,volume,msid", nil)
+	if err != nil {
+		return nil, fmt.Errorf("query cDOT volumes for monitor: %w: %s", err, strings.TrimSpace(string(output)))
+	}
+	volumes := make(map[string]monitorVolume)
+	for _, mapping := range parseONTAPVolumeTable(string(output)) {
+		volumes[mapping.ID] = monitorVolume{Name: mapping.Name, SVM: mapping.Vserver}
+	}
+	return volumes, nil
+}
+
+func resolveMonitorEvent(event *store.Event, volumes map[string]monitorVolume) {
+	volume, found := volumes[event.VolumeMSID]
+	if !found {
+		return
+	}
+	if event.VolumeName == "" {
+		event.VolumeName = volume.Name
+	}
+	if event.SVMName == "" {
+		event.SVMName = volume.SVM
+	}
+}
+
 type monitorOptions struct {
-	ShowNode, ShowLIF                                 bool
-	HideOperation, HideTimestamp, HideSVM, HideVolume bool
+	ShowNode, ShowLIF, ShowOperation   bool
+	HideTimestamp, HideSVM, HideVolume bool
+}
+
+func newestMonitorEventsByPath(events []store.Event) []store.Event {
+	newest := make(map[string]store.Event)
+	for _, event := range events {
+		if current, found := newest[event.Path]; !found || event.Timestamp.After(current.Timestamp) {
+			newest[event.Path] = event
+		}
+	}
+	grouped := make([]store.Event, 0, len(newest))
+	for _, event := range newest {
+		grouped = append(grouped, event)
+	}
+	sort.Slice(grouped, func(left, right int) bool { return grouped[left].Timestamp.Before(grouped[right].Timestamp) })
+	return grouped
 }
 
 func printMonitorEvents(writer io.Writer, events []store.Event, options monitorOptions) error {
@@ -3310,14 +3417,14 @@ func printMonitorEvents(writer io.Writer, events []store.Event, options monitorO
 	if !options.HideTimestamp {
 		header = append(header, "Timestamp")
 	}
-	if !options.HideOperation {
+	if options.ShowOperation {
 		header = append(header, "Operation")
-	}
-	if !options.HideVolume {
-		header = append(header, "Volume")
 	}
 	if !options.HideSVM {
 		header = append(header, "SVM")
+	}
+	if !options.HideVolume {
+		header = append(header, "Volume")
 	}
 	if options.ShowNode {
 		header = append(header, "Node")
@@ -3332,14 +3439,14 @@ func printMonitorEvents(writer io.Writer, events []store.Event, options monitorO
 		if !options.HideTimestamp {
 			row = append(row, event.Timestamp.UTC().Format(time.RFC3339Nano))
 		}
-		if !options.HideOperation {
+		if options.ShowOperation {
 			row = append(row, event.Operation)
-		}
-		if !options.HideVolume {
-			row = append(row, eventVolume(event))
 		}
 		if !options.HideSVM {
 			row = append(row, eventSVM(event))
+		}
+		if !options.HideVolume {
+			row = append(row, eventVolume(event))
 		}
 		if options.ShowNode {
 			row = append(row, event.NodeID)
