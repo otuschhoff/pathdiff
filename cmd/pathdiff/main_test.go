@@ -647,6 +647,13 @@ func TestFPolicyClientLIFs(t *testing.T) {
 	}
 }
 
+func TestFPolicyReachabilityError(t *testing.T) {
+	err := &fpolicyReachabilityError{LIF: fpolicyLIF{Name: "data", Address: "192.0.2.10", SVM: "finance", Node: "node-1"}, Reason: "receiver-to-LIF ping also failed, so this LIF is likely on an isolated private network"}
+	if got := err.Error(); !strings.Contains(got, "lif=data addr=192.0.2.10 svm=finance node=node-1") || !strings.Contains(got, "isolated private network") {
+		t.Fatalf("reachability error = %q", got)
+	}
+}
+
 func TestFPolicyPingSucceeded(t *testing.T) {
 	if !fpolicyPingSucceeded([]byte("1 packets sent, 1 packets were received")) {
 		t.Fatal("successful ping was not recognized")
