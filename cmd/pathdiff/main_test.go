@@ -226,21 +226,30 @@ func TestPrintPathsLimitsCoalescedResults(t *testing.T) {
 	}
 }
 
-func TestPrintParentPathsCoalescesDirectories(t *testing.T) {
+func TestPrintParentSummaries(t *testing.T) {
 	base := time.Date(2026, 8, 29, 12, 0, 0, 0, time.UTC)
-	events := []store.Event{
-		{Path: "/vol/alpha/a.txt", Timestamp: base, VolumeName: "one"},
-		{Path: "/vol/alpha/b.txt", Timestamp: base.Add(time.Minute), VolumeName: "one"},
-		{Path: "/vol/alpha/a.txt", Timestamp: base.Add(2 * time.Minute), VolumeName: "one"},
-		{Path: "/vol/beta/c.txt", Timestamp: base, VolumeName: "one"},
+	summaries := []store.ParentSummary{
+		{Path: "/vol/alpha", Timestamp: base.Add(2 * time.Minute), ChildCount: 2, VolumeName: "one", SVMName: "svm-one"},
+		{Path: "/vol/beta", Timestamp: base, ChildCount: 1, VolumeName: "one", SVMName: "svm-one"},
 	}
 	var output bytes.Buffer
-	if err := printParentPaths(&output, events, "*", 100, "path"); err != nil {
+	if err := printParentSummaries(&output, summaries, 100, "path"); err != nil {
 		t.Fatal(err)
 	}
 	got := output.String()
-	if strings.Count(got, "/vol/alpha") != 1 || strings.Count(got, "/vol/beta") != 1 || !strings.Contains(got, "2026-08-29T12:02:00Z") || !strings.Contains(got, "CNT") {
-		t.Fatalf("parent paths were not coalesced to latest changes: %s", got)
+	if strings.Count(got, "/vol/alpha") != 1 || strings.Count(got, "/vol/beta") != 1 || !strings.Contains(got, "2026-08-29T12:02:00Z") || !strings.Contains(got, "svm-one") || !strings.Contains(got, "one") || !strings.Contains(got, "CNT") {
+		t.Fatalf("unexpected parent summaries: %s", got)
+	}
+}
+
+func TestResolveParentSummaries(t *testing.T) {
+	summaries := []store.ParentSummary{{VolumeMSID: "2163258291", SVMID: "svm-id"}}
+	if !parentSummariesNeedResolution(summaries) {
+		t.Fatal("unresolved parent summary was not detected")
+	}
+	resolveParentSummaries(summaries, map[string]monitorVolume{"2163258291": {Name: "asic_user", SVM: "ncl1-1-vs-50"}})
+	if summaries[0].VolumeName != "asic_user" || summaries[0].SVMName != "ncl1-1-vs-50" || parentSummariesNeedResolution(summaries) {
+		t.Fatalf("parent summary was not resolved: %#v", summaries[0])
 	}
 }
 

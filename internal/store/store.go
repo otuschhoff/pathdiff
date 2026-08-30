@@ -9,6 +9,8 @@ import (
 	"math"
 	"os"
 	"path/filepath"
+	"regexp"
+	"strings"
 	"time"
 
 	"github.com/cockroachdb/pebble"
@@ -156,6 +158,16 @@ type Mapping struct {
 	Name string
 }
 
+type ParentSummary struct {
+	Path       string    `json:"path"`
+	Timestamp  time.Time `json:"timestamp"`
+	ChildCount uint64    `json:"child_count"`
+	VolumeMSID string    `json:"volume_msid,omitempty"`
+	VolumeName string    `json:"volume_name,omitempty"`
+	SVMID      string    `json:"svm_id,omitempty"`
+	SVMName    string    `json:"svm_name,omitempty"`
+}
+
 func (d *DB) Stats() (Stats, error) {
 	var size uint64
 	err := filepath.Walk(d.path, func(_ string, info os.FileInfo, err error) error {
@@ -185,6 +197,39 @@ func (d *DB) SetSVMName(id, name string) error {
 		return fmt.Errorf("SVM name is required")
 	}
 	return d.db.Set(append([]byte("s:"), id...), []byte(name), pebble.NoSync)
+}
+
+func (d *DB) SetVolumeSVMName(msid, name string) error {
+	if msid == "" {
+		return fmt.Errorf("volume MSID is required")
+	}
+	if name == "" {
+		return fmt.Errorf("SVM name is required")
+	}
+	return d.db.Set(append([]byte("w:"), msid...), []byte(name), pebble.NoSync)
+}
+
+func (d *DB) CacheParentMappings(summaries []ParentSummary) error {
+	batch := d.db.NewBatch()
+	defer batch.Close()
+	for _, summary := range summaries {
+		if summary.VolumeMSID != "" && summary.VolumeName != "" {
+			if err := batch.Set(append([]byte("v:"), summary.VolumeMSID...), []byte(summary.VolumeName), pebble.NoSync); err != nil {
+				return err
+			}
+		}
+		if summary.VolumeMSID != "" && summary.SVMName != "" {
+			if err := batch.Set(append([]byte("w:"), summary.VolumeMSID...), []byte(summary.SVMName), pebble.NoSync); err != nil {
+				return err
+			}
+		}
+		if summary.SVMID != "" && summary.SVMName != "" {
+			if err := batch.Set(append([]byte("s:"), summary.SVMID...), []byte(summary.SVMName), pebble.NoSync); err != nil {
+				return err
+			}
+		}
+	}
+	return batch.Commit(pebble.NoSync)
 }
 
 func (d *DB) MarkFPolicyLIFUnreachable(svm, lif, address string) error {
@@ -281,6 +326,174 @@ func (d *DB) EventsByPath(path string, start, end time.Time) ([]Event, error) {
 		events = append(events, event)
 	}
 	return events, iter.Error()
+}
+
+func (d *DB) ParentSummariesByPath(path, wildcard string, start, end time.Time) ([]ParentSummary, error) {
+	matcher, err := compilePathWildcard(wildcard)
+	if err != nil {
+		return nil, err
+	}
+	volumeNames, err := d.mappingNames("v:")
+	if err != nil {
+		return nil, err
+	}
+	svmNames, err := d.mappingNames("s:")
+	if err != nil {
+		return nil, err
+	}
+	volumeSVMNames, err := d.mappingNames("w:")
+	if err != nil {
+		return nil, err
+	}
+	prefix := pathPrefix(path)
+	iter, err := d.db.NewIter(&pebble.IterOptions{LowerBound: prefix, UpperBound: prefixEnd(prefix)})
+	if err != nil {
+		return nil, err
+	}
+	defer iter.Close()
+
+	type parentKey struct {
+		path, volumeMSID string
+	}
+	parents := make(map[parentKey]*ParentSummary)
+	svmIDsByVolume := make(map[string]string)
+	seenForChild := make(map[parentKey]struct{})
+	var previousChild, previousVolume []byte
+	parent := ""
+	matched := false
+	volumeMSID := ""
+	for iter.First(); iter.Valid() && bytes.HasPrefix(iter.Key(), prefix); iter.Next() {
+		childPath, timestamp, volumeID, err := decodePathIndexKey(iter.Key())
+		if err != nil {
+			return nil, err
+		}
+		if timestamp.Before(start) || timestamp.After(end) {
+			continue
+		}
+		if !bytes.Equal(childPath, previousChild) {
+			previousChild = append(previousChild[:0], childPath...)
+			previousVolume = previousVolume[:0]
+			parent = filepath.Dir(string(childPath))
+			matched = matcher.MatchString(parent)
+			clear(seenForChild)
+		}
+		if !matched {
+			continue
+		}
+		if !bytes.Equal(volumeID, previousVolume) {
+			previousVolume = append(previousVolume[:0], volumeID...)
+			volumeMSID = string(volumeID)
+		}
+		key := parentKey{path: parent, volumeMSID: volumeMSID}
+		svmID := svmIDsByVolume[volumeMSID]
+		if svmID == "" {
+			if encoded := eventJSONString(iter.Value(), []byte(`"svm_id":"`)); len(encoded) > 0 {
+				svmID = string(encoded)
+				svmIDsByVolume[volumeMSID] = svmID
+			}
+		}
+		summary := parents[key]
+		if summary == nil {
+			svmName := svmNames[svmID]
+			if svmName == "" {
+				svmName = volumeSVMNames[volumeMSID]
+			}
+			summary = &ParentSummary{Path: parent, VolumeMSID: volumeMSID, VolumeName: volumeNames[volumeMSID], SVMID: svmID, SVMName: svmName}
+			parents[key] = summary
+		} else if summary.SVMID == "" && svmID != "" {
+			summary.SVMID = svmID
+			if name := svmNames[svmID]; name != "" {
+				summary.SVMName = name
+			}
+		}
+		if timestamp.After(summary.Timestamp) {
+			summary.Timestamp = timestamp
+		}
+		if _, seen := seenForChild[key]; !seen {
+			summary.ChildCount++
+			seenForChild[key] = struct{}{}
+		}
+	}
+	if err := iter.Error(); err != nil {
+		return nil, err
+	}
+	summaries := make([]ParentSummary, 0, len(parents))
+	cacheNeeded := false
+	for _, summary := range parents {
+		summaries = append(summaries, *summary)
+		if summary.SVMID != "" && summary.SVMName != "" && svmNames[summary.SVMID] == "" {
+			cacheNeeded = true
+		}
+	}
+	if cacheNeeded {
+		if err := d.CacheParentMappings(summaries); err != nil {
+			return nil, err
+		}
+	}
+	return summaries, nil
+}
+
+func eventJSONString(data, prefix []byte) []byte {
+	start := bytes.Index(data, prefix)
+	if start < 0 {
+		return nil
+	}
+	start += len(prefix)
+	end := bytes.IndexByte(data[start:], '"')
+	if end < 0 {
+		return nil
+	}
+	return data[start : start+end]
+}
+
+func decodePathIndexKey(key []byte) ([]byte, time.Time, []byte, error) {
+	if len(key) < 14 || !bytes.HasPrefix(key, []byte("p:")) {
+		return nil, time.Time{}, nil, fmt.Errorf("invalid path index key")
+	}
+	volumeSeparator := bytes.LastIndexByte(key, ':')
+	if volumeSeparator < 0 {
+		return nil, time.Time{}, nil, fmt.Errorf("invalid path index key")
+	}
+	operationSeparator := bytes.LastIndexByte(key[:volumeSeparator], ':')
+	pathSeparator := operationSeparator - 9
+	if operationSeparator < 0 || pathSeparator < 2 || key[pathSeparator] != ':' {
+		return nil, time.Time{}, nil, fmt.Errorf("invalid path index key")
+	}
+	timestamp := time.UnixMicro(int64(binary.BigEndian.Uint64(key[pathSeparator+1 : operationSeparator]))).UTC()
+	return key[2:pathSeparator], timestamp, key[volumeSeparator+1:], nil
+}
+
+func compilePathWildcard(pattern string) (*regexp.Regexp, error) {
+	var expression strings.Builder
+	expression.WriteString("(?i)^")
+	for _, character := range pattern {
+		switch character {
+		case '*':
+			expression.WriteString(".*")
+		case '?':
+			expression.WriteByte('.')
+		default:
+			expression.WriteString(regexp.QuoteMeta(string(character)))
+		}
+	}
+	expression.WriteString("$")
+	matcher, err := regexp.Compile(expression.String())
+	if err != nil {
+		return nil, fmt.Errorf("invalid path wildcard %q: %w", pattern, err)
+	}
+	return matcher, nil
+}
+
+func (d *DB) mappingNames(prefix string) (map[string]string, error) {
+	mappings, err := d.listMappings(prefix)
+	if err != nil {
+		return nil, err
+	}
+	names := make(map[string]string, len(mappings))
+	for _, mapping := range mappings {
+		names[mapping.ID] = mapping.Name
+	}
+	return names, nil
 }
 
 func (d *DB) resolveVolumeName(event *Event) error {

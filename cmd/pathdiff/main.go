@@ -54,29 +54,32 @@ var (
 )
 
 type controlRequest struct {
-	Command    string    `json:"command"`
-	Since      time.Time `json:"since,omitempty"`
-	Path       string    `json:"path,omitempty"`
-	Start      time.Time `json:"start,omitempty"`
-	End        time.Time `json:"end,omitempty"`
-	VolumeMSID string    `json:"volume_msid,omitempty"`
-	VolumeName string    `json:"volume_name,omitempty"`
-	SVMID      string    `json:"svm_id,omitempty"`
-	SVMName    string    `json:"svm_name,omitempty"`
+	Command    string                `json:"command"`
+	Search     string                `json:"search,omitempty"`
+	Parents    []store.ParentSummary `json:"parents,omitempty"`
+	Since      time.Time             `json:"since,omitempty"`
+	Path       string                `json:"path,omitempty"`
+	Start      time.Time             `json:"start,omitempty"`
+	End        time.Time             `json:"end,omitempty"`
+	VolumeMSID string                `json:"volume_msid,omitempty"`
+	VolumeName string                `json:"volume_name,omitempty"`
+	SVMID      string                `json:"svm_id,omitempty"`
+	SVMName    string                `json:"svm_name,omitempty"`
 }
 
 type controlResponse struct {
-	Error         string          `json:"error,omitempty"`
-	Status        string          `json:"status,omitempty"`
-	Connections   int             `json:"connections,omitempty"`
-	EventCount    uint64          `json:"event_count,omitempty"`
-	RequestRate   float64         `json:"request_rate,omitempty"`
-	DBPath        string          `json:"db_path,omitempty"`
-	DBSize        uint64          `json:"db_size,omitempty"`
-	Events        []store.Event   `json:"events,omitempty"`
-	Engines       []engineInfo    `json:"engines,omitempty"`
-	Mappings      []store.Mapping `json:"mappings,omitempty"`
-	ListenerPorts []listenerPort  `json:"listener_ports,omitempty"`
+	Error         string                `json:"error,omitempty"`
+	Status        string                `json:"status,omitempty"`
+	Connections   int                   `json:"connections,omitempty"`
+	EventCount    uint64                `json:"event_count,omitempty"`
+	RequestRate   float64               `json:"request_rate,omitempty"`
+	DBPath        string                `json:"db_path,omitempty"`
+	DBSize        uint64                `json:"db_size,omitempty"`
+	Events        []store.Event         `json:"events,omitempty"`
+	Parents       []store.ParentSummary `json:"parents,omitempty"`
+	Engines       []engineInfo          `json:"engines,omitempty"`
+	Mappings      []store.Mapping       `json:"mappings,omitempty"`
+	ListenerPorts []listenerPort        `json:"listener_ports,omitempty"`
 }
 
 type listenerPort struct {
@@ -988,6 +991,8 @@ func handleControl(connection net.Conn, db *store.DB, stop context.CancelFunc, t
 			stop()
 		case "events":
 			response.Events, err = db.EventsByPath(request.Path, request.Start, request.End)
+		case "path-parents":
+			response.Parents, err = db.ParentSummariesByPath(request.Path, request.Search, request.Start, request.End)
 		case "recent":
 			response.Events, err = db.EventsSince(request.Since)
 		case "volume-set":
@@ -999,6 +1004,16 @@ func handleControl(connection net.Conn, db *store.DB, stop context.CancelFunc, t
 			response.Mappings, err = db.ListVolumeMappings()
 		case "svm-set":
 			err = db.SetSVMName(request.SVMID, request.SVMName)
+			if err == nil {
+				response.Status = "updated"
+			}
+		case "volume-svm-set":
+			err = db.SetVolumeSVMName(request.VolumeMSID, request.SVMName)
+			if err == nil {
+				response.Status = "updated"
+			}
+		case "parent-mappings-set":
+			err = db.CacheParentMappings(request.Parents)
 			if err == nil {
 				response.Status = "updated"
 			}
@@ -3331,7 +3346,40 @@ func newPathListCommand() *cobra.Command {
 }
 
 func newPathParentCommand() *cobra.Command {
-	return newPathQueryCommand("parent [path-search]", "List parent directories changed during a time range", printParentPaths)
+	var controlPath, pathPrefix, startValue, endValue, sortBy string
+	var maxResults int
+	command := &cobra.Command{Use: "parent [path-search]", Args: cobra.MaximumNArgs(1), Short: "List parent directories changed during a time range", RunE: func(command *cobra.Command, arguments []string) error {
+		start, end, err := eventRange(startValue, endValue, time.Now().UTC())
+		if err != nil {
+			return err
+		}
+		search := "*"
+		if len(arguments) == 1 {
+			search = normalizePathSearch(arguments[0])
+		}
+		response, err := callControl(controlPath, controlRequest{Command: "path-parents", Search: search, Path: pathPrefix, Start: start, End: end})
+		if err != nil {
+			return err
+		}
+		if parentSummariesNeedResolution(response.Parents) {
+			volumes, err := queryMonitorVolumes()
+			if err != nil {
+				return err
+			}
+			resolveParentSummaries(response.Parents, volumes)
+			if err := cacheParentSummaryNames(controlPath, response.Parents); err != nil {
+				return err
+			}
+		}
+		return printParentSummaries(command.OutOrStdout(), response.Parents, maxResults, sortBy)
+	}}
+	command.Flags().StringVar(&controlPath, "control", defaultControl, "Unix control socket")
+	command.Flags().StringVar(&pathPrefix, "path", "", "path prefix")
+	command.Flags().StringVar(&startValue, "start", "", "inclusive time; RFC3339, YYYY-MM-DD, or relative duration (default 24h ago)")
+	command.Flags().StringVar(&endValue, "end", "", "inclusive time; RFC3339, YYYY-MM-DD, or relative duration (default now)")
+	command.Flags().IntVar(&maxResults, "max", 100, "maximum paths to display")
+	command.Flags().StringVar(&sortBy, "sort", "path", "sort by path or timestamp")
+	return command
 }
 
 func newPathQueryCommand(use, summary string, render func(io.Writer, []store.Event, string, int, string) error) *cobra.Command {
@@ -3380,67 +3428,82 @@ func printPaths(writer io.Writer, events []store.Event, wildcard string, maxResu
 	return printPathRows(writer, events, wildcard, maxResults, sortBy, "Path", func(event store.Event) string { return event.Path })
 }
 
-func printParentPaths(writer io.Writer, events []store.Event, wildcard string, maxResults int, sortBy string) error {
+func printParentSummaries(writer io.Writer, summaries []store.ParentSummary, maxResults int, sortBy string) error {
 	if maxResults < 1 {
 		return errors.New("max must be greater than zero")
 	}
 	if sortBy != "path" && sortBy != "timestamp" {
 		return fmt.Errorf("unsupported sort %q; use path or timestamp", sortBy)
 	}
-	type parentRow struct {
-		event    store.Event
-		children map[string]struct{}
-	}
-	parents := make(map[string]*parentRow)
-	for _, event := range events {
-		childPath := event.Path
-		parent := filepath.Dir(event.Path)
-		matched, err := wildcardMatch(wildcard, parent)
-		if err != nil {
-			return fmt.Errorf("invalid path wildcard %q: %w", wildcard, err)
-		}
-		if !matched {
-			continue
-		}
-		key := eventVolume(event) + "\x00" + parent
-		row := parents[key]
-		if row == nil {
-			event.Path = parent
-			row = &parentRow{event: event, children: make(map[string]struct{})}
-			parents[key] = row
-		}
-		row.children[childPath] = struct{}{}
-		if event.Timestamp.After(row.event.Timestamp) {
-			event.Path = parent
-			row.event = event
-		}
-	}
-	rows := make([]*parentRow, 0, len(parents))
-	for _, row := range parents {
-		rows = append(rows, row)
-	}
-	if len(rows) > maxResults {
-		_, err := fmt.Fprintf(writer, "%d changed parents match; increase --max and/or tighten the path search, --path prefix, or time range.\n", len(rows))
+	if len(summaries) > maxResults {
+		_, err := fmt.Fprintf(writer, "%d changed parents match; increase --max and/or tighten the path search, --path prefix, or time range.\n", len(summaries))
 		return err
 	}
-	sort.Slice(rows, func(left, right int) bool {
+	sort.Slice(summaries, func(left, right int) bool {
 		if sortBy == "timestamp" {
-			return rows[left].event.Timestamp.After(rows[right].event.Timestamp)
+			return summaries[left].Timestamp.After(summaries[right].Timestamp)
 		}
-		leftVolume, rightVolume := eventVolume(rows[left].event), eventVolume(rows[right].event)
-		if leftVolume == rightVolume {
-			return rows[left].event.Path < rows[right].event.Path
+		leftSVM, rightSVM := parentSVM(summaries[left]), parentSVM(summaries[right])
+		if leftSVM != rightSVM {
+			return leftSVM < rightSVM
 		}
-		return leftVolume < rightVolume
+		leftVolume, rightVolume := parentVolume(summaries[left]), parentVolume(summaries[right])
+		if leftVolume != rightVolume {
+			return leftVolume < rightVolume
+		}
+		return summaries[left].Path < summaries[right].Path
 	})
 
 	tableWriter := newTableWriter(writer)
-	tableWriter.AppendHeader(table.Row{"Last Change", "Volume", "CNT", "Parent"})
-	for _, row := range rows {
-		tableWriter.AppendRow(table.Row{row.event.Timestamp.UTC().Format(time.RFC3339Nano), eventVolume(row.event), len(row.children), row.event.Path})
+	tableWriter.AppendHeader(table.Row{"Last Change", "SVM", "Volume", "CNT", "Parent"})
+	for _, summary := range summaries {
+		tableWriter.AppendRow(table.Row{summary.Timestamp.UTC().Format(time.RFC3339Nano), parentSVM(summary), parentVolume(summary), summary.ChildCount, summary.Path})
 	}
 	tableWriter.Render()
 	return nil
+}
+
+func parentVolume(summary store.ParentSummary) string {
+	if summary.VolumeName != "" {
+		return summary.VolumeName
+	}
+	return summary.VolumeMSID
+}
+
+func parentSVM(summary store.ParentSummary) string {
+	if summary.SVMName != "" {
+		return summary.SVMName
+	}
+	return summary.SVMID
+}
+
+func parentSummariesNeedResolution(summaries []store.ParentSummary) bool {
+	for _, summary := range summaries {
+		if summary.VolumeName == "" || summary.SVMName == "" {
+			return true
+		}
+	}
+	return false
+}
+
+func resolveParentSummaries(summaries []store.ParentSummary, volumes map[string]monitorVolume) {
+	for index := range summaries {
+		volume, found := volumes[summaries[index].VolumeMSID]
+		if !found {
+			continue
+		}
+		if summaries[index].VolumeName == "" {
+			summaries[index].VolumeName = volume.Name
+		}
+		if summaries[index].SVMName == "" {
+			summaries[index].SVMName = volume.SVM
+		}
+	}
+}
+
+func cacheParentSummaryNames(controlPath string, summaries []store.ParentSummary) error {
+	_, err := callControl(controlPath, controlRequest{Command: "parent-mappings-set", Parents: summaries})
+	return err
 }
 
 func printPathRows(writer io.Writer, events []store.Event, wildcard string, maxResults int, sortBy, column string, pathFor func(store.Event) string) error {
