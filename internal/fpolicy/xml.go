@@ -10,7 +10,7 @@ import (
 	"strings"
 	"time"
 
-	"pathdiff/internal/store"
+	"github.com/otuschhoff/pathdiff/internal/store"
 )
 
 const MaxFrameSize = 1024 * 1024

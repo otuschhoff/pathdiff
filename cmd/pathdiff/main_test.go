@@ -15,186 +15,20 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
-	"sync"
 	"testing"
 	"time"
 
-	"pathdiff/internal/store"
+	"github.com/otuschhoff/pathdiff/internal/store"
 
 	"github.com/jedib0t/go-pretty/v6/text"
 	"github.com/spf13/cobra"
 	"golang.org/x/crypto/ssh"
 )
 
-func TestFPolicyListenerManagerPorts(t *testing.T) {
-	manager := &fpolicyListenerManager{listeners: map[int]*managedFPolicyListener{
-		9912: {svms: []string{"svm-two"}, sources: map[string]struct{}{"192.0.2.11": {}, "192.0.2.10": {}}},
-		9911: {svms: []string{"svm-one"}, sources: map[string]struct{}{"192.0.2.12": {}}},
-	}}
-	manager.snapshotPortsLocked()
-	ports := manager.Ports()
-	if len(ports) != 2 || ports[0].Port != 9911 || ports[1].Port != 9912 || strings.Join(ports[1].SVMs, ",") != "svm-two" || strings.Join(ports[1].Sources, ",") != "192.0.2.10,192.0.2.11" {
-		t.Fatalf("ports = %#v", ports)
-	}
-}
-
-func TestSameSourcesAllowsEmptySourceSets(t *testing.T) {
-	if !sameSources(map[string]struct{}{}, map[string]struct{}{}) {
-		t.Fatal("empty source sets should be equal")
-	}
-}
-
-func TestTrafficRecorder(t *testing.T) {
-	server, client := net.Pipe()
-	recorder, err := newTrafficRecorder(server, t.TempDir())
-	if err != nil {
-		t.Fatal(err)
-	}
-	done := make(chan error, 1)
-	go func() {
-		_, err := client.Write([]byte("request"))
-		done <- err
-	}()
-	buffer := make([]byte, len("request"))
-	if _, err := recorder.Read(buffer); err != nil {
-		t.Fatal(err)
-	}
-	if err := <-done; err != nil {
-		t.Fatal(err)
-	}
-	done = make(chan error, 1)
-	go func() {
-		buffer := make([]byte, len("response"))
-		_, err := client.Read(buffer)
-		done <- err
-	}()
-	if _, err := recorder.Write([]byte("response")); err != nil {
-		t.Fatal(err)
-	}
-	if err := <-done; err != nil {
-		t.Fatal(err)
-	}
-	if err := recorder.Close(); err != nil {
-		t.Fatal(err)
-	}
-	if err := client.Close(); err != nil {
-		t.Fatal(err)
-	}
-	inFiles, err := filepath.Glob(filepath.Join(filepath.Dir(recorder.in.Name()), "*.in"))
-	if err != nil || len(inFiles) != 1 {
-		t.Fatalf("in capture files = %v, err = %v", inFiles, err)
-	}
-	outFiles, err := filepath.Glob(filepath.Join(filepath.Dir(recorder.out.Name()), "*.out"))
-	if err != nil || len(outFiles) != 1 {
-		t.Fatalf("out capture files = %v, err = %v", outFiles, err)
-	}
-	in, err := os.ReadFile(inFiles[0])
-	if err != nil || string(in) != "request" {
-		t.Fatalf("in capture = %q, err = %v", in, err)
-	}
-	out, err := os.ReadFile(outFiles[0])
-	if err != nil || string(out) != "response" {
-		t.Fatalf("out capture = %q, err = %v", out, err)
-	}
-}
-
-func TestTrafficRecorderReportsCaptureFailures(t *testing.T) {
-	server, client := net.Pipe()
-	recorder, err := newTrafficRecorder(server, t.TempDir())
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := recorder.in.Close(); err != nil {
-		t.Fatal(err)
-	}
-	writeDone := make(chan error, 1)
-	go func() {
-		_, err := client.Write([]byte("request"))
-		writeDone <- err
-	}()
-	buffer := make([]byte, len("request"))
-	count, err := recorder.Read(buffer)
-	if count != len(buffer) || err == nil || !strings.Contains(err.Error(), "record inbound traffic") {
-		t.Fatalf("Read() = %d, %v", count, err)
-	}
-	if err := <-writeDone; err != nil {
-		t.Fatal(err)
-	}
-	if err := recorder.out.Close(); err != nil {
-		t.Fatal(err)
-	}
-	if err := recorder.Close(); err == nil || !strings.Contains(err.Error(), "close inbound traffic capture") || !strings.Contains(err.Error(), "close outbound traffic capture") {
-		t.Fatalf("Close() error = %v", err)
-	}
-	_ = client.Close()
-}
-
-type writeErrorConn struct {
-	net.Conn
-}
-
-func (writeErrorConn) Write([]byte) (int, error) {
-	return 0, errors.New("forced response write failure")
-}
-
 type errorWriter struct{}
 
 func (errorWriter) Write([]byte) (int, error) {
 	return 0, errors.New("forced output failure")
-}
-
-func TestAcceptRetryDelayIsBounded(t *testing.T) {
-	delay := time.Duration(0)
-	for range 10 {
-		delay = nextAcceptRetryDelay(delay)
-	}
-	if delay != 5*time.Second {
-		t.Fatalf("retry delay = %s, want 5s", delay)
-	}
-}
-
-func TestHandleControlReportsResponseWriteFailure(t *testing.T) {
-	db, err := store.Open(t.TempDir())
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { _ = db.Close() })
-	server, client := net.Pipe()
-	handled := make(chan error, 1)
-	go func() {
-		handled <- handleControl(writeErrorConn{Conn: server}, db, nil, nil, nil, nil)
-	}()
-	if err := json.NewEncoder(client).Encode(controlRequest{Command: "db-status"}); err != nil {
-		t.Fatal(err)
-	}
-	if err := <-handled; err == nil || !strings.Contains(err.Error(), `encode control response for "db-status"`) {
-		t.Fatalf("handleControl() error = %v", err)
-	}
-	_ = server.Close()
-	_ = client.Close()
-}
-
-func TestConnectionRegistryCloseAll(t *testing.T) {
-	server, client := net.Pipe()
-	t.Cleanup(func() { _ = client.Close() })
-	registry := newConnectionRegistry()
-	registry.Add(server)
-	done := make(chan error, 1)
-	go func() {
-		buffer := make([]byte, 1)
-		_, err := server.Read(buffer)
-		done <- err
-	}()
-
-	registry.CloseAll()
-	select {
-	case err := <-done:
-		if err == nil {
-			t.Fatal("reader returned no error after registry shutdown")
-		}
-	case <-time.After(time.Second):
-		t.Fatal("registry shutdown did not unblock the connection reader")
-	}
 }
 
 func TestParseTimeExpression(t *testing.T) {
@@ -658,57 +492,17 @@ func TestRetentionCommandsRegistered(t *testing.T) {
 	}
 }
 
-func TestRetentionControlSetAndShow(t *testing.T) {
-	db, err := store.Open(t.TempDir())
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { _ = db.Close() })
-	if err := db.Store(store.Event{Path: "/expired", Operation: "write", Timestamp: time.Now().UTC().Add(-2 * time.Hour)}); err != nil {
-		t.Fatal(err)
-	}
-	request := func(request controlRequest) controlResponse {
-		server, client := net.Pipe()
-		go func() {
-			defer server.Close()
-			handleControl(server, db, nil, nil, nil, nil)
-		}()
-		if err := json.NewEncoder(client).Encode(request); err != nil {
-			t.Fatal(err)
-		}
-		var response controlResponse
-		if err := json.NewDecoder(client).Decode(&response); err != nil {
-			t.Fatal(err)
-		}
-		_ = client.Close()
-		if response.Error != "" {
-			t.Fatal(response.Error)
-		}
-		return response
-	}
-	set := request(controlRequest{Command: "retention-set", Retention: time.Hour})
-	if set.Retention != time.Hour || set.DeletedEvents != 1 || set.Status != "updated" {
-		t.Fatalf("retention set response = %#v", set)
-	}
-	show := request(controlRequest{Command: "retention-show"})
-	if show.Retention != time.Hour {
-		t.Fatalf("retention show response = %#v", show)
-	}
-}
-
 func TestEngineSnapshotAndFormatting(t *testing.T) {
-	tracker := newSenderTracker(false)
-	tracker.senders["192.0.2.10"] = &senderStats{
-		active:         1,
-		connectedSince: time.Now().UTC().Add(-time.Minute),
-		totalEvents:    43120,
-		sessionEvents:  43120,
-		localPort:      "9911",
-		lastSeen:       time.Now().UTC().Add(-time.Minute),
-		nodeID:         "node-1",
-		svmID:          "svm-1",
-	}
-	engines := tracker.engines()
+	engines := []engineInfo{{
+		Since:       time.Now().UTC().Add(-time.Minute),
+		TotalEvents: 43120,
+		AverageRate: 718.6,
+		LIFIPv4:     "192.0.2.10",
+		NodeID:      "node-1",
+		SVMID:       "svm-1",
+		LocalPort:   "9911",
+		LastSeen:    time.Now().UTC().Add(-time.Minute),
+	}}
 	if len(engines) != 1 || engines[0].LIFIPv4 != "192.0.2.10" || engines[0].TotalEvents != 43120 || engines[0].LocalPort != "9911" || engines[0].SVMID != "svm-1" || engines[0].AverageRate <= 0 {
 		t.Fatalf("unexpected engine snapshot: %#v", engines)
 	}
@@ -753,20 +547,7 @@ func TestEngineStatusFormatting(t *testing.T) {
 	}
 }
 
-func TestEngineSessionMetricsResetAfterDisconnect(t *testing.T) {
-	tracker := newSenderTracker(false)
-	address := &net.TCPAddr{IP: net.ParseIP("192.0.2.1"), Port: 9911}
-	tracker.connect("192.0.2.10", address)
-	tracker.eventStored("192.0.2.10")
-	tracker.disconnect("192.0.2.10")
-	if len(tracker.senders) != 0 {
-		t.Fatalf("disconnected sender was retained: %#v", tracker.senders)
-	}
-	tracker.connect("192.0.2.10", address)
-	engine := tracker.engines()[0]
-	if engine.TotalEvents != 0 || !engine.LastSeen.IsZero() || engine.AverageRate != 0 || tracker.totalEvents != 1 {
-		t.Fatalf("session metrics were not reset: %#v", engine)
-	}
+func TestEngineZeroMetricsFormatting(t *testing.T) {
 	if formatEventRate(0) != text.FgHiBlack.Sprint("-") || formatEngineEventCount(0) != text.FgHiBlack.Sprint("-") {
 		t.Fatal("zero engine metrics were not rendered as muted dashes")
 	}
@@ -794,38 +575,6 @@ func TestFormatEventCount(t *testing.T) {
 	}
 	if got := formatEventCount(1000); got != "1k" {
 		t.Fatalf("formatEventCount(1000) = %q", got)
-	}
-}
-
-func TestSenderTrackerRequestRate(t *testing.T) {
-	tracker := newSenderTracker(false)
-	tracker.startedAt = time.Date(2026, 8, 29, 12, 0, 0, 0, time.UTC)
-	tracker.totalEvents = 120
-	if got := tracker.requestRate(tracker.startedAt.Add(2 * time.Minute)); got != 1 {
-		t.Fatalf("requestRate() = %f, want 1", got)
-	}
-}
-
-func TestAcceptEventsReturnsWhenListenerCloses(t *testing.T) {
-	listener, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatal(err)
-	}
-	var accepts, connections sync.WaitGroup
-	accepts.Add(1)
-	go acceptEvents(context.Background(), listener, nil, nil, "", nil, nil, &accepts, &connections)
-	if err := listener.Close(); err != nil {
-		t.Fatal(err)
-	}
-	done := make(chan struct{})
-	go func() {
-		accepts.Wait()
-		close(done)
-	}()
-	select {
-	case <-done:
-	case <-time.After(time.Second):
-		t.Fatal("accept loop did not return after its listener closed")
 	}
 }
 

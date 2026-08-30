@@ -8,6 +8,47 @@
 - Keep a durable, locally queryable history optimized for time and path lookups.
 - Provide daemon lifecycle, audit, backup, and live-monitoring workflows from one CLI.
 
+## Go Library
+
+Import `github.com/otuschhoff/pathdiff` to run the receiver inside another Go application. The receiver opens and owns `DatabasePath`; query its database directly while it is running:
+
+```go
+ctx, cancel := context.WithCancel(context.Background())
+defer cancel()
+
+receiver, err := pathdiff.NewReceiver(pathdiff.Config{
+    DatabasePath: "pathdiff_data",
+    Listeners: []pathdiff.ListenerConfig{{
+        Address:        "0.0.0.0:9911",
+        AllowedSources: []string{"192.0.2.10"},
+    }},
+})
+if err != nil {
+    return err
+}
+if err := receiver.Start(ctx); err != nil {
+    return err
+}
+defer receiver.Close()
+
+events, err := receiver.Database().EventsByPath(
+    "/vol/finance/",
+    time.Now().Add(-24*time.Hour),
+    time.Now(),
+)
+```
+
+An application can instead run the receiver in a separate process by configuring `ControlPath`. Query it from any Go process with `Client`:
+
+```go
+client := pathdiff.NewClient("/run/pathdiff/pathdiff.sock")
+status, err := client.Status(ctx)
+events, err := client.EventsByPath(ctx, "/vol/finance/", start, end)
+parents, err := client.ParentSummariesByPath(ctx, "/vol/finance/", "*.csv", start, end)
+```
+
+Use `Config.Database` to supply an already-open `Database`; in that mode the caller retains ownership and must close it. `SetListeners` supports runtime endpoint reconciliation, and `Config.Refresh` can delegate application-specific discovery to a callback. cDOT SSH discovery, policy activation, systemd management, and table rendering remain CLI concerns under `cmd/pathdiff`.
+
 ## Usage
 
 Build the binary with `xc build`, then register and start the per-user systemd service:

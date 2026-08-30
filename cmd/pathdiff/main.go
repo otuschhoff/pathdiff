@@ -1,14 +1,12 @@
 package main
 
 import (
-	"bufio"
 	"context"
 	"crypto/ed25519"
 	"crypto/rand"
 	"crypto/x509"
 	"encoding/json"
 	"encoding/pem"
-	"encoding/xml"
 	"errors"
 	"fmt"
 	"io"
@@ -23,12 +21,11 @@ import (
 	"strconv"
 	"strings"
 	"sync"
-	"sync/atomic"
 	"syscall"
 	"time"
 
-	"pathdiff/internal/fpolicy"
-	"pathdiff/internal/store"
+	pathdifflib "github.com/otuschhoff/pathdiff"
+	"github.com/otuschhoff/pathdiff/internal/store"
 
 	"github.com/jedib0t/go-pretty/v6/table"
 	"github.com/jedib0t/go-pretty/v6/text"
@@ -46,7 +43,6 @@ const (
 )
 
 var (
-	captureSequence     atomic.Uint64
 	listenRangePattern  = regexp.MustCompile(`^(.*:)([0-9]+)-([0-9]+)$`)
 	unitListenPattern   = regexp.MustCompile(`--listen\s+("[^"]*"|\S+)`)
 	pingPacketsPattern  = regexp.MustCompile(`(?i)(\d+)\s+packets?\s+(?:(?:are|were)\s+)?received`)
@@ -54,43 +50,8 @@ var (
 	retentionDayPattern = regexp.MustCompile(`^([0-9]+)d$`)
 )
 
-type controlRequest struct {
-	Command    string                `json:"command"`
-	Search     string                `json:"search,omitempty"`
-	Parents    []store.ParentSummary `json:"parents,omitempty"`
-	Since      time.Time             `json:"since,omitempty"`
-	Path       string                `json:"path,omitempty"`
-	Start      time.Time             `json:"start,omitempty"`
-	End        time.Time             `json:"end,omitempty"`
-	VolumeMSID string                `json:"volume_msid,omitempty"`
-	VolumeName string                `json:"volume_name,omitempty"`
-	SVMID      string                `json:"svm_id,omitempty"`
-	SVMName    string                `json:"svm_name,omitempty"`
-	Retention  time.Duration         `json:"retention,omitempty"`
-}
-
-type controlResponse struct {
-	Error         string                `json:"error,omitempty"`
-	Status        string                `json:"status,omitempty"`
-	Connections   int                   `json:"connections,omitempty"`
-	EventCount    uint64                `json:"event_count,omitempty"`
-	RequestRate   float64               `json:"request_rate,omitempty"`
-	DBPath        string                `json:"db_path,omitempty"`
-	DBSize        uint64                `json:"db_size,omitempty"`
-	Events        []store.Event         `json:"events,omitempty"`
-	Parents       []store.ParentSummary `json:"parents,omitempty"`
-	Engines       []engineInfo          `json:"engines,omitempty"`
-	Mappings      []store.Mapping       `json:"mappings,omitempty"`
-	ListenerPorts []listenerPort        `json:"listener_ports,omitempty"`
-	Retention     time.Duration         `json:"retention,omitempty"`
-	DeletedEvents uint64                `json:"deleted_events,omitempty"`
-}
-
-type listenerPort struct {
-	Port    int      `json:"port"`
-	SVMs    []string `json:"svms"`
-	Sources []string `json:"sources"`
-}
+type controlRequest = pathdifflib.Request
+type controlResponse = pathdifflib.Response
 
 func main() {
 	if err := newRootCommand().Execute(); err != nil {
@@ -137,17 +98,7 @@ func newDaemonCommand() *cobra.Command {
 	return daemon
 }
 
-func runDaemon(dbPath, listenAddr, controlPath, recordDir string, verbose bool) (returnErr error) {
-	db, err := store.Open(dbPath)
-	if err != nil {
-		return fmt.Errorf("open database: %w", err)
-	}
-	defer func() {
-		if err := db.Close(); err != nil {
-			returnErr = errors.Join(returnErr, fmt.Errorf("close database: %w", err))
-		}
-	}()
-
+func runDaemon(dbPath, listenAddr, controlPath, recordDir string, verbose bool) error {
 	listenerEndpoints, err := parseListenAddresses(listenAddr)
 	if err != nil {
 		return fmt.Errorf("listen for events: %w", err)
@@ -157,195 +108,79 @@ func runDaemon(dbPath, listenAddr, controlPath, recordDir string, verbose bool) 
 		return err
 	}
 
-	if err := os.MkdirAll(filepath.Dir(controlPath), 0o755); err != nil {
-		return fmt.Errorf("create control socket directory: %w", err)
-	}
-	if err := os.Remove(controlPath); err != nil && !errors.Is(err, os.ErrNotExist) {
-		return fmt.Errorf("remove stale control socket: %w", err)
-	}
-	controlListener, err := net.Listen("unix", controlPath)
-	if err != nil {
-		return fmt.Errorf("listen for control requests: %w", err)
-	}
-	defer func() {
-		if err := controlListener.Close(); err != nil && !errors.Is(err, net.ErrClosed) {
-			returnErr = errors.Join(returnErr, fmt.Errorf("close control listener: %w", err))
-		}
-		if err := os.Remove(controlPath); err != nil && !errors.Is(err, os.ErrNotExist) {
-			returnErr = errors.Join(returnErr, fmt.Errorf("remove control socket: %w", err))
-		}
-	}()
-
 	fmt.Printf("pathdiff daemon: events=%s control=%s db=%s\n", listenAddr, controlPath, dbPath)
-	context, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer cancel()
-
-	var accepts, background, connections sync.WaitGroup
-	activeConnections := newConnectionRegistry()
-	trackers := newSenderTracker(verbose)
-	listenerManager := newFPolicyListenerManager(context, listenerEndpoints, receiverEndpoints, db, recordDir, trackers, activeConnections, &accepts, &connections)
-	defer listenerManager.Close()
-	go trackers.reportEvery(context, 10*time.Second)
-	accepts.Add(1)
-	go acceptControls(context, controlListener, db, cancel, trackers, activeConnections, &accepts, &connections, listenerManager.Refresh, listenerManager.Ports)
-	go func() {
-		if err := listenerManager.Refresh(); err != nil {
-			fmt.Fprintln(os.Stderr, "discover FPolicy senders:", err)
-		}
-	}()
-	go listenerManager.RefreshEvery(context, time.Minute)
-	background.Add(1)
-	go func() {
-		defer background.Done()
-		enforceRetentionEvery(context, db, time.Minute)
-	}()
-	<-context.Done()
-	listenerManager.Close()
-	_ = controlListener.Close()
-	accepts.Wait()
-	activeConnections.CloseAll()
-	connections.Wait()
-	background.Wait()
-	return nil
-}
-
-func enforceRetentionEvery(context context.Context, db *store.DB, interval time.Duration) {
-	apply := func() {
-		if _, err := db.ApplyRetention(time.Now().UTC()); err != nil {
-			fmt.Fprintln(os.Stderr, "apply event retention:", err)
-		}
-	}
-	apply()
-	ticker := time.NewTicker(interval)
-	defer ticker.Stop()
-	for {
-		select {
-		case <-context.Done():
-			return
-		case <-ticker.C:
-			apply()
-		}
-	}
-}
-
-func listenEventPorts(specification string) ([]net.Listener, error) {
-	addresses, err := parseListenAddresses(specification)
+	receiver, err := pathdifflib.NewReceiver(pathdifflib.Config{
+		DatabasePath:      dbPath,
+		ControlPath:       controlPath,
+		RecordDirectory:   recordDir,
+		RefreshInterval:   time.Minute,
+		RetentionInterval: time.Minute,
+	})
 	if err != nil {
-		return nil, err
+		return err
 	}
-	listeners := make([]net.Listener, 0, len(addresses))
-	for _, address := range addresses {
-		listener, err := net.ListenTCP("tcp", address)
-		if err != nil {
-			closeListeners(listeners)
-			return nil, err
-		}
-		listeners = append(listeners, listener)
-	}
-	return listeners, nil
+	discovery := newFPolicyReceiverDiscovery(listenerEndpoints, receiverEndpoints, receiver.Database(), verbose)
+	receiver.SetRefresh(discovery.Refresh, time.Minute)
+	return receiver.Run(ctx)
 }
 
-func closeListeners(listeners []net.Listener) {
-	for _, listener := range listeners {
-		_ = listener.Close()
-	}
-}
-
-type managedFPolicyListener struct {
-	listener net.Listener
-	sources  map[string]struct{}
-	svms     []string
-}
-
-type fpolicyListenerManager struct {
+type fpolicyReceiverDiscovery struct {
 	mu                sync.Mutex
-	refreshMu         sync.Mutex
-	context           context.Context
 	listenEndpoints   map[int]*net.TCPAddr
 	receiverEndpoints []*net.TCPAddr
-	db                *store.DB
-	recordDir         string
-	trackers          *senderTracker
-	connections       *connectionRegistry
-	acceptGroup       *sync.WaitGroup
-	waitGroup         *sync.WaitGroup
-	listeners         map[int]*managedFPolicyListener
+	db                reachabilityDatabase
 	enabledPolicies   map[string]struct{}
-	portSnapshot      atomic.Value
+	verbose           bool
 }
 
-func newFPolicyListenerManager(context context.Context, listenEndpoints, receiverEndpoints []*net.TCPAddr, db *store.DB, recordDir string, trackers *senderTracker, connections *connectionRegistry, acceptGroup, waitGroup *sync.WaitGroup) *fpolicyListenerManager {
+func newFPolicyReceiverDiscovery(listenEndpoints, receiverEndpoints []*net.TCPAddr, db reachabilityDatabase, verbose bool) *fpolicyReceiverDiscovery {
 	endpoints := make(map[int]*net.TCPAddr, len(listenEndpoints))
 	for _, endpoint := range listenEndpoints {
 		endpoints[endpoint.Port] = endpoint
 	}
-	manager := &fpolicyListenerManager{context: context, listenEndpoints: endpoints, receiverEndpoints: receiverEndpoints, db: db, recordDir: recordDir, trackers: trackers, connections: connections, acceptGroup: acceptGroup, waitGroup: waitGroup, listeners: make(map[int]*managedFPolicyListener), enabledPolicies: make(map[string]struct{})}
-	manager.portSnapshot.Store([]listenerPort{})
-	return manager
+	return &fpolicyReceiverDiscovery{listenEndpoints: endpoints, receiverEndpoints: receiverEndpoints, db: db, enabledPolicies: make(map[string]struct{}), verbose: verbose}
 }
 
-func (m *fpolicyListenerManager) Refresh() error {
-	m.refreshMu.Lock()
-	defer m.refreshMu.Unlock()
-	if err := m.context.Err(); err != nil {
-		return err
-	}
-	expected, err := discoverFPolicySenders(m.context, m.receiverEndpoints)
+func (d *fpolicyReceiverDiscovery) Refresh(ctx context.Context, receiver *pathdifflib.Receiver) error {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	expected, err := discoverFPolicySenders(ctx, d.receiverEndpoints)
 	if err != nil {
 		return err
 	}
-	if err := m.context.Err(); err != nil {
-		return err
-	}
+	configs := make([]pathdifflib.ListenerConfig, 0, len(expected))
 	expectedPolicies := make(map[string]struct{})
-	for _, sender := range expected {
+	for port, sender := range expected {
+		endpoint := d.listenEndpoints[port]
+		if endpoint == nil {
+			continue
+		}
+		sources := make([]string, 0, len(sender.Sources))
+		for source := range sender.Sources {
+			sources = append(sources, source)
+		}
+		configs = append(configs, pathdifflib.ListenerConfig{Address: endpoint.String(), AllowedSources: sources, SVMs: fpolicySenderSVMs(sender)})
 		for _, policy := range sender.Policies {
 			expectedPolicies[policy.SVM+"\x00"+policy.Name] = struct{}{}
 		}
 	}
-	m.mu.Lock()
-	for key := range m.enabledPolicies {
-		if _, expected := expectedPolicies[key]; !expected {
-			delete(m.enabledPolicies, key)
+	if err := receiver.SetListeners(configs); err != nil {
+		return err
+	}
+	for key := range d.enabledPolicies {
+		if _, exists := expectedPolicies[key]; !exists {
+			delete(d.enabledPolicies, key)
 		}
 	}
-	for port, managed := range m.listeners {
-		if sender := expected[port]; sender == nil || !sameSources(managed.sources, sender.Sources) {
-			_ = managed.listener.Close()
-			delete(m.listeners, port)
-		}
-	}
-	for port, sender := range expected {
-		if managed := m.listeners[port]; managed != nil {
-			managed.svms = fpolicySenderSVMs(sender)
-			continue
-		}
-		endpoint := m.listenEndpoints[port]
-		if endpoint == nil {
-			continue
-		}
-		listener, err := net.ListenTCP("tcp", endpoint)
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "listen for FPolicy sender on %s: %v\n", endpoint, err)
-			continue
-		}
-		sources := copySources(sender.Sources)
-		m.listeners[port] = &managedFPolicyListener{listener: listener, sources: sources, svms: fpolicySenderSVMs(sender)}
-		m.acceptGroup.Add(1)
-		go acceptEvents(m.context, listener, sources, m.db, m.recordDir, m.trackers, m.connections, m.acceptGroup, m.waitGroup)
-	}
-	m.snapshotPortsLocked()
-	m.mu.Unlock()
 	for _, sender := range expected {
 		for _, policy := range sender.Policies {
 			key := policy.SVM + "\x00" + policy.Name
-			m.mu.Lock()
-			if _, enabled := m.enabledPolicies[key]; enabled {
-				m.mu.Unlock()
+			if _, enabled := d.enabledPolicies[key]; enabled {
 				continue
 			}
-			m.mu.Unlock()
-			if err := tryEnableFPolicyPolicy(m.context, m.db, policy); err != nil {
+			if err := tryEnableFPolicyPolicy(ctx, d.db, policy); err != nil {
 				if errors.Is(err, context.Canceled) {
 					return context.Canceled
 				}
@@ -356,63 +191,10 @@ func (m *fpolicyListenerManager) Refresh() error {
 				fmt.Fprintf(os.Stderr, "FPolicy activation failed for SVM %s policy %s: %v; will retry on the next cDOT refresh\n", policy.SVM, policy.Name, err)
 				continue
 			}
-			m.mu.Lock()
-			m.enabledPolicies[key] = struct{}{}
-			m.mu.Unlock()
+			d.enabledPolicies[key] = struct{}{}
 		}
 	}
 	return nil
-}
-
-func (m *fpolicyListenerManager) RefreshEvery(context context.Context, interval time.Duration) {
-	ticker := time.NewTicker(interval)
-	defer ticker.Stop()
-	for {
-		select {
-		case <-context.Done():
-			return
-		case <-ticker.C:
-			if err := m.Refresh(); err != nil {
-				fmt.Fprintln(os.Stderr, "refresh FPolicy senders:", err)
-			}
-		}
-	}
-}
-
-func (m *fpolicyListenerManager) Close() {
-	m.refreshMu.Lock()
-	defer m.refreshMu.Unlock()
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	for port, listener := range m.listeners {
-		_ = listener.listener.Close()
-		delete(m.listeners, port)
-	}
-	m.snapshotPortsLocked()
-}
-
-func (m *fpolicyListenerManager) Ports() []listenerPort {
-	if snapshot := m.portSnapshot.Load(); snapshot != nil {
-		return append([]listenerPort(nil), snapshot.([]listenerPort)...)
-	}
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	return m.snapshotPortsLocked()
-}
-
-func (m *fpolicyListenerManager) snapshotPortsLocked() []listenerPort {
-	ports := make([]listenerPort, 0, len(m.listeners))
-	for port, listener := range m.listeners {
-		sources := make([]string, 0, len(listener.sources))
-		for source := range listener.sources {
-			sources = append(sources, source)
-		}
-		sort.Strings(sources)
-		ports = append(ports, listenerPort{Port: port, SVMs: append([]string(nil), listener.svms...), Sources: sources})
-	}
-	sort.Slice(ports, func(left, right int) bool { return ports[left].Port < ports[right].Port })
-	m.portSnapshot.Store(ports)
-	return ports
 }
 
 func fpolicySenderSVMs(sender *expectedFPolicySender) []string {
@@ -430,27 +212,12 @@ func fpolicySenderSVMs(sender *expectedFPolicySender) []string {
 	return svms
 }
 
-func sameSources(left, right map[string]struct{}) bool {
-	if len(left) != len(right) {
-		return false
-	}
-	for source := range left {
-		if _, found := right[source]; !found {
-			return false
-		}
-	}
-	return true
+type reachabilityDatabase interface {
+	FPolicyLIFUnreachable(svm, lif, address string) (bool, error)
+	MarkFPolicyLIFUnreachable(svm, lif, address string) error
 }
 
-func copySources(sources map[string]struct{}) map[string]struct{} {
-	copy := make(map[string]struct{}, len(sources))
-	for source := range sources {
-		copy[source] = struct{}{}
-	}
-	return copy
-}
-
-func tryEnableFPolicyPolicy(context context.Context, db *store.DB, policy fpolicyPolicy) error {
+func tryEnableFPolicyPolicy(context context.Context, db reachabilityDatabase, policy fpolicyPolicy) error {
 	host := defaultCDOTCluster()
 	keyFile, err := cdotKeyFile("")
 	if err != nil {
@@ -520,632 +287,7 @@ func resolveListenerEndpoints(listeners []*net.TCPAddr) ([]*net.TCPAddr, error) 
 	return endpoints, nil
 }
 
-func acceptEvents(context context.Context, listener net.Listener, allowedSources map[string]struct{}, db *store.DB, recordDir string, trackers *senderTracker, activeConnections *connectionRegistry, accepts, connections *sync.WaitGroup) {
-	defer accepts.Done()
-	var retryDelay time.Duration
-	for {
-		connection, err := listener.Accept()
-		if err != nil {
-			if context.Err() != nil || errors.Is(err, net.ErrClosed) {
-				return
-			}
-			retryDelay = nextAcceptRetryDelay(retryDelay)
-			fmt.Fprintf(os.Stderr, "accept event connection: %v; retrying in %s\n", err, retryDelay)
-			if !waitForRetry(context, retryDelay) {
-				return
-			}
-			continue
-		}
-		retryDelay = 0
-		if _, allowed := allowedSources[senderName(connection.RemoteAddr())]; !allowed {
-			fmt.Fprintf(os.Stderr, "reject unexpected FPolicy sender %s on %s\n", connection.RemoteAddr(), connection.LocalAddr())
-			_ = connection.Close()
-			continue
-		}
-		connections.Add(1)
-		go func() {
-			defer connections.Done()
-			activeConnections.Add(connection)
-			defer activeConnections.Remove(connection)
-			sender := senderName(connection.RemoteAddr())
-			trackers.connect(sender, connection.LocalAddr())
-			defer trackers.disconnect(sender)
-			activeConnection := connection
-			if recordDir != "" {
-				var err error
-				activeConnection, err = newTrafficRecorder(connection, recordDir)
-				if err != nil {
-					fmt.Fprintln(os.Stderr, "create traffic capture:", err)
-					_ = connection.Close()
-					return
-				}
-			}
-			defer func() {
-				if err := activeConnection.Close(); err != nil && !errors.Is(err, net.ErrClosed) {
-					fmt.Fprintf(os.Stderr, "close event connection from %s: %v\n", sender, err)
-				}
-			}()
-			readEvents(activeConnection, db, trackers, sender)
-		}()
-	}
-}
-
-func nextAcceptRetryDelay(current time.Duration) time.Duration {
-	if current == 0 {
-		return 100 * time.Millisecond
-	}
-	return min(current*2, 5*time.Second)
-}
-
-func waitForRetry(context context.Context, delay time.Duration) bool {
-	timer := time.NewTimer(delay)
-	defer timer.Stop()
-	select {
-	case <-context.Done():
-		return false
-	case <-timer.C:
-		return true
-	}
-}
-
-type connectionRegistry struct {
-	mu          sync.Mutex
-	connections map[net.Conn]struct{}
-}
-
-func newConnectionRegistry() *connectionRegistry {
-	return &connectionRegistry{connections: make(map[net.Conn]struct{})}
-}
-
-func (r *connectionRegistry) Add(connection net.Conn) {
-	r.mu.Lock()
-	r.connections[connection] = struct{}{}
-	r.mu.Unlock()
-}
-
-func (r *connectionRegistry) Remove(connection net.Conn) {
-	r.mu.Lock()
-	delete(r.connections, connection)
-	r.mu.Unlock()
-}
-
-func (r *connectionRegistry) CloseAll() {
-	r.mu.Lock()
-	connections := make([]net.Conn, 0, len(r.connections))
-	for connection := range r.connections {
-		connections = append(connections, connection)
-	}
-	r.mu.Unlock()
-	for _, connection := range connections {
-		_ = connection.Close()
-	}
-}
-
-type senderTracker struct {
-	verbose     bool
-	startedAt   time.Time
-	mu          sync.Mutex
-	totalEvents uint64
-	senders     map[string]*senderStats
-}
-
-type senderStats struct {
-	active         int
-	protocol       string
-	intervalEvents uint64
-	totalEvents    uint64
-	sessionEvents  uint64
-	connectedSince time.Time
-	localPort      string
-	nodeID         string
-	svmID          string
-	lastSeen       time.Time
-}
-
-type engineInfo struct {
-	Since       time.Time `json:"since"`
-	TotalEvents uint64    `json:"total_events"`
-	AverageRate float64   `json:"average_events_per_second"`
-	LIFIPv4     string    `json:"lif_ipv4"`
-	LIFHostname string    `json:"lif_hostname,omitempty"`
-	NodeID      string    `json:"node_id,omitempty"`
-	SVMID       string    `json:"svm_id,omitempty"`
-	NodeName    string    `json:"node_name,omitempty"`
-	SVMName     string    `json:"svm_name,omitempty"`
-	FPolicy     string    `json:"fpolicy_status,omitempty"`
-	LocalPort   string    `json:"local_port"`
-	LastSeen    time.Time `json:"last_seen"`
-}
-
-func newSenderTracker(verbose bool) *senderTracker {
-	return &senderTracker{verbose: verbose, startedAt: time.Now().UTC(), senders: make(map[string]*senderStats)}
-}
-
-func (t *senderTracker) connect(sender string, localAddress net.Addr) {
-	t.mu.Lock()
-	stats := t.sender(sender)
-	if stats.active == 0 {
-		stats.connectedSince = time.Now().UTC()
-		stats.intervalEvents = 0
-		stats.sessionEvents = 0
-		stats.lastSeen = time.Time{}
-		_, stats.localPort, _ = net.SplitHostPort(localAddress.String())
-	}
-	stats.active++
-	active := stats.active
-	t.mu.Unlock()
-	t.logf("sender=%s state=connected active_connections=%d", sender, active)
-}
-
-func (t *senderTracker) negotiated(sender, nodeID, svmID string) {
-	t.mu.Lock()
-	stats := t.sender(sender)
-	stats.nodeID = nodeID
-	stats.svmID = svmID
-	t.mu.Unlock()
-}
-
-func (t *senderTracker) disconnect(sender string) {
-	t.mu.Lock()
-	stats := t.sender(sender)
-	if stats.active > 0 {
-		stats.active--
-	}
-	active := stats.active
-	if active == 0 {
-		delete(t.senders, sender)
-	}
-	t.mu.Unlock()
-	t.logf("sender=%s state=disconnected active_connections=%d", sender, active)
-}
-
-func (t *senderTracker) protocolDetected(sender, protocol string) {
-	t.mu.Lock()
-	stats := t.sender(sender)
-	changed := stats.protocol != protocol
-	stats.protocol = protocol
-	t.mu.Unlock()
-	if changed {
-		t.logf("sender=%s state=protocol_detected protocol=%s", sender, protocol)
-	}
-}
-
-func (t *senderTracker) eventStored(sender string) {
-	t.mu.Lock()
-	stats := t.sender(sender)
-	stats.intervalEvents++
-	stats.totalEvents++
-	stats.sessionEvents++
-	stats.lastSeen = time.Now().UTC()
-	t.totalEvents++
-	t.mu.Unlock()
-}
-
-func (t *senderTracker) eventMetadata(sender string) (svmID, nodeID string) {
-	t.mu.Lock()
-	defer t.mu.Unlock()
-	stats := t.sender(sender)
-	return stats.svmID, stats.nodeID
-}
-
-func (t *senderTracker) connectionCount() int {
-	t.mu.Lock()
-	defer t.mu.Unlock()
-	count := 0
-	for _, stats := range t.senders {
-		count += stats.active
-	}
-	return count
-}
-
-func (t *senderTracker) requestRate(now time.Time) float64 {
-	t.mu.Lock()
-	defer t.mu.Unlock()
-	elapsed := now.Sub(t.startedAt).Seconds()
-	if elapsed <= 0 {
-		return 0
-	}
-	return float64(t.totalEvents) / elapsed
-}
-
-func (t *senderTracker) engines() []engineInfo {
-	t.mu.Lock()
-	defer t.mu.Unlock()
-	now := time.Now().UTC()
-	engines := make([]engineInfo, 0, len(t.senders))
-	for lifIPv4, stats := range t.senders {
-		if stats.active == 0 {
-			continue
-		}
-		elapsed := now.Sub(stats.connectedSince).Seconds()
-		average := 0.0
-		if elapsed > 0 {
-			average = float64(stats.sessionEvents) / elapsed
-		}
-		engines = append(engines, engineInfo{Since: stats.connectedSince, TotalEvents: stats.sessionEvents, AverageRate: average, LIFIPv4: lifIPv4, NodeID: stats.nodeID, SVMID: stats.svmID, LocalPort: stats.localPort, LastSeen: stats.lastSeen})
-	}
-	return engines
-}
-
-func (t *senderTracker) reportEvery(context context.Context, interval time.Duration) {
-	if !t.verbose {
-		return
-	}
-	ticker := time.NewTicker(interval)
-	defer ticker.Stop()
-	for {
-		select {
-		case <-context.Done():
-			return
-		case <-ticker.C:
-			t.mu.Lock()
-			for sender, stats := range t.senders {
-				events := stats.intervalEvents
-				stats.intervalEvents = 0
-				fmt.Fprintf(os.Stderr, "sender=%s state=throughput protocol=%s active_connections=%d events=%d interval=%s events_per_second=%.2f total_events=%d\n", sender, stats.protocol, stats.active, events, interval, float64(events)/interval.Seconds(), stats.totalEvents)
-			}
-			t.mu.Unlock()
-		}
-	}
-}
-
-func (t *senderTracker) sender(name string) *senderStats {
-	stats := t.senders[name]
-	if stats == nil {
-		stats = &senderStats{}
-		t.senders[name] = stats
-	}
-	return stats
-}
-
-func (t *senderTracker) logf(format string, arguments ...any) {
-	if t.verbose {
-		fmt.Fprintf(os.Stderr, format+"\n", arguments...)
-	}
-}
-
-func senderName(address net.Addr) string {
-	host, _, err := net.SplitHostPort(address.String())
-	if err == nil {
-		return host
-	}
-	return address.String()
-}
-
-type trafficRecorder struct {
-	net.Conn
-	in, out *os.File
-}
-
-func newTrafficRecorder(connection net.Conn, directory string) (*trafficRecorder, error) {
-	if err := os.MkdirAll(directory, 0o700); err != nil {
-		return nil, fmt.Errorf("create traffic capture directory: %w", err)
-	}
-	prefix := fmt.Sprintf("%s-%06d", time.Now().UTC().Format("20060102T150405.000000000Z"), captureSequence.Add(1))
-	in, err := os.Create(filepath.Join(directory, prefix+".in"))
-	if err != nil {
-		return nil, fmt.Errorf("create inbound traffic capture: %w", err)
-	}
-	out, err := os.Create(filepath.Join(directory, prefix+".out"))
-	if err != nil {
-		createErr := fmt.Errorf("create outbound traffic capture: %w", err)
-		if closeErr := in.Close(); closeErr != nil {
-			return nil, errors.Join(createErr, fmt.Errorf("close inbound traffic capture after setup failure: %w", closeErr))
-		}
-		return nil, createErr
-	}
-	return &trafficRecorder{Conn: connection, in: in, out: out}, nil
-}
-
-func (r *trafficRecorder) Read(payload []byte) (int, error) {
-	count, err := r.Conn.Read(payload)
-	if count > 0 {
-		if _, captureErr := r.in.Write(payload[:count]); captureErr != nil {
-			return count, errors.Join(err, fmt.Errorf("record inbound traffic: %w", captureErr))
-		}
-	}
-	return count, err
-}
-
-func (r *trafficRecorder) Write(payload []byte) (int, error) {
-	count, err := r.Conn.Write(payload)
-	if count > 0 {
-		if _, captureErr := r.out.Write(payload[:count]); captureErr != nil {
-			return count, errors.Join(err, fmt.Errorf("record outbound traffic: %w", captureErr))
-		}
-	}
-	return count, err
-}
-
-func (r *trafficRecorder) Close() error {
-	var closeErrors []error
-	if err := r.in.Close(); err != nil {
-		closeErrors = append(closeErrors, fmt.Errorf("close inbound traffic capture: %w", err))
-	}
-	if err := r.out.Close(); err != nil {
-		closeErrors = append(closeErrors, fmt.Errorf("close outbound traffic capture: %w", err))
-	}
-	if err := r.Conn.Close(); err != nil && !errors.Is(err, net.ErrClosed) {
-		closeErrors = append(closeErrors, fmt.Errorf("close recorded connection: %w", err))
-	}
-	return errors.Join(closeErrors...)
-}
-
-func readEvents(connection net.Conn, db *store.DB, trackers *senderTracker, sender string) {
-	reader := bufio.NewReader(connection)
-	first, err := reader.Peek(1)
-	if err != nil {
-		if !errors.Is(err, io.EOF) {
-			fmt.Fprintln(os.Stderr, "read event stream:", err)
-		}
-		return
-	}
-	if first[0] == '<' {
-		trackers.protocolDetected(sender, "raw-xml")
-		readXMLEvents(reader, connection, db, trackers, sender)
-		return
-	}
-	if first[0] == 0x22 {
-		trackers.protocolDetected(sender, "ontap-xml")
-		readONTAPXMLEvents(reader, connection, db, trackers, sender)
-		return
-	}
-	if first[0] != '{' {
-		fmt.Fprintf(os.Stderr, "reject event connection from %s: unsupported protocol prefix %#x\n", connection.RemoteAddr(), first[0])
-		return
-	}
-	trackers.protocolDetected(sender, "json-lines")
-
-	scanner := bufio.NewScanner(reader)
-	scanner.Buffer(make([]byte, 4096), 1024*1024)
-	for scanner.Scan() {
-		var event store.Event
-		if err := json.Unmarshal(scanner.Bytes(), &event); err != nil {
-			fmt.Fprintln(os.Stderr, "decode event:", err)
-			continue
-		}
-		if event.Path == "" {
-			fmt.Fprintln(os.Stderr, "reject event: path is required")
-			continue
-		}
-		if err := db.Store(event); err != nil {
-			fmt.Fprintf(os.Stderr, "store event from %s; closing sender connection: %v\n", sender, err)
-			return
-		}
-		trackers.eventStored(sender)
-		trackers.logf("sender=%s state=event_stored operation=%s path=%q", sender, event.Operation, event.Path)
-	}
-	if err := scanner.Err(); err != nil {
-		fmt.Fprintln(os.Stderr, "read event stream:", err)
-	}
-}
-
-func readONTAPXMLEvents(reader *bufio.Reader, connection net.Conn, db *store.DB, trackers *senderTracker, sender string) {
-	message, err := fpolicy.ReadONTAPXMLFrame(reader)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "read ONTAP XML handshake from %s: %v\n", connection.RemoteAddr(), err)
-		return
-	}
-	if message.Type != "NEGO_REQ" {
-		fmt.Fprintf(os.Stderr, "reject ONTAP XML session from %s: expected NEGO_REQ, got %s\n", connection.RemoteAddr(), message.Type)
-		return
-	}
-	response, err := fpolicy.ONTAPNegotiateResponse(message.Session, message.VserverUUID, message.PolicyName)
-	if err != nil {
-		fmt.Fprintln(os.Stderr, "encode ONTAP XML handshake response:", err)
-		return
-	}
-	if err := fpolicy.WriteONTAPXMLFrame(connection, "NEGO_RESP", response); err != nil {
-		fmt.Fprintf(os.Stderr, "write ONTAP XML handshake response to %s: %v\n", connection.RemoteAddr(), err)
-		return
-	}
-	trackers.negotiated(sender, message.NodeID, message.VserverUUID)
-	trackers.logf("sender=%s state=negotiated protocol=ontap-xml policy=%s vserver_uuid=%s", sender, message.PolicyName, message.VserverUUID)
-
-	for {
-		message, err := fpolicy.ReadONTAPXMLFrame(reader)
-		if errors.Is(err, io.EOF) {
-			return
-		}
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "read ONTAP XML event from %s: %v\n", connection.RemoteAddr(), err)
-			return
-		}
-		if message.Type == "KEEP_ALIVE" {
-			trackers.logf("sender=%s state=keep_alive", sender)
-			continue
-		}
-		if message.Type == "SCREEN_REQ" {
-			if !storeScreenEvent(message.Payload, connection, db, trackers, sender) {
-				return
-			}
-			continue
-		}
-		if message.Type != "NOTIFY_REQ" {
-			trackers.logf("sender=%s state=message_ignored type=%s", sender, message.Type)
-			continue
-		}
-		if !storeXMLEvent(message.Payload, connection, db, trackers, sender) {
-			return
-		}
-	}
-}
-
-func storeScreenEvent(payload []byte, connection net.Conn, db *store.DB, trackers *senderTracker, sender string) bool {
-	event, err := fpolicy.ParseScreenRequest(payload)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "decode ONTAP XML screen request from %s: %v\n", connection.RemoteAddr(), err)
-		return true
-	}
-	annotateSenderEvent(&event, trackers, sender)
-	if err := db.Store(event); err != nil {
-		fmt.Fprintf(os.Stderr, "store ONTAP XML screen request from %s; closing sender connection: %v\n", sender, err)
-		return false
-	}
-	trackers.eventStored(sender)
-	trackers.logf("sender=%s state=screen_request_stored operation=%s path=%q", sender, event.Operation, event.Path)
-	return true
-}
-
-func readXMLEvents(reader *bufio.Reader, connection net.Conn, db *store.DB, trackers *senderTracker, sender string) {
-	decoder := xml.NewDecoder(reader)
-	for {
-		event, err := fpolicy.DecodeXMLNotification(decoder)
-		if errors.Is(err, io.EOF) {
-			return
-		}
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "read XML event from %s: %v\n", connection.RemoteAddr(), err)
-			return
-		}
-		if err := db.Store(event); err != nil {
-			fmt.Fprintf(os.Stderr, "store XML event from %s; closing sender connection: %v\n", sender, err)
-			return
-		}
-		trackers.eventStored(sender)
-		trackers.logf("sender=%s state=event_stored operation=%s path=%q", sender, event.Operation, event.Path)
-	}
-}
-
-func storeXMLEvent(payload []byte, connection net.Conn, db *store.DB, trackers *senderTracker, sender string) bool {
-	event, err := fpolicy.ParseXMLNotification(payload)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "decode XML event from %s: %v\n", connection.RemoteAddr(), err)
-		return true
-	}
-	annotateSenderEvent(&event, trackers, sender)
-	if err := db.Store(event); err != nil {
-		fmt.Fprintf(os.Stderr, "store XML event from %s; closing sender connection: %v\n", sender, err)
-		return false
-	}
-	trackers.eventStored(sender)
-	trackers.logf("sender=%s state=event_stored operation=%s path=%q", sender, event.Operation, event.Path)
-	return true
-}
-
-func annotateSenderEvent(event *store.Event, trackers *senderTracker, sender string) {
-	event.SVMID, event.NodeID = trackers.eventMetadata(sender)
-	event.LIFIPv4 = sender
-}
-
-func acceptControls(context context.Context, listener net.Listener, db *store.DB, stop context.CancelFunc, trackers *senderTracker, activeConnections *connectionRegistry, accepts, connections *sync.WaitGroup, refresh func() error, ports func() []listenerPort) {
-	defer accepts.Done()
-	var retryDelay time.Duration
-	for {
-		connection, err := listener.Accept()
-		if err != nil {
-			if context.Err() != nil || errors.Is(err, net.ErrClosed) {
-				return
-			}
-			retryDelay = nextAcceptRetryDelay(retryDelay)
-			fmt.Fprintf(os.Stderr, "accept control connection: %v; retrying in %s\n", err, retryDelay)
-			if !waitForRetry(context, retryDelay) {
-				return
-			}
-			continue
-		}
-		retryDelay = 0
-		connections.Add(1)
-		go func() {
-			defer connections.Done()
-			activeConnections.Add(connection)
-			defer activeConnections.Remove(connection)
-			defer connection.Close()
-			if err := handleControl(connection, db, stop, trackers, refresh, ports); err != nil {
-				fmt.Fprintf(os.Stderr, "handle control request from %s: %v\n", connection.RemoteAddr(), err)
-			}
-		}()
-	}
-}
-
-func handleControl(connection net.Conn, db *store.DB, stop context.CancelFunc, trackers *senderTracker, refresh func() error, ports func() []listenerPort) error {
-	var request controlRequest
-	response := controlResponse{}
-	if err := json.NewDecoder(io.LimitReader(connection, 1024*1024)).Decode(&request); err != nil {
-		response.Error = "invalid request: " + err.Error()
-	} else {
-		switch request.Command {
-		case "status":
-			response.Status = "running"
-			response.Connections = trackers.connectionCount()
-			response.ListenerPorts = ports()
-			response.EventCount, err = db.EventCount()
-			response.RequestRate = trackers.requestRate(time.Now().UTC())
-		case "engines":
-			response.Engines = trackers.engines()
-		case "fpolicy-refresh":
-			err = refresh()
-			if err == nil {
-				response.Status = "refreshed"
-			}
-		case "listener-ports":
-			response.ListenerPorts = ports()
-		case "stop":
-			response.Status = "stopping"
-			stop()
-		case "events":
-			response.Events, err = db.EventsByPath(request.Path, request.Start, request.End)
-		case "path-parents":
-			response.Parents, err = db.ParentSummariesByPath(request.Path, request.Search, request.Start, request.End)
-		case "recent":
-			response.Events, err = db.EventsSince(request.Since)
-		case "volume-set":
-			err = db.SetVolumeName(request.VolumeMSID, request.VolumeName)
-			if err == nil {
-				response.Status = "updated"
-			}
-		case "volume-list":
-			response.Mappings, err = db.ListVolumeMappings()
-		case "svm-set":
-			err = db.SetSVMName(request.SVMID, request.SVMName)
-			if err == nil {
-				response.Status = "updated"
-			}
-		case "volume-svm-set":
-			err = db.SetVolumeSVMName(request.VolumeMSID, request.SVMName)
-			if err == nil {
-				response.Status = "updated"
-			}
-		case "parent-mappings-set":
-			err = db.CacheParentMappings(request.Parents)
-			if err == nil {
-				response.Status = "updated"
-			}
-		case "svm-list":
-			response.Mappings, err = db.ListSVMMappings()
-		case "events-reset":
-			err = db.ResetEvents()
-			if err == nil {
-				response.Status = "reset"
-			}
-		case "retention-show":
-			response.Retention, _, err = db.Retention()
-		case "retention-set":
-			err = db.SetRetention(request.Retention)
-			if err == nil {
-				response.DeletedEvents, err = db.ApplyRetention(time.Now().UTC())
-			}
-			if err == nil {
-				response.Retention = request.Retention
-				response.Status = "updated"
-			}
-		case "db-status":
-			var stats store.Stats
-			stats, err = db.Stats()
-			response.DBPath = stats.Path
-			response.DBSize = stats.Size
-		default:
-			response.Error = "unknown command"
-		}
-		if err != nil {
-			response.Error = err.Error()
-		}
-	}
-	if err := json.NewEncoder(connection).Encode(response); err != nil {
-		return fmt.Errorf("encode control response for %q: %w", request.Command, err)
-	}
-	return nil
-}
+type engineInfo = pathdifflib.EngineInfo
 
 func newDBCommand() *cobra.Command {
 	database := &cobra.Command{Use: "db", Short: "Manage persisted data"}
@@ -1826,7 +968,7 @@ func newFPolicyActionCommand(action, ontapAction string) *cobra.Command {
 	return command
 }
 
-func enableFPolicyPolicy(context context.Context, db *store.DB, client *ssh.Client, policy fpolicyPolicy, debugWriter io.Writer) error {
+func enableFPolicyPolicy(context context.Context, db reachabilityDatabase, client *ssh.Client, policy fpolicyPolicy, debugWriter io.Writer) error {
 	if err := context.Err(); err != nil {
 		return err
 	}
@@ -1862,7 +1004,7 @@ func enableFPolicyPolicy(context context.Context, db *store.DB, client *ssh.Clie
 	return waitForFPolicyConnection(context, client, policy, debugWriter, 30*time.Second)
 }
 
-func verifyFPolicyReachability(context context.Context, db *store.DB, client *ssh.Client, policy fpolicyPolicy, debugWriter io.Writer) error {
+func verifyFPolicyReachability(context context.Context, db reachabilityDatabase, client *ssh.Client, policy fpolicyPolicy, debugWriter io.Writer) error {
 	output, err := runSSHCommand(client, "network interface show -instance", debugWriter)
 	if err != nil {
 		return fmt.Errorf("could not list FPolicy-client LIFs before activation: %s", ontapErrorDetail(output))
@@ -4161,22 +3303,7 @@ func newControlCommand(name string) *cobra.Command {
 }
 
 func callControl(controlPath string, request controlRequest) (controlResponse, error) {
-	connection, err := net.Dial("unix", controlPath)
-	if err != nil {
-		return controlResponse{}, fmt.Errorf("connect to daemon: %w", err)
-	}
-	defer connection.Close()
-	if err := json.NewEncoder(connection).Encode(request); err != nil {
-		return controlResponse{}, fmt.Errorf("send daemon command %q: %w", request.Command, err)
-	}
-	var response controlResponse
-	if err := json.NewDecoder(connection).Decode(&response); err != nil {
-		return controlResponse{}, fmt.Errorf("read daemon command %q response: %w", request.Command, err)
-	}
-	if response.Error != "" {
-		return controlResponse{}, fmt.Errorf("daemon command %q: %s", request.Command, response.Error)
-	}
-	return response, nil
+	return pathdifflib.NewClient(controlPath).Do(context.Background(), request)
 }
 
 func printResponse(response controlResponse) error {
