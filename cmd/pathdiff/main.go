@@ -282,6 +282,10 @@ func (m *fpolicyListenerManager) Refresh() error {
 				if errors.Is(err, context.Canceled) {
 					return context.Canceled
 				}
+				var reachability *fpolicyReachabilityError
+				if errors.As(err, &reachability) && reachability.Known {
+					continue
+				}
 				fmt.Fprintf(os.Stderr, "FPolicy activation failed for SVM %s policy %s: %v; will retry on the next cDOT refresh\n", policy.SVM, policy.Name, err)
 				continue
 			}
@@ -1663,7 +1667,7 @@ func verifyFPolicyReachability(context context.Context, db *store.DB, client *ss
 					return err
 				}
 				if unreachable {
-					return fmt.Errorf("receiver unreachable from lif=%s addr=%s svm=%s node=%s; retained as unreachable until cDOT reports a new LIF address", lif.Name, lif.Address, lif.SVM, lif.Node)
+					return &fpolicyReachabilityError{LIF: lif, Target: target, Known: true, Reason: "previously marked unreachable; will not retry until cDOT reports a new LIF address"}
 				}
 			}
 			if err := pingFPolicyReceiver(context, client, lif, target, debugWriter); err != nil {
@@ -1679,6 +1683,17 @@ func verifyFPolicyReachability(context context.Context, db *store.DB, client *ss
 	return nil
 }
 
+type fpolicyReachabilityError struct {
+	LIF    fpolicyLIF
+	Target string
+	Known  bool
+	Reason string
+}
+
+func (e *fpolicyReachabilityError) Error() string {
+	return fmt.Sprintf("receiver unreachable from lif=%s addr=%s svm=%s node=%s: %s", e.LIF.Name, e.LIF.Address, e.LIF.SVM, e.LIF.Node, e.Reason)
+}
+
 func pingFPolicyReceiver(context context.Context, client *ssh.Client, lif fpolicyLIF, target string, debugWriter io.Writer) error {
 	for attempt := 1; attempt <= 5; attempt++ {
 		if err := context.Err(); err != nil {
@@ -1690,7 +1705,13 @@ func pingFPolicyReceiver(context context.Context, client *ssh.Client, lif fpolic
 			return nil
 		}
 		if attempt == 5 {
-			return fmt.Errorf("receiver unreachable from lif=%s addr=%s svm=%s node=%s after %d ping attempts; marking this address unreachable until it changes", lif.Name, lif.Address, lif.SVM, lif.Node, attempt)
+			reason := "cDOT-to-receiver ping failed after 5 attempts"
+			if receiverCanPingLIF(context, lif.Address) {
+				reason += "; receiver-to-LIF ping succeeded, so a one-way firewall or routing policy is likely"
+			} else {
+				reason += "; receiver-to-LIF ping also failed, so this LIF is likely on an isolated private network"
+			}
+			return &fpolicyReachabilityError{LIF: lif, Target: target, Reason: reason}
 		}
 		delay := time.Second * time.Duration(1<<(attempt-1))
 		select {
@@ -1700,6 +1721,11 @@ func pingFPolicyReceiver(context context.Context, client *ssh.Client, lif fpolic
 		}
 	}
 	return nil
+}
+
+func receiverCanPingLIF(context context.Context, address string) bool {
+	command := exec.CommandContext(context, "ping", "-c", "1", "-W", "1", address)
+	return command.Run() == nil
 }
 
 func fpolicyPingSucceeded(output []byte) bool {
