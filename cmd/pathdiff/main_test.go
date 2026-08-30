@@ -647,6 +647,15 @@ func TestFPolicyClientLIFs(t *testing.T) {
 	}
 }
 
+func TestFPolicyPingSucceeded(t *testing.T) {
+	if !fpolicyPingSucceeded([]byte("1 packets sent, 1 packets were received")) {
+		t.Fatal("successful ping was not recognized")
+	}
+	if fpolicyPingSucceeded([]byte("1 packets sent, 0 packets received, 100% packet loss")) || fpolicyPingSucceeded([]byte("no reply")) {
+		t.Fatal("unreachable ping was accepted")
+	}
+}
+
 func TestParseONTAPInstancesPreservesWrappedServiceList(t *testing.T) {
 	records := parseONTAPInstances("Vserver Name: finance\nLogical Interface Name: data\nService List: data-core, data-nfs,\n              data-fpolicy-client\nNetwork Address: 192.0.2.10\nOperational Status: up\n")
 	lifs := fpolicyClientLIFs(records)

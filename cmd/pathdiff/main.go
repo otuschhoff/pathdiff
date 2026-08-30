@@ -1656,14 +1656,26 @@ func verifyFPolicyReachability(context context.Context, client *ssh.Client, poli
 			if err := context.Err(); err != nil {
 				return err
 			}
-			pingCommand := "network ping -lif " + shellQuote(lif.Name) + " -vserver " + shellQuote(lif.SVM) + " -destination " + shellQuote(target) + " -count 1 -wait 1 -wait-response 1000"
+			pingCommand := "network ping -lif " + shellQuote(lif.Name) + " -vserver " + shellQuote(lif.SVM) + " -destination " + shellQuote(target) + " -count 1 -wait 1 -wait-response 1000 -show-detail true"
 			pingOutput, err := runSSHCommand(client, pingCommand, debugWriter)
 			if err != nil {
+				return fmt.Errorf("receiver %s is unreachable from FPolicy LIF %s (%s): %s; activation will not be attempted", target, lif.Name, lif.Address, ontapErrorDetail(pingOutput))
+			}
+			if !fpolicyPingSucceeded(pingOutput) {
 				return fmt.Errorf("receiver %s is unreachable from FPolicy LIF %s (%s): %s; activation will not be attempted", target, lif.Name, lif.Address, ontapErrorDetail(pingOutput))
 			}
 		}
 	}
 	return nil
+}
+
+func fpolicyPingSucceeded(output []byte) bool {
+	match := regexp.MustCompile(`(?i)(\d+)\s+packets?\s+(?:(?:are|were)\s+)?received`).FindStringSubmatch(string(output))
+	if len(match) != 2 {
+		return false
+	}
+	received, err := strconv.Atoi(match[1])
+	return err == nil && received > 0
 }
 
 func connectFPolicyEngine(client *ssh.Client, policy fpolicyPolicy, debugWriter io.Writer) error {
