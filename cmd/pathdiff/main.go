@@ -278,7 +278,7 @@ func (m *fpolicyListenerManager) Refresh() error {
 				continue
 			}
 			m.mu.Unlock()
-			if err := tryEnableFPolicyPolicy(m.context, policy); err != nil {
+			if err := tryEnableFPolicyPolicy(m.context, m.db, policy); err != nil {
 				if errors.Is(err, context.Canceled) {
 					return context.Canceled
 				}
@@ -377,7 +377,7 @@ func copySources(sources map[string]struct{}) map[string]struct{} {
 	return copy
 }
 
-func tryEnableFPolicyPolicy(context context.Context, policy fpolicyPolicy) error {
+func tryEnableFPolicyPolicy(context context.Context, db *store.DB, policy fpolicyPolicy) error {
 	host := defaultCDOTCluster()
 	keyFile, err := cdotKeyFile("")
 	if err != nil {
@@ -392,7 +392,7 @@ func tryEnableFPolicyPolicy(context context.Context, policy fpolicyPolicy) error
 		return err
 	}
 	defer client.Close()
-	return enableFPolicyPolicy(context, client, policy, nil)
+	return enableFPolicyPolicy(context, db, client, policy, nil)
 }
 
 func parseListenAddresses(specification string) ([]*net.TCPAddr, error) {
@@ -1252,6 +1252,7 @@ type expectedFPolicySender struct {
 type fpolicyLIF struct {
 	Name    string
 	SVM     string
+	Node    string
 	Address string
 }
 
@@ -1325,7 +1326,7 @@ func fpolicyClientLIFs(records []map[string]string) []fpolicyLIF {
 	for _, record := range records {
 		address := instanceField(record, "Network Address")
 		ip := net.ParseIP(address)
-		lif := fpolicyLIF{Name: instanceField(record, "Logical Interface Name"), SVM: instanceField(record, "Vserver"), Address: address}
+		lif := fpolicyLIF{Name: instanceField(record, "Logical Interface Name"), SVM: instanceField(record, "Vserver"), Node: instanceField(record, "Current Node"), Address: address}
 		if lif.Name == "" || lif.SVM == "" || ip == nil || ip.To4() == nil || !strings.Contains(strings.ToLower(instanceField(record, "Service List")), "data-fpolicy-client") || !strings.EqualFold(instanceField(record, "Operational Status"), "up") {
 			continue
 		}
@@ -1574,7 +1575,7 @@ func newFPolicyActionCommand(action, ontapAction string) *cobra.Command {
 		}
 		for _, policy := range selected {
 			if ontapAction == "enable" {
-				if err := enableFPolicyPolicy(command.Context(), client, policy, debugWriter); err != nil {
+				if err := enableFPolicyPolicy(command.Context(), nil, client, policy, debugWriter); err != nil {
 					return err
 				}
 				continue
@@ -1597,11 +1598,11 @@ func newFPolicyActionCommand(action, ontapAction string) *cobra.Command {
 	return command
 }
 
-func enableFPolicyPolicy(context context.Context, client *ssh.Client, policy fpolicyPolicy, debugWriter io.Writer) error {
+func enableFPolicyPolicy(context context.Context, db *store.DB, client *ssh.Client, policy fpolicyPolicy, debugWriter io.Writer) error {
 	if err := context.Err(); err != nil {
 		return err
 	}
-	if err := verifyFPolicyReachability(context, client, policy, debugWriter); err != nil {
+	if err := verifyFPolicyReachability(context, db, client, policy, debugWriter); err != nil {
 		return err
 	}
 	disableCommand := "vserver fpolicy disable -vserver " + shellQuote(policy.SVM) + " -policy-name " + shellQuote(policy.Name)
@@ -1633,7 +1634,7 @@ func enableFPolicyPolicy(context context.Context, client *ssh.Client, policy fpo
 	return waitForFPolicyConnection(context, client, policy, debugWriter, 30*time.Second)
 }
 
-func verifyFPolicyReachability(context context.Context, client *ssh.Client, policy fpolicyPolicy, debugWriter io.Writer) error {
+func verifyFPolicyReachability(context context.Context, db *store.DB, client *ssh.Client, policy fpolicyPolicy, debugWriter io.Writer) error {
 	output, err := runSSHCommand(client, "network interface show -instance", debugWriter)
 	if err != nil {
 		return fmt.Errorf("could not list FPolicy-client LIFs before activation: %s", ontapErrorDetail(output))
@@ -1656,14 +1657,46 @@ func verifyFPolicyReachability(context context.Context, client *ssh.Client, poli
 			if err := context.Err(); err != nil {
 				return err
 			}
-			pingCommand := "network ping -lif " + shellQuote(lif.Name) + " -vserver " + shellQuote(lif.SVM) + " -destination " + shellQuote(target) + " -count 1 -wait 1 -wait-response 1000 -show-detail true"
-			pingOutput, err := runSSHCommand(client, pingCommand, debugWriter)
-			if err != nil {
-				return fmt.Errorf("receiver %s is unreachable from FPolicy LIF %s (%s): %s; activation will not be attempted", target, lif.Name, lif.Address, ontapErrorDetail(pingOutput))
+			if db != nil {
+				unreachable, err := db.FPolicyLIFUnreachable(lif.SVM, lif.Name, lif.Address)
+				if err != nil {
+					return err
+				}
+				if unreachable {
+					return fmt.Errorf("receiver unreachable from lif=%s addr=%s svm=%s node=%s; retained as unreachable until cDOT reports a new LIF address", lif.Name, lif.Address, lif.SVM, lif.Node)
+				}
 			}
-			if !fpolicyPingSucceeded(pingOutput) {
-				return fmt.Errorf("receiver %s is unreachable from FPolicy LIF %s (%s): %s; activation will not be attempted", target, lif.Name, lif.Address, ontapErrorDetail(pingOutput))
+			if err := pingFPolicyReceiver(context, client, lif, target, debugWriter); err != nil {
+				if db != nil {
+					if markErr := db.MarkFPolicyLIFUnreachable(lif.SVM, lif.Name, lif.Address); markErr != nil {
+						return fmt.Errorf("%w; could not persist unreachable state: %v", err, markErr)
+					}
+				}
+				return err
 			}
+		}
+	}
+	return nil
+}
+
+func pingFPolicyReceiver(context context.Context, client *ssh.Client, lif fpolicyLIF, target string, debugWriter io.Writer) error {
+	for attempt := 1; attempt <= 5; attempt++ {
+		if err := context.Err(); err != nil {
+			return err
+		}
+		command := "network ping -lif " + shellQuote(lif.Name) + " -vserver " + shellQuote(lif.SVM) + " -destination " + shellQuote(target) + " -count 1 -wait 1 -wait-response 1000 -show-detail true"
+		output, err := runSSHCommand(client, command, debugWriter)
+		if err == nil && fpolicyPingSucceeded(output) {
+			return nil
+		}
+		if attempt == 5 {
+			return fmt.Errorf("receiver unreachable from lif=%s addr=%s svm=%s node=%s after %d ping attempts; marking this address unreachable until it changes", lif.Name, lif.Address, lif.SVM, lif.Node, attempt)
+		}
+		delay := time.Second * time.Duration(1<<(attempt-1))
+		select {
+		case <-context.Done():
+			return context.Err()
+		case <-time.After(delay):
 		}
 	}
 	return nil
