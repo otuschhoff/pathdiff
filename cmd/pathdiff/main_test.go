@@ -327,6 +327,82 @@ func TestDatabaseStatusFormatting(t *testing.T) {
 	}
 }
 
+func TestRetentionDurationAndFormatting(t *testing.T) {
+	for value, expected := range map[string]time.Duration{"30d": 30 * 24 * time.Hour, "36h": 36 * time.Hour, "90m": 90 * time.Minute} {
+		duration, err := parseRetentionDuration(value)
+		if err != nil || duration != expected {
+			t.Fatalf("parseRetentionDuration(%q) = %s, %v; want %s", value, duration, err, expected)
+		}
+	}
+	for _, value := range []string{"", "0", "0d", "forever"} {
+		if _, err := parseRetentionDuration(value); err == nil {
+			t.Fatalf("parseRetentionDuration(%q) succeeded", value)
+		}
+	}
+	var output bytes.Buffer
+	if err := printRetention(&output, controlResponse{Retention: 30 * 24 * time.Hour, DeletedEvents: 42}, true); err != nil {
+		t.Fatal(err)
+	}
+	if got := output.String(); !strings.Contains(got, "30d") || !strings.Contains(got, "42") || !strings.Contains(got, "EXPIRED EVENTS DELETED") {
+		t.Fatalf("unexpected retention output: %s", got)
+	}
+	output.Reset()
+	if err := printRetention(&output, controlResponse{}, false); err != nil {
+		t.Fatal(err)
+	}
+	if got := output.String(); !strings.Contains(got, "disabled") || strings.Contains(got, "EXPIRED EVENTS") {
+		t.Fatalf("unexpected disabled retention output: %s", got)
+	}
+}
+
+func TestRetentionCommandsRegistered(t *testing.T) {
+	root := newRootCommand()
+	for _, arguments := range [][]string{{"db", "retention", "show"}, {"db", "retention", "set"}} {
+		command, remaining, err := root.Find(arguments)
+		if err != nil || len(remaining) != 0 || command == nil {
+			t.Fatalf("Find(%v) = command %v, remaining %v, err %v", arguments, command, remaining, err)
+		}
+	}
+}
+
+func TestRetentionControlSetAndShow(t *testing.T) {
+	db, err := store.Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = db.Close() })
+	if err := db.Store(store.Event{Path: "/expired", Operation: "write", Timestamp: time.Now().UTC().Add(-2 * time.Hour)}); err != nil {
+		t.Fatal(err)
+	}
+	request := func(request controlRequest) controlResponse {
+		server, client := net.Pipe()
+		go func() {
+			defer server.Close()
+			handleControl(server, db, nil, nil, nil, nil)
+		}()
+		if err := json.NewEncoder(client).Encode(request); err != nil {
+			t.Fatal(err)
+		}
+		var response controlResponse
+		if err := json.NewDecoder(client).Decode(&response); err != nil {
+			t.Fatal(err)
+		}
+		_ = client.Close()
+		if response.Error != "" {
+			t.Fatal(response.Error)
+		}
+		return response
+	}
+	set := request(controlRequest{Command: "retention-set", Retention: time.Hour})
+	if set.Retention != time.Hour || set.DeletedEvents != 1 || set.Status != "updated" {
+		t.Fatalf("retention set response = %#v", set)
+	}
+	show := request(controlRequest{Command: "retention-show"})
+	if show.Retention != time.Hour {
+		t.Fatalf("retention show response = %#v", show)
+	}
+}
+
 func TestEngineSnapshotAndFormatting(t *testing.T) {
 	tracker := newSenderTracker(false)
 	tracker.senders["192.0.2.10"] = &senderStats{

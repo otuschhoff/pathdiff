@@ -65,6 +65,8 @@ bin/pathdiff path list firefox --start 10d
 bin/pathdiff path parent --path /vol/finance/ --sort timestamp --max 250
 bin/pathdiff db status
 bin/pathdiff db event reset
+bin/pathdiff db retention show
+bin/pathdiff db retention set 30d
 bin/pathdiff cdot volume list
 bin/pathdiff cdot svm list
 ```
@@ -82,6 +84,8 @@ bin/pathdiff cdot svm list
 `db event reset` removes all stored event records through the running daemon. It preserves configured volume MSID-to-name mappings.
 
 `db status` renders the live Pebble database path and its on-disk size through the daemon control socket.
+
+`db retention show` displays the persisted event retention policy, which is disabled until explicitly configured. `db retention set <duration>` accepts Go durations such as `36h` and whole-day values such as `30d`, persists the policy, and immediately removes expired events. The daemon reapplies the policy every minute, deleting expired records from both event indexes while preserving volume and SVM mappings.
 
 ## Implementation
 
