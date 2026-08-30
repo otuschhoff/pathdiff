@@ -254,6 +254,24 @@ func TestServiceFormatting(t *testing.T) {
 	}
 }
 
+func TestPrintMonitorEvents(t *testing.T) {
+	events := []store.Event{{Path: "/vol/finance/report.csv", Operation: "write", Timestamp: time.Date(2026, 8, 30, 12, 0, 0, 0, time.UTC), VolumeName: "finance", SVMName: "ncl1-1-vs-50", NodeID: "node-1", LIFIPv4: "192.0.2.10"}}
+	var output bytes.Buffer
+	if err := printMonitorEvents(&output, events, monitorOptions{ShowNode: true, ShowLIF: true}); err != nil {
+		t.Fatal(err)
+	}
+	if got := output.String(); !strings.Contains(got, "VOLUME") || !strings.Contains(got, "SVM") || !strings.Contains(got, "NODE") || !strings.Contains(got, "LIF") || !strings.Contains(got, "finance") || !strings.Contains(got, "192.0.2.10") {
+		t.Fatalf("unexpected monitor output: %s", got)
+	}
+	output.Reset()
+	if err := printMonitorEvents(&output, events, monitorOptions{HideTimestamp: true, HideOperation: true, HideVolume: true, HideSVM: true}); err != nil {
+		t.Fatal(err)
+	}
+	if got := output.String(); strings.Contains(got, "TIMESTAMP") || strings.Contains(got, "OPERATION") || strings.Contains(got, "VOLUME") || strings.Contains(got, "SVM") || !strings.Contains(got, "PATH") {
+		t.Fatalf("unexpected hidden monitor output: %s", got)
+	}
+}
+
 func TestDatabaseStatusFormatting(t *testing.T) {
 	if got := formatBytes(1536); got != "1.5 KiB" {
 		t.Fatalf("formatBytes() = %q", got)

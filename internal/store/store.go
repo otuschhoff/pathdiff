@@ -20,6 +20,10 @@ type Event struct {
 	Timestamp  time.Time `json:"timestamp"`
 	VolumeMSID string    `json:"volume_msid,omitempty"`
 	VolumeName string    `json:"volume_name,omitempty"`
+	SVMID      string    `json:"svm_id,omitempty"`
+	SVMName    string    `json:"svm_name,omitempty"`
+	NodeID     string    `json:"node_id,omitempty"`
+	LIFIPv4    string    `json:"lif_ipv4,omitempty"`
 }
 
 type DB struct {
@@ -89,6 +93,7 @@ func (d *DB) Store(event Event) error {
 		event.Timestamp = time.Now().UTC()
 	}
 	event.VolumeName = ""
+	event.SVMName = ""
 	data, err := json.Marshal(event)
 	if err != nil {
 		return err
@@ -220,6 +225,9 @@ func (d *DB) EventsSince(since time.Time) ([]Event, error) {
 		if err := d.resolveVolumeName(&event); err != nil {
 			return nil, err
 		}
+		if err := d.resolveSVMName(&event); err != nil {
+			return nil, err
+		}
 		events = append(events, event)
 	}
 	return events, iter.Error()
@@ -248,6 +256,9 @@ func (d *DB) EventsByPath(path string, start, end time.Time) ([]Event, error) {
 		if err := d.resolveVolumeName(&event); err != nil {
 			return nil, err
 		}
+		if err := d.resolveSVMName(&event); err != nil {
+			return nil, err
+		}
 		events = append(events, event)
 	}
 	return events, iter.Error()
@@ -266,5 +277,21 @@ func (d *DB) resolveVolumeName(event *Event) error {
 	}
 	defer closer.Close()
 	event.VolumeName = string(name)
+	return nil
+}
+
+func (d *DB) resolveSVMName(event *Event) error {
+	if event.SVMID == "" {
+		return nil
+	}
+	name, closer, err := d.db.Get(append([]byte("s:"), event.SVMID...))
+	if errors.Is(err, pebble.ErrNotFound) {
+		return nil
+	}
+	if err != nil {
+		return fmt.Errorf("look up SVM name: %w", err)
+	}
+	defer closer.Close()
+	event.SVMName = string(name)
 	return nil
 }
