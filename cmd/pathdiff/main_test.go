@@ -2,11 +2,13 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"crypto/ed25519"
 	"crypto/rand"
 	"crypto/x509"
 	"encoding/json"
 	"encoding/pem"
+	"errors"
 	"io"
 	"net"
 	"os"
@@ -321,6 +323,7 @@ func TestEngineSnapshotAndFormatting(t *testing.T) {
 		active:         1,
 		connectedSince: time.Now().UTC().Add(-time.Minute),
 		totalEvents:    43120,
+		sessionEvents:  43120,
 		localPort:      "9911",
 		lastSeen:       time.Now().UTC().Add(-time.Minute),
 		nodeID:         "node-1",
@@ -368,6 +371,22 @@ func TestEngineStatusFormatting(t *testing.T) {
 	}
 	if got := formatLastSeen(time.Time{}); got != text.FgYellow.Sprint("never") {
 		t.Fatalf("formatLastSeen(zero) = %q", got)
+	}
+}
+
+func TestEngineSessionMetricsResetAfterDisconnect(t *testing.T) {
+	tracker := newSenderTracker(false)
+	address := &net.TCPAddr{IP: net.ParseIP("192.0.2.1"), Port: 9911}
+	tracker.connect("192.0.2.10", address)
+	tracker.eventStored("192.0.2.10")
+	tracker.disconnect("192.0.2.10")
+	tracker.connect("192.0.2.10", address)
+	engine := tracker.engines()[0]
+	if engine.TotalEvents != 0 || !engine.LastSeen.IsZero() || engine.AverageRate != 0 || tracker.senders["192.0.2.10"].totalEvents != 1 {
+		t.Fatalf("session metrics were not reset: %#v", engine)
+	}
+	if formatEventRate(0) != text.FgHiBlack.Sprint("-") || formatEngineEventCount(0) != text.FgHiBlack.Sprint("-") {
+		t.Fatal("zero engine metrics were not rendered as muted dashes")
 	}
 }
 
@@ -640,6 +659,14 @@ func TestFPolicyEngineConnected(t *testing.T) {
 	}
 	if fpolicyEngineConnected([]string{"connected", "disconnected"}) || fpolicyEngineConnected(nil) {
 		t.Fatal("unexpected connected engine states")
+	}
+}
+
+func TestWaitForFPolicyConnectionHonorsCancellation(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if err := waitForFPolicyConnection(ctx, nil, fpolicyPolicy{}, nil, time.Second); !errors.Is(err, context.Canceled) {
+		t.Fatalf("waitForFPolicyConnection() error = %v", err)
 	}
 }
 

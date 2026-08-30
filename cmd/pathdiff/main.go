@@ -278,7 +278,10 @@ func (m *fpolicyListenerManager) Refresh() error {
 				continue
 			}
 			m.mu.Unlock()
-			if err := tryEnableFPolicyPolicy(policy); err != nil {
+			if err := tryEnableFPolicyPolicy(m.context, policy); err != nil {
+				if errors.Is(err, context.Canceled) {
+					return context.Canceled
+				}
 				fmt.Fprintf(os.Stderr, "FPolicy activation failed for SVM %s policy %s: %v; will retry on the next cDOT refresh\n", policy.SVM, policy.Name, err)
 				continue
 			}
@@ -374,7 +377,7 @@ func copySources(sources map[string]struct{}) map[string]struct{} {
 	return copy
 }
 
-func tryEnableFPolicyPolicy(policy fpolicyPolicy) error {
+func tryEnableFPolicyPolicy(context context.Context, policy fpolicyPolicy) error {
 	host := defaultCDOTCluster()
 	keyFile, err := cdotKeyFile("")
 	if err != nil {
@@ -389,7 +392,7 @@ func tryEnableFPolicyPolicy(policy fpolicyPolicy) error {
 		return err
 	}
 	defer client.Close()
-	return enableFPolicyPolicy(client, policy, nil)
+	return enableFPolicyPolicy(context, client, policy, nil)
 }
 
 func parseListenAddresses(specification string) ([]*net.TCPAddr, error) {
@@ -528,6 +531,7 @@ type senderStats struct {
 	protocol       string
 	intervalEvents uint64
 	totalEvents    uint64
+	sessionEvents  uint64
 	connectedSince time.Time
 	localPort      string
 	nodeID         string
@@ -559,6 +563,9 @@ func (t *senderTracker) connect(sender string, localAddress net.Addr) {
 	stats := t.sender(sender)
 	if stats.active == 0 {
 		stats.connectedSince = time.Now().UTC()
+		stats.intervalEvents = 0
+		stats.sessionEvents = 0
+		stats.lastSeen = time.Time{}
 		_, stats.localPort, _ = net.SplitHostPort(localAddress.String())
 	}
 	stats.active++
@@ -602,6 +609,7 @@ func (t *senderTracker) eventStored(sender string) {
 	stats := t.sender(sender)
 	stats.intervalEvents++
 	stats.totalEvents++
+	stats.sessionEvents++
 	stats.lastSeen = time.Now().UTC()
 	t.mu.Unlock()
 }
@@ -649,9 +657,9 @@ func (t *senderTracker) engines() []engineInfo {
 		elapsed := now.Sub(stats.connectedSince).Seconds()
 		average := 0.0
 		if elapsed > 0 {
-			average = float64(stats.totalEvents) / elapsed
+			average = float64(stats.sessionEvents) / elapsed
 		}
-		engines = append(engines, engineInfo{Since: stats.connectedSince, TotalEvents: stats.totalEvents, AverageRate: average, LIFIPv4: lifIPv4, NodeID: stats.nodeID, SVMID: stats.svmID, LocalPort: stats.localPort, LastSeen: stats.lastSeen})
+		engines = append(engines, engineInfo{Since: stats.connectedSince, TotalEvents: stats.sessionEvents, AverageRate: average, LIFIPv4: lifIPv4, NodeID: stats.nodeID, SVMID: stats.svmID, LocalPort: stats.localPort, LastSeen: stats.lastSeen})
 	}
 	return engines
 }
@@ -1550,7 +1558,7 @@ func newFPolicyActionCommand(action, ontapAction string) *cobra.Command {
 		}
 		for _, policy := range selected {
 			if ontapAction == "enable" {
-				if err := enableFPolicyPolicy(client, policy, debugWriter); err != nil {
+				if err := enableFPolicyPolicy(command.Context(), client, policy, debugWriter); err != nil {
 					return err
 				}
 				continue
@@ -1573,7 +1581,10 @@ func newFPolicyActionCommand(action, ontapAction string) *cobra.Command {
 	return command
 }
 
-func enableFPolicyPolicy(client *ssh.Client, policy fpolicyPolicy, debugWriter io.Writer) error {
+func enableFPolicyPolicy(context context.Context, client *ssh.Client, policy fpolicyPolicy, debugWriter io.Writer) error {
+	if err := context.Err(); err != nil {
+		return err
+	}
 	disableCommand := "vserver fpolicy disable -vserver " + shellQuote(policy.SVM) + " -policy-name " + shellQuote(policy.Name)
 	disableOutput, err := runSSHCommand(client, disableCommand, debugWriter)
 	if err != nil && !strings.Contains(strings.ToLower(string(disableOutput)), "not enabled") {
@@ -1581,6 +1592,9 @@ func enableFPolicyPolicy(client *ssh.Client, policy fpolicyPolicy, debugWriter i
 	}
 	enabled := false
 	for sequence := 1; sequence <= 1000; sequence++ {
+		if err := context.Err(); err != nil {
+			return err
+		}
 		remoteCommand := "vserver fpolicy enable -vserver " + shellQuote(policy.SVM) + " -policy-name " + shellQuote(policy.Name) + " -sequence-number " + strconv.Itoa(sequence)
 		output, err := runSSHCommand(client, remoteCommand, debugWriter)
 		if err == nil || strings.Contains(strings.ToLower(string(output)), "already enabled") {
@@ -1597,7 +1611,7 @@ func enableFPolicyPolicy(client *ssh.Client, policy fpolicyPolicy, debugWriter i
 	if err := connectFPolicyEngine(client, policy, debugWriter); err != nil {
 		return err
 	}
-	return waitForFPolicyConnection(client, policy, debugWriter, 30*time.Second)
+	return waitForFPolicyConnection(context, client, policy, debugWriter, 30*time.Second)
 }
 
 func connectFPolicyEngine(client *ssh.Client, policy fpolicyPolicy, debugWriter io.Writer) error {
@@ -1625,9 +1639,12 @@ func connectFPolicyEngine(client *ssh.Client, policy fpolicyPolicy, debugWriter 
 	return nil
 }
 
-func waitForFPolicyConnection(client *ssh.Client, policy fpolicyPolicy, debugWriter io.Writer, timeout time.Duration) error {
+func waitForFPolicyConnection(context context.Context, client *ssh.Client, policy fpolicyPolicy, debugWriter io.Writer, timeout time.Duration) error {
 	deadline := time.Now().Add(timeout)
 	for {
+		if err := context.Err(); err != nil {
+			return err
+		}
 		remoteCommand := "vserver fpolicy show-engine -vserver " + shellQuote(policy.SVM) + " -policy-name " + shellQuote(policy.Name) + " -fields vserver,policy-name,server-status"
 		output, err := runSSHCommand(client, remoteCommand, debugWriter)
 		if err != nil {
@@ -1640,7 +1657,11 @@ func waitForFPolicyConnection(client *ssh.Client, policy fpolicyPolicy, debugWri
 		if time.Now().After(deadline) {
 			return fmt.Errorf("receiver handshake did not complete within %s", timeout)
 		}
-		time.Sleep(time.Second)
+		select {
+		case <-context.Done():
+			return context.Err()
+		case <-time.After(time.Second):
+		}
 	}
 }
 
@@ -2339,14 +2360,14 @@ func printEngines(writer io.Writer, engines []engineInfo) error {
 		{Name: "Avg Event/s", Align: text.AlignRight, AlignHeader: text.AlignRight},
 		{Name: "Total Events", Align: text.AlignRight, AlignHeader: text.AlignRight},
 	})
-	tableWriter.AppendHeader(table.Row{"SVM", "Node", "LIF", "Port", "State", "Last Seen", "Since", "Avg Event/s", "Graph", "Total Events"})
+	tableWriter.AppendHeader(table.Row{"SVM", "Node", "LIF", "Port", "State", "Last Seen", "Up Since", "Avg Event/s", "Graph", "Total Events"})
 	for _, engine := range engines {
 		engine.LIFHostname = shortHostname(resolveHostname(engine.LIFIPv4))
 		node, svm := engine.NodeName, engineSVM(engine)
 		if node == "" {
 			node = engine.NodeID
 		}
-		tableWriter.AppendRow(table.Row{svm, node, engine.LIFHostname, engine.LocalPort, formatFPolicyState(engine.FPolicy), formatLastSeen(engine.LastSeen), engine.Since.UTC().Format(time.RFC3339), fmt.Sprintf("%.2f", engine.AverageRate), formatMetricGraphCell(engine.AverageRate, maxRate, 6), formatEventCount(engine.TotalEvents)})
+		tableWriter.AppendRow(table.Row{svm, node, engine.LIFHostname, engine.LocalPort, formatFPolicyState(engine.FPolicy), formatLastSeen(engine.LastSeen), engine.Since.UTC().Format(time.RFC3339), formatEventRate(engine.AverageRate), formatMetricGraphCell(engine.AverageRate, maxRate, 6), formatEngineEventCount(engine.TotalEvents)})
 	}
 	tableWriter.Render()
 	return nil
@@ -2357,6 +2378,20 @@ func engineSVM(engine engineInfo) string {
 		return engine.SVMName
 	}
 	return engine.SVMID
+}
+
+func formatEventRate(rate float64) string {
+	if rate == 0 {
+		return text.FgHiBlack.Sprint("-")
+	}
+	return fmt.Sprintf("%.2f", rate)
+}
+
+func formatEngineEventCount(count uint64) string {
+	if count == 0 {
+		return text.FgHiBlack.Sprint("-")
+	}
+	return formatEventCount(count)
 }
 
 func formatMetricGraphCell(value, maxValue float64, width int) string {
