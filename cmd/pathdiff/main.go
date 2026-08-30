@@ -59,16 +59,22 @@ type controlRequest struct {
 }
 
 type controlResponse struct {
-	Error       string          `json:"error,omitempty"`
-	Status      string          `json:"status,omitempty"`
-	Connections int             `json:"connections,omitempty"`
-	EventCount  uint64          `json:"event_count,omitempty"`
-	RequestRate float64         `json:"request_rate,omitempty"`
-	DBPath      string          `json:"db_path,omitempty"`
-	DBSize      uint64          `json:"db_size,omitempty"`
-	Events      []store.Event   `json:"events,omitempty"`
-	Engines     []engineInfo    `json:"engines,omitempty"`
-	Mappings    []store.Mapping `json:"mappings,omitempty"`
+	Error         string          `json:"error,omitempty"`
+	Status        string          `json:"status,omitempty"`
+	Connections   int             `json:"connections,omitempty"`
+	EventCount    uint64          `json:"event_count,omitempty"`
+	RequestRate   float64         `json:"request_rate,omitempty"`
+	DBPath        string          `json:"db_path,omitempty"`
+	DBSize        uint64          `json:"db_size,omitempty"`
+	Events        []store.Event   `json:"events,omitempty"`
+	Engines       []engineInfo    `json:"engines,omitempty"`
+	Mappings      []store.Mapping `json:"mappings,omitempty"`
+	ListenerPorts []listenerPort  `json:"listener_ports,omitempty"`
+}
+
+type listenerPort struct {
+	Port    int      `json:"port"`
+	Sources []string `json:"sources"`
 }
 
 func main() {
@@ -161,7 +167,7 @@ func runDaemon(dbPath, listenAddr, controlPath, recordDir string, verbose bool) 
 	defer listenerManager.Close()
 	go trackers.reportEvery(context, 10*time.Second)
 	go listenerManager.RefreshEvery(context, time.Minute)
-	go acceptControls(context, controlListener, db, cancel, trackers, activeConnections, &connections, listenerManager.Refresh)
+	go acceptControls(context, controlListener, db, cancel, trackers, activeConnections, &connections, listenerManager.Refresh, listenerManager.Ports)
 	<-context.Done()
 	listenerManager.Close()
 	_ = controlListener.Close()
@@ -200,6 +206,7 @@ type managedFPolicyListener struct {
 
 type fpolicyListenerManager struct {
 	mu                sync.Mutex
+	refreshMu         sync.Mutex
 	context           context.Context
 	listenEndpoints   map[int]*net.TCPAddr
 	receiverEndpoints []*net.TCPAddr
@@ -221,12 +228,13 @@ func newFPolicyListenerManager(context context.Context, listenEndpoints, receive
 }
 
 func (m *fpolicyListenerManager) Refresh() error {
-	m.mu.Lock()
-	defer m.mu.Unlock()
+	m.refreshMu.Lock()
+	defer m.refreshMu.Unlock()
 	expected, err := discoverFPolicySenders(m.receiverEndpoints)
 	if err != nil {
 		return err
 	}
+	m.mu.Lock()
 	for port, managed := range m.listeners {
 		if sender := expected[port]; sender == nil || !sameSources(managed.sources, sender.Sources) {
 			_ = managed.listener.Close()
@@ -234,7 +242,7 @@ func (m *fpolicyListenerManager) Refresh() error {
 		}
 	}
 	for port, sender := range expected {
-		if len(sender.Sources) == 0 || m.listeners[port] != nil {
+		if m.listeners[port] != nil {
 			continue
 		}
 		endpoint := m.listenEndpoints[port]
@@ -250,17 +258,23 @@ func (m *fpolicyListenerManager) Refresh() error {
 		m.listeners[port] = &managedFPolicyListener{listener: listener, sources: sources}
 		go acceptEvents(m.context, listener, sources, m.db, m.recordDir, m.trackers, m.connections, m.waitGroup)
 	}
+	m.mu.Unlock()
 	for _, sender := range expected {
 		for _, policy := range sender.Policies {
 			key := policy.SVM + "\x00" + policy.Name
+			m.mu.Lock()
 			if _, enabled := m.enabledPolicies[key]; enabled {
+				m.mu.Unlock()
 				continue
 			}
+			m.mu.Unlock()
 			if err := tryEnableFPolicyPolicy(policy); err != nil {
 				fmt.Fprintf(os.Stderr, "enable FPolicy policy %s on %s: %v\n", policy.Name, policy.SVM, err)
 				continue
 			}
+			m.mu.Lock()
 			m.enabledPolicies[key] = struct{}{}
+			m.mu.Unlock()
 		}
 	}
 	return nil
@@ -288,6 +302,22 @@ func (m *fpolicyListenerManager) Close() {
 		_ = listener.listener.Close()
 		delete(m.listeners, port)
 	}
+}
+
+func (m *fpolicyListenerManager) Ports() []listenerPort {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	ports := make([]listenerPort, 0, len(m.listeners))
+	for port, listener := range m.listeners {
+		sources := make([]string, 0, len(listener.sources))
+		for source := range listener.sources {
+			sources = append(sources, source)
+		}
+		sort.Strings(sources)
+		ports = append(ports, listenerPort{Port: port, Sources: sources})
+	}
+	sort.Slice(ports, func(left, right int) bool { return ports[left].Port < ports[right].Port })
+	return ports
 }
 
 func sameSources(left, right map[string]struct{}) bool {
@@ -325,11 +355,7 @@ func tryEnableFPolicyPolicy(policy fpolicyPolicy) error {
 		return err
 	}
 	defer client.Close()
-	output, err := runSSHCommand(client, "vserver fpolicy enable -vserver "+shellQuote(policy.SVM)+" -policy-name "+shellQuote(policy.Name), nil)
-	if err != nil && !strings.Contains(strings.ToLower(string(output)), "already enabled") {
-		return fmt.Errorf("%w: %s", err, strings.TrimSpace(string(output)))
-	}
-	return nil
+	return enableFPolicyPolicy(client, policy, nil)
 }
 
 func parseListenAddresses(specification string) ([]*net.TCPAddr, error) {
@@ -822,7 +848,7 @@ func storeXMLEvent(payload []byte, connection net.Conn, db *store.DB, trackers *
 	trackers.logf("sender=%s state=event_stored operation=%s path=%q", sender, event.Operation, event.Path)
 }
 
-func acceptControls(context context.Context, listener net.Listener, db *store.DB, stop context.CancelFunc, trackers *senderTracker, activeConnections *connectionRegistry, connections *sync.WaitGroup, refresh func() error) {
+func acceptControls(context context.Context, listener net.Listener, db *store.DB, stop context.CancelFunc, trackers *senderTracker, activeConnections *connectionRegistry, connections *sync.WaitGroup, refresh func() error, ports func() []listenerPort) {
 	for {
 		connection, err := listener.Accept()
 		if err != nil {
@@ -838,12 +864,12 @@ func acceptControls(context context.Context, listener net.Listener, db *store.DB
 			activeConnections.Add(connection)
 			defer activeConnections.Remove(connection)
 			defer connection.Close()
-			handleControl(connection, db, stop, trackers, refresh)
+			handleControl(connection, db, stop, trackers, refresh, ports)
 		}()
 	}
 }
 
-func handleControl(connection net.Conn, db *store.DB, stop context.CancelFunc, trackers *senderTracker, refresh func() error) {
+func handleControl(connection net.Conn, db *store.DB, stop context.CancelFunc, trackers *senderTracker, refresh func() error, ports func() []listenerPort) {
 	var request controlRequest
 	response := controlResponse{}
 	if err := json.NewDecoder(io.LimitReader(connection, 1024*1024)).Decode(&request); err != nil {
@@ -853,6 +879,7 @@ func handleControl(connection net.Conn, db *store.DB, stop context.CancelFunc, t
 		case "status":
 			response.Status = "running"
 			response.Connections = trackers.connectionCount()
+			response.ListenerPorts = ports()
 			response.EventCount, err = db.EventCount()
 			response.RequestRate = trackers.requestRate(time.Now().UTC())
 		case "engines":
@@ -862,6 +889,8 @@ func handleControl(connection net.Conn, db *store.DB, stop context.CancelFunc, t
 			if err == nil {
 				response.Status = "refreshed"
 			}
+		case "listener-ports":
+			response.ListenerPorts = ports()
 		case "stop":
 			response.Status = "stopping"
 			stop()
@@ -1005,21 +1034,41 @@ func enrichEngines(client *ssh.Client, engines []engineInfo, debugWriter io.Writ
 		engines[index].SVMName = svms[engines[index].SVMID]
 		engines[index].FPolicy = "unavailable"
 	}
-	fpolicyOutput, err := runSSHCommand(client, "vserver fpolicy show -instance", debugWriter)
+	fpolicyOutput, err := runSSHCommand(client, "vserver fpolicy show-engine -fields vserver,policy-name,server-status", debugWriter)
 	if err != nil {
 		return nil
 	}
-	statuses := make(map[string]string)
-	for _, record := range parseONTAPInstances(string(fpolicyOutput)) {
-		key := instanceField(record, "Vserver") + "\x00" + instanceField(record, "Node")
-		statuses[key] = instanceField(record, "Status")
-	}
+	statuses := fpolicyEngineStatesForServers(string(fpolicyOutput), localAddresses())
 	for index := range engines {
 		if status := statuses[engines[index].SVMName+"\x00"+engines[index].NodeName]; status != "" {
 			engines[index].FPolicy = status
 		}
 	}
 	return nil
+}
+
+func fpolicyEngineStatesForServers(output string, servers []string) map[string]string {
+	allowed := make(map[string]struct{}, len(servers))
+	for _, server := range servers {
+		allowed[server] = struct{}{}
+	}
+	states := make(map[string]string)
+	for _, line := range strings.Split(output, "\n") {
+		fields := strings.Fields(line)
+		if len(fields) != 5 || fields[0] == "node" || strings.HasPrefix(fields[0], "-") {
+			continue
+		}
+		if _, found := allowed[fields[3]]; !found {
+			continue
+		}
+		key := fields[1] + "\x00" + fields[0]
+		if strings.EqualFold(fields[4], "connected") {
+			states[key] = "connected"
+		} else if states[key] == "" {
+			states[key] = "off"
+		}
+	}
+	return states
 }
 
 func newCDOTCommand() *cobra.Command {
@@ -1292,6 +1341,9 @@ func pathdiffEndpoints() ([]*net.TCPAddr, error) {
 			if match := regexp.MustCompile(`--listen\s+("[^"]*"|\S+)`).FindStringSubmatch(string(unit)); len(match) == 2 {
 				if value, err := strconv.Unquote(match[1]); err == nil {
 					listenAddr = value
+					if listenAddr == ":9911" {
+						listenAddr = defaultListen
+					}
 				}
 			}
 		}
@@ -1301,7 +1353,6 @@ func pathdiffEndpoints() ([]*net.TCPAddr, error) {
 		return nil, fmt.Errorf("parse pathdiff listener %q: %w", listenAddr, err)
 	}
 	for _, endpoint := range endpoints {
-		host := endpoint.IP.String()
 		if endpoint.IP == nil || endpoint.IP.IsUnspecified() {
 			for _, address := range localAddresses() {
 				if ip := net.ParseIP(address); ip != nil && ip.To4() != nil {
@@ -1310,7 +1361,7 @@ func pathdiffEndpoints() ([]*net.TCPAddr, error) {
 				}
 			}
 		}
-		if ip := net.ParseIP(host); endpoint.IP == nil || ip == nil || endpoint.IP.To4() == nil {
+		if endpoint.IP == nil || endpoint.IP.To4() == nil {
 			return nil, fmt.Errorf("resolve pathdiff listener IPv4 address from %q", listenAddr)
 		}
 	}
@@ -1405,7 +1456,7 @@ func newFPolicyStopCommand() *cobra.Command {
 }
 
 func newFPolicyActionCommand(action, ontapAction string) *cobra.Command {
-	var keyFile, knownHostsFile string
+	var controlPath, keyFile, knownHostsFile string
 	var acceptNewHostKey, debugSSHExec, all bool
 	command := &cobra.Command{Use: action + " [<svmWildcardSearchTerm> [<policyClass>]]", Args: cobra.MaximumNArgs(2), Short: strings.ToUpper(action[:1]) + action[1:] + " FPolicy policy classes", RunE: func(command *cobra.Command, arguments []string) error {
 		policies, err := queryFPolicy(command, keyFile, knownHostsFile, acceptNewHostKey, debugSSHExec)
@@ -1422,6 +1473,11 @@ func newFPolicyActionCommand(action, ontapAction string) *cobra.Command {
 		selected := filterFPolicyPolicies(policies, svmPattern, policyPattern, all)
 		if len(selected) == 0 {
 			return errors.New("no matching FPolicy policy classes")
+		}
+		if ontapAction == "enable" {
+			if _, err := callControl(controlPath, controlRequest{Command: "fpolicy-refresh"}); err != nil {
+				return fmt.Errorf("ensure pathdiff is listening for FPolicy policies: %w", err)
+			}
 		}
 		host, _ := command.Flags().GetString("host")
 		user, _ := command.Flags().GetString("user")
@@ -1445,6 +1501,12 @@ func newFPolicyActionCommand(action, ontapAction string) *cobra.Command {
 			debugWriter = command.ErrOrStderr()
 		}
 		for _, policy := range selected {
+			if ontapAction == "enable" {
+				if err := enableFPolicyPolicy(client, policy, debugWriter); err != nil {
+					return err
+				}
+				continue
+			}
 			remoteCommand := "vserver fpolicy " + ontapAction + " -vserver " + shellQuote(policy.SVM) + " -policy-name " + shellQuote(policy.Name)
 			output, err := runSSHCommand(client, remoteCommand, debugWriter)
 			if err != nil {
@@ -1458,14 +1520,104 @@ func newFPolicyActionCommand(action, ontapAction string) *cobra.Command {
 		return printFPolicyAction(command.OutOrStdout(), selected, state)
 	}}
 	addCDOTConnectionFlags(command, &keyFile, &knownHostsFile, &acceptNewHostKey, &debugSSHExec)
+	command.Flags().StringVar(&controlPath, "control", defaultControl, "Unix control socket")
 	command.Flags().BoolVarP(&all, "all", "a", false, action+" all matching FPolicy policies instead of pathdiff*")
 	return command
+}
+
+func enableFPolicyPolicy(client *ssh.Client, policy fpolicyPolicy, debugWriter io.Writer) error {
+	disableCommand := "vserver fpolicy disable -vserver " + shellQuote(policy.SVM) + " -policy-name " + shellQuote(policy.Name)
+	disableOutput, err := runSSHCommand(client, disableCommand, debugWriter)
+	if err != nil && !strings.Contains(strings.ToLower(string(disableOutput)), "not enabled") {
+		return fmt.Errorf("stop FPolicy policy %s on %s before starting: %w: %s", policy.Name, policy.SVM, err, strings.TrimSpace(string(disableOutput)))
+	}
+	enabled := false
+	for sequence := 1; sequence <= 1000; sequence++ {
+		remoteCommand := "vserver fpolicy enable -vserver " + shellQuote(policy.SVM) + " -policy-name " + shellQuote(policy.Name) + " -sequence-number " + strconv.Itoa(sequence)
+		output, err := runSSHCommand(client, remoteCommand, debugWriter)
+		if err == nil || strings.Contains(strings.ToLower(string(output)), "already enabled") {
+			enabled = true
+			break
+		}
+		if !fpolicySequenceConflict(string(output)) {
+			return fmt.Errorf("start FPolicy policy %s on %s: %w: %s", policy.Name, policy.SVM, err, strings.TrimSpace(string(output)))
+		}
+	}
+	if !enabled {
+		return fmt.Errorf("start FPolicy policy %s on %s: no free sequence number found", policy.Name, policy.SVM)
+	}
+	if err := connectFPolicyEngine(client, policy, debugWriter); err != nil {
+		return err
+	}
+	return waitForFPolicyConnection(client, policy, debugWriter, 30*time.Second)
+}
+
+func connectFPolicyEngine(client *ssh.Client, policy fpolicyPolicy, debugWriter io.Writer) error {
+	nodeOutput, err := runSSHCommand(client, "node show -instance", debugWriter)
+	if err != nil {
+		return fmt.Errorf("list nodes for FPolicy policy %s on %s: %w", policy.Name, policy.SVM, err)
+	}
+	for _, node := range parseONTAPInstances(string(nodeOutput)) {
+		name := instanceField(node, "Node")
+		if name == "" {
+			continue
+		}
+		for _, server := range strings.Split(policy.Targets, ",") {
+			server = strings.TrimSpace(server)
+			if server == "" {
+				continue
+			}
+			remoteCommand := "vserver fpolicy engine-connect -vserver " + shellQuote(policy.SVM) + " -policy-name " + shellQuote(policy.Name) + " -node " + shellQuote(name) + " -server " + shellQuote(server)
+			output, err := runSSHCommand(client, remoteCommand, debugWriter)
+			if err != nil && !strings.Contains(strings.ToLower(string(output)), "already connected") {
+				return fmt.Errorf("connect FPolicy engine for policy %s on %s node %s server %s: %w: %s", policy.Name, policy.SVM, name, server, err, strings.TrimSpace(string(output)))
+			}
+		}
+	}
+	return nil
+}
+
+func waitForFPolicyConnection(client *ssh.Client, policy fpolicyPolicy, debugWriter io.Writer, timeout time.Duration) error {
+	deadline := time.Now().Add(timeout)
+	for {
+		remoteCommand := "vserver fpolicy show-engine -vserver " + shellQuote(policy.SVM) + " -policy-name " + shellQuote(policy.Name) + " -fields vserver,policy-name,server-status"
+		output, err := runSSHCommand(client, remoteCommand, debugWriter)
+		if err != nil {
+			return fmt.Errorf("check FPolicy connection for policy %s on %s: %w: %s", policy.Name, policy.SVM, err, strings.TrimSpace(string(output)))
+		}
+		statuses := parseFPolicyEngineStates(string(output))[policy.SVM+"\x00"+policy.Name]
+		if fpolicyEngineConnected(statuses) {
+			return nil
+		}
+		if time.Now().After(deadline) {
+			return fmt.Errorf("wait for FPolicy policy %s on %s to connect: timed out after %s", policy.Name, policy.SVM, timeout)
+		}
+		time.Sleep(time.Second)
+	}
+}
+
+func fpolicyEngineConnected(statuses []string) bool {
+	if len(statuses) == 0 {
+		return false
+	}
+	for _, status := range statuses {
+		if !strings.EqualFold(status, "connected") {
+			return false
+		}
+	}
+	return true
+}
+
+func fpolicySequenceConflict(output string) bool {
+	output = strings.ToLower(output)
+	return strings.Contains(output, "sequence") && (strings.Contains(output, "already") || strings.Contains(output, "in use") || strings.Contains(output, "exists"))
 }
 
 type fpolicyPolicy struct {
 	SVM     string
 	Name    string
 	Engine  string
+	State   string
 	Targets string
 	Port    string
 	SSL     string
@@ -1528,7 +1680,42 @@ func queryFPolicy(command *cobra.Command, keyFile, knownHostsFile string, accept
 	if err != nil {
 		return nil, fmt.Errorf("query cDOT FPolicy external engines: %w: %s", err, strings.TrimSpace(string(engineOutput)))
 	}
-	return parseFPolicyPolicies(string(policyOutput), string(engineOutput)), nil
+	policies := parseFPolicyPolicies(string(policyOutput), string(engineOutput))
+	stateOutput, err := runSSHCommand(client, "vserver fpolicy show-engine -fields vserver,policy-name,server-status", debugWriter)
+	if err != nil {
+		return policies, nil
+	}
+	applyFPolicyEngineStates(policies, parseFPolicyEngineStates(string(stateOutput)))
+	return policies, nil
+}
+
+func parseFPolicyEngineStates(output string) map[string][]string {
+	states := make(map[string][]string)
+	for _, line := range strings.Split(output, "\n") {
+		fields := strings.Fields(line)
+		if len(fields) != 5 || fields[0] == "node" || strings.HasPrefix(fields[0], "-") {
+			continue
+		}
+		key := fields[1] + "\x00" + fields[2]
+		states[key] = append(states[key], fields[4])
+	}
+	return states
+}
+
+func applyFPolicyEngineStates(policies []fpolicyPolicy, states map[string][]string) {
+	for index := range policies {
+		statuses := states[policies[index].SVM+"\x00"+policies[index].Name]
+		if len(statuses) == 0 {
+			continue
+		}
+		policies[index].State = "off"
+		for _, status := range statuses {
+			if strings.EqualFold(status, "connected") {
+				policies[index].State = "connected"
+				break
+			}
+		}
+	}
 }
 
 func parseFPolicyPolicies(policyOutput, engineOutput string) []fpolicyPolicy {
@@ -1548,6 +1735,7 @@ func parseFPolicyPolicies(policyOutput, engineOutput string) []fpolicyPolicy {
 			SVM:     instanceField(record, "Vserver"),
 			Name:    firstInstanceField(record, "Policy", "Policy Name", "Name"),
 			Engine:  engineName,
+			State:   "unknown",
 			Targets: fpolicyTargets(engine),
 			Port:    firstInstanceField(engine, "Port Number of FPolicy Service", "Port"),
 			SSL:     firstInstanceField(engine, "SSL Option for External Communication", "SSL Option", "SSL"),
@@ -1616,9 +1804,9 @@ func wildcardContains(value, pattern string) bool {
 
 func printFPolicyPolicies(writer io.Writer, policies []fpolicyPolicy) error {
 	tableWriter := newTableWriter(writer)
-	tableWriter.AppendHeader(table.Row{"SVM", "Engine", "Targets", "Port", "SSL", "Type", "Format", "Policy Class", "Event Class"})
+	tableWriter.AppendHeader(table.Row{"SVM", "Engine", "State", "Targets", "Port", "SSL", "Type", "Format", "Policy Class", "Event Class"})
 	for _, policy := range policies {
-		tableWriter.AppendRow(table.Row{policy.SVM, policy.Engine, policy.Targets, policy.Port, policy.SSL, policy.Type, policy.Format, policy.Name, policy.Events})
+		tableWriter.AppendRow(table.Row{policy.SVM, policy.Engine, formatFPolicyState(policy.State), policy.Targets, policy.Port, policy.SSL, policy.Type, policy.Format, policy.Name, policy.Events})
 	}
 	tableWriter.Render()
 	return nil
@@ -2078,8 +2266,11 @@ func formatLastSeen(lastSeen time.Time) string {
 }
 
 func formatFPolicyState(state string) string {
-	if state == "" || state == "unavailable" {
+	if state == "" || state == "unavailable" || strings.EqualFold(state, "disconnected") || strings.EqualFold(state, "off") {
 		return text.FgRed.Sprint("off")
+	}
+	if strings.EqualFold(state, "connected") {
+		return text.FgGreen.Sprint("connected")
 	}
 	return state
 }
@@ -2117,7 +2308,146 @@ func newNodeCommand() *cobra.Command {
 }
 
 func newLIFCommand() *cobra.Command {
-	return newCDOTInventoryCommand("lif", "List live cDOT LIFs", "network interface show -instance", []string{"Network Address", "Current Node", "Vserver"})
+	group := &cobra.Command{Use: "lif", Short: "List live cDOT LIFs"}
+	var keyFile, knownHostsFile, svm, node, subnet string
+	var acceptNewHostKey, debugSSHExec, all bool
+	list := &cobra.Command{Use: "list [<svmWildcardSearchTerm>]", Args: cobra.MaximumNArgs(1), Short: "List live cDOT LIFs", RunE: func(command *cobra.Command, arguments []string) error {
+		host, _ := command.Flags().GetString("host")
+		user, _ := command.Flags().GetString("user")
+		if host == "" {
+			return errors.New("host is required")
+		}
+		keyPath, err := cdotKeyFile(keyFile)
+		if err != nil {
+			return err
+		}
+		if knownHostsFile == "" {
+			knownHostsFile, err = cdotKnownHostsFile()
+			if err != nil {
+				return err
+			}
+		}
+		var debugWriter io.Writer
+		if debugSSHExec {
+			debugWriter = command.ErrOrStderr()
+		}
+		client, err := openCDOTClient(host, user, keyPath, knownHostsFile, acceptNewHostKey)
+		if err != nil {
+			return err
+		}
+		defer client.Close()
+		output, err := runSSHCommand(client, "network interface show -instance", debugWriter)
+		if err != nil {
+			return fmt.Errorf("query cDOT LIFs: %w: %s", err, strings.TrimSpace(string(output)))
+		}
+		records := parseONTAPInstances(string(output))
+		if !all {
+			records = reachableLIFs(records)
+		}
+		if len(arguments) == 1 {
+			records = filterLIFs(records, arguments[0], "", "")
+		}
+		records = filterLIFs(records, svm, node, subnet)
+		return printONTAPInventory(command.OutOrStdout(), []string{"Network Address", "Current Node", "Vserver"}, records)
+	}}
+	addCDOTConnectionFlags(list, &keyFile, &knownHostsFile, &acceptNewHostKey, &debugSSHExec)
+	list.Flags().BoolVarP(&all, "all", "a", false, "show all LIFs, including unreachable entries")
+	list.Flags().StringVar(&svm, "svm", "", "SVM name wildcard")
+	list.Flags().StringVar(&node, "node", "", "current node name wildcard")
+	list.Flags().StringVar(&subnet, "subnet", "", "subnet name wildcard")
+	var showKeyFile, showKnownHostsFile string
+	var showAcceptNewHostKey, showDebugSSHExec bool
+	show := &cobra.Command{Use: "show <lifName>", Args: cobra.ExactArgs(1), Short: "Show all details for a cDOT LIF", RunE: func(command *cobra.Command, arguments []string) error {
+		host, _ := command.Flags().GetString("host")
+		user, _ := command.Flags().GetString("user")
+		if host == "" {
+			return errors.New("host is required")
+		}
+		keyPath, err := cdotKeyFile(showKeyFile)
+		if err != nil {
+			return err
+		}
+		if showKnownHostsFile == "" {
+			showKnownHostsFile, err = cdotKnownHostsFile()
+			if err != nil {
+				return err
+			}
+		}
+		var debugWriter io.Writer
+		if showDebugSSHExec {
+			debugWriter = command.ErrOrStderr()
+		}
+		client, err := openCDOTClient(host, user, keyPath, showKnownHostsFile, showAcceptNewHostKey)
+		if err != nil {
+			return err
+		}
+		defer client.Close()
+		output, err := runSSHCommand(client, "network interface show -lif "+shellQuote(arguments[0])+" -instance", debugWriter)
+		if err != nil {
+			return fmt.Errorf("query cDOT LIF %s: %w: %s", arguments[0], err, strings.TrimSpace(string(output)))
+		}
+		records := parseONTAPInstances(string(output))
+		for _, record := range records {
+			if instanceField(record, "Logical Interface Name") == arguments[0] {
+				return printONTAPRecord(command.OutOrStdout(), record)
+			}
+		}
+		return fmt.Errorf("cDOT LIF %q was not found", arguments[0])
+	}}
+	addCDOTConnectionFlags(show, &showKeyFile, &showKnownHostsFile, &showAcceptNewHostKey, &showDebugSSHExec)
+	group.AddCommand(list, show)
+	return group
+}
+
+func printONTAPRecord(writer io.Writer, record map[string]string) error {
+	fields := make([]string, 0, len(record))
+	for field := range record {
+		fields = append(fields, field)
+	}
+	sort.Strings(fields)
+	tableWriter := newTableWriter(writer)
+	tableWriter.AppendHeader(table.Row{"Field", "Value"})
+	for _, field := range fields {
+		tableWriter.AppendRow(table.Row{field, record[field]})
+	}
+	tableWriter.Render()
+	return nil
+}
+
+func filterLIFsBySVM(records []map[string]string, pattern string) []map[string]string {
+	return filterLIFs(records, pattern, "", "")
+}
+
+func filterLIFs(records []map[string]string, svm, node, subnet string) []map[string]string {
+	filtered := make([]map[string]string, 0, len(records))
+	for _, record := range records {
+		if svm != "" && !wildcardContains(instanceField(record, "Vserver"), svm) {
+			continue
+		}
+		if node != "" && !wildcardContains(instanceField(record, "Current Node"), node) {
+			continue
+		}
+		if subnet != "" && !wildcardContains(instanceField(record, "Subnet Name"), subnet) {
+			continue
+		}
+		filtered = append(filtered, record)
+	}
+	return filtered
+}
+
+func reachableLIFs(records []map[string]string) []map[string]string {
+	filtered := make([]map[string]string, 0, len(records))
+	for _, record := range records {
+		address := net.ParseIP(instanceField(record, "Network Address"))
+		if address == nil || address.To4() == nil || address.IsLoopback() || address.IsLinkLocalUnicast() || address.IsUnspecified() {
+			continue
+		}
+		if status := instanceField(record, "Operational Status"); status != "" && !strings.EqualFold(status, "up") {
+			continue
+		}
+		filtered = append(filtered, record)
+	}
+	return filtered
 }
 
 func newCDOTInventoryCommand(name, summary, remoteCommand string, fields []string) *cobra.Command {
@@ -2171,6 +2501,9 @@ func printONTAPInventory(writer io.Writer, fields []string, records []map[string
 	}
 	tableWriter.AppendHeader(header)
 	for _, record := range records {
+		if !hasONTAPInventoryFields(record, fields) {
+			continue
+		}
 		row := make(table.Row, len(fields))
 		for index, field := range fields {
 			row[index] = instanceField(record, field)
@@ -2179,6 +2512,15 @@ func printONTAPInventory(writer io.Writer, fields []string, records []map[string
 	}
 	tableWriter.Render()
 	return nil
+}
+
+func hasONTAPInventoryFields(record map[string]string, fields []string) bool {
+	for _, field := range fields {
+		if instanceField(record, field) != "" {
+			return true
+		}
+	}
+	return false
 }
 
 func newCDOTListCommand(name, idColumn, summary, remoteCommand, nameField, idField string) *cobra.Command {
@@ -2288,6 +2630,11 @@ func instanceField(record map[string]string, field string) string {
 	if value := record[field]; value != "" {
 		return value
 	}
+	if strings.EqualFold(field, "Vserver") {
+		if value := record["Vserver Name"]; value != "" {
+			return value
+		}
+	}
 	for name, value := range record {
 		if strings.EqualFold(name, field) {
 			return value
@@ -2346,8 +2693,33 @@ func printMappings(writer io.Writer, nameColumn, idColumn string, mappings []sto
 
 func newServiceCommand() *cobra.Command {
 	service := &cobra.Command{Use: "service", Short: "Manage the pathdiff systemd service"}
-	service.AddCommand(newServiceStartCommand(), newServiceStatusCommand(), newServiceRefreshCommand(), newServiceStopCommand(), newServiceMonitorCommand())
+	service.AddCommand(newServiceStartCommand(), newServiceRestartCommand(), newServiceStatusCommand(), newServiceRefreshCommand(), newServiceListPortsCommand(), newServiceStopCommand(), newServiceMonitorCommand())
 	return service
+}
+
+func newServiceListPortsCommand() *cobra.Command {
+	var controlPath string
+	command := &cobra.Command{Use: "list-ports", Short: "List active FPolicy listener ports", RunE: func(command *cobra.Command, _ []string) error {
+		response, err := callControl(controlPath, controlRequest{Command: "listener-ports"})
+		if err != nil {
+			return err
+		}
+		tableWriter := newTableWriter(command.OutOrStdout())
+		tableWriter.AppendHeader(table.Row{"Port", "Allowed LIF IPv4s"})
+		for _, port := range response.ListenerPorts {
+			tableWriter.AppendRow(table.Row{port.Port, strings.Join(port.Sources, ", ")})
+		}
+		tableWriter.Render()
+		return nil
+	}}
+	command.Flags().StringVar(&controlPath, "control", defaultControl, "Unix control socket")
+	return command
+}
+
+func newServiceRestartCommand() *cobra.Command {
+	return &cobra.Command{Use: "restart", Short: "Restart the user systemd service", RunE: func(*cobra.Command, []string) error {
+		return runSystemctlUser("restart", "pathdiff.service")
+	}}
 }
 
 func newServiceRefreshCommand() *cobra.Command {
@@ -2397,11 +2769,12 @@ func newServiceStatusCommand() *cobra.Command {
 		if err != nil {
 			return err
 		}
-		connections, events, rate := "-", "-", "-"
+		connections, ports, events, rate := "-", "-", "-", "-"
 		if state == "active" {
 			response, err := callControl(controlPath, controlRequest{Command: "status"})
 			if err == nil {
-				connections = formatCount(uint64(response.Connections))
+				connections = formatHealthCount(response.Connections)
+				ports = formatHealthCount(len(response.ListenerPorts))
 				events = formatCount(response.EventCount)
 				rate = fmt.Sprintf("%.2f", response.RequestRate)
 			} else {
@@ -2409,13 +2782,21 @@ func newServiceStatusCommand() *cobra.Command {
 			}
 		}
 		tableWriter := newTableWriter(command.OutOrStdout())
-		tableWriter.AppendHeader(table.Row{"Service", "State", "FPolicy Connections", "Registered Events", "Requests/s Since Start"})
-		tableWriter.AppendRow(table.Row{"pathdiff", state, connections, events, rate})
+		tableWriter.AppendHeader(table.Row{"Service", "State", "FPolicy Connections", "Listen Ports", "Registered Events", "Requests/s Since Start"})
+		tableWriter.AppendRow(table.Row{"pathdiff", state, connections, ports, events, rate})
 		tableWriter.Render()
 		return nil
 	}}
 	command.Flags().StringVar(&controlPath, "control", defaultControl, "Unix control socket")
 	return command
+}
+
+func formatHealthCount(value int) string {
+	formatted := formatCount(uint64(value))
+	if value == 0 {
+		return text.FgRed.Sprint(formatted)
+	}
+	return formatted
 }
 
 func newServiceStopCommand() *cobra.Command {

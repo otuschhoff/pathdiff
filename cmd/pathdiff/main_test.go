@@ -19,6 +19,23 @@ import (
 	"golang.org/x/crypto/ssh"
 )
 
+func TestFPolicyListenerManagerPorts(t *testing.T) {
+	manager := &fpolicyListenerManager{listeners: map[int]*managedFPolicyListener{
+		9912: {sources: map[string]struct{}{"192.0.2.11": {}, "192.0.2.10": {}}},
+		9911: {sources: map[string]struct{}{"192.0.2.12": {}}},
+	}}
+	ports := manager.Ports()
+	if len(ports) != 2 || ports[0].Port != 9911 || ports[1].Port != 9912 || strings.Join(ports[1].Sources, ",") != "192.0.2.10,192.0.2.11" {
+		t.Fatalf("ports = %#v", ports)
+	}
+}
+
+func TestSameSourcesAllowsEmptySourceSets(t *testing.T) {
+	if !sameSources(map[string]struct{}{}, map[string]struct{}{}) {
+		t.Fatal("empty source sets should be equal")
+	}
+}
+
 func TestTrafficRecorder(t *testing.T) {
 	server, client := net.Pipe()
 	recorder, err := newTrafficRecorder(server, t.TempDir())
@@ -229,6 +246,12 @@ func TestServiceFormatting(t *testing.T) {
 	if !strings.Contains(unit, "ExecStart=/opt/pathdiff daemon run") || !strings.Contains(unit, "Restart=on-failure") {
 		t.Fatalf("unexpected systemd unit: %s", unit)
 	}
+	if got := formatHealthCount(0); got != text.FgRed.Sprint("0") {
+		t.Fatalf("formatHealthCount(0) = %q", got)
+	}
+	if got := formatHealthCount(2); got != "2" {
+		t.Fatalf("formatHealthCount(2) = %q", got)
+	}
 }
 
 func TestDatabaseStatusFormatting(t *testing.T) {
@@ -275,8 +298,18 @@ func TestEngineStatusFormatting(t *testing.T) {
 	if got := formatFPolicyState("unavailable"); got != text.FgRed.Sprint("off") {
 		t.Fatalf("formatFPolicyState(unavailable) = %q", got)
 	}
+	if got := formatFPolicyState("connected"); got != text.FgGreen.Sprint("connected") {
+		t.Fatalf("formatFPolicyState(connected) = %q", got)
+	}
 	if got := formatLastSeen(time.Time{}); got != text.FgYellow.Sprint("never") {
 		t.Fatalf("formatLastSeen(zero) = %q", got)
+	}
+}
+
+func TestFPolicyEngineStatesForServers(t *testing.T) {
+	states := fpolicyEngineStatesForServers("node vserver policy-name server server-status\n---- ------- ----------- ------ -------------\nnode-1 finance varonis 192.0.2.20 connected\nnode-1 finance pathdiff 192.0.2.10 disconnected\nnode-2 finance pathdiff 192.0.2.10 connected\n", []string{"192.0.2.10"})
+	if states["finance\x00node-1"] != "off" || states["finance\x00node-2"] != "connected" || states["finance\x00node-3"] != "" {
+		t.Fatalf("states = %#v", states)
 	}
 }
 
@@ -368,6 +401,77 @@ func TestParseONTAPInstances(t *testing.T) {
 	}
 }
 
+func TestInstanceFieldUsesLIFVserverName(t *testing.T) {
+	if got := instanceField(map[string]string{"Vserver Name": "finance"}, "Vserver"); got != "finance" {
+		t.Fatalf("LIF Vserver = %q", got)
+	}
+}
+
+func TestReachableLIFs(t *testing.T) {
+	records := []map[string]string{
+		{"Network Address": "172.21.33.154", "Operational Status": "up"},
+		{"Network Address": "169.254.82.216", "Operational Status": "up"},
+		{"Network Address": "172.21.33.155", "Operational Status": "down"},
+		{"Operational Status": "up"},
+	}
+	filtered := reachableLIFs(records)
+	if len(filtered) != 1 || instanceField(filtered[0], "Network Address") != "172.21.33.154" {
+		t.Fatalf("reachable LIFs = %#v", filtered)
+	}
+}
+
+func TestFilterLIFsBySVM(t *testing.T) {
+	records := []map[string]string{{"Vserver Name": "ncl1-1-vs-80"}, {"Vserver Name": "ncl1-1-vs-99"}}
+	filtered := filterLIFsBySVM(records, "80")
+	if len(filtered) != 1 || instanceField(filtered[0], "Vserver") != "ncl1-1-vs-80" {
+		t.Fatalf("filtered LIFs = %#v", filtered)
+	}
+}
+
+func TestFilterLIFs(t *testing.T) {
+	records := []map[string]string{
+		{"Vserver Name": "ncl1-1-vs-80", "Current Node": "ncl1-1-ps-07", "Subnet Name": "data-80"},
+		{"Vserver Name": "ncl1-1-vs-80", "Current Node": "ncl1-1-ps-08", "Subnet Name": "data-80"},
+		{"Vserver Name": "ncl1-1-vs-99", "Current Node": "ncl1-1-ps-08", "Subnet Name": "data-99"},
+	}
+	filtered := filterLIFs(records, "80", "07", "data-80")
+	if len(filtered) != 1 || instanceField(filtered[0], "Current Node") != "ncl1-1-ps-07" {
+		t.Fatalf("filtered LIFs = %#v", filtered)
+	}
+}
+
+func TestPrintONTAPRecord(t *testing.T) {
+	var output bytes.Buffer
+	if err := printONTAPRecord(&output, map[string]string{"Vserver Name": "finance", "Network Address": "192.0.2.10"}); err != nil {
+		t.Fatal(err)
+	}
+	if got := output.String(); !strings.Contains(got, "FIELD") || !strings.Contains(got, "Vserver Name") || !strings.Contains(got, "192.0.2.10") {
+		t.Fatalf("unexpected ONTAP record: %s", got)
+	}
+}
+
+func TestHasONTAPInventoryFields(t *testing.T) {
+	if hasONTAPInventoryFields(map[string]string{"Last login time": "now"}, []string{"Node"}) {
+		t.Fatal("login banner should not be rendered as inventory")
+	}
+	if !hasONTAPInventoryFields(map[string]string{"Node": "node-1"}, []string{"Node"}) {
+		t.Fatal("node inventory record was excluded")
+	}
+}
+
+func TestParseONTAPInstancesSkipsLIFLoginBanner(t *testing.T) {
+	records := parseONTAPInstances("Last login time: now\n\nVserver Name: finance\nLogical Interface Name: finance_data\nNetwork Address: 192.0.2.10\n")
+	var lif map[string]string
+	for _, record := range records {
+		if instanceField(record, "Logical Interface Name") == "finance_data" {
+			lif = record
+		}
+	}
+	if lif == nil || instanceField(lif, "Network Address") != "192.0.2.10" {
+		t.Fatalf("LIF record = %#v", lif)
+	}
+}
+
 func TestParseONTAPVolumeTable(t *testing.T) {
 	mappings := parseONTAPVolumeTable("vserver volume msid\n-------- ------ ----\nfinance data 2163258291\nengineering vol0 -\n")
 	if len(mappings) != 1 || mappings[0] != (cdotMapping{Vserver: "finance", Name: "data", ID: "2163258291"}) {
@@ -383,6 +487,10 @@ func TestParseFPolicyPolicies(t *testing.T) {
 	policy := policies[0]
 	if policy.SVM != "finance" || policy.Name != "track_inode_changes" || policy.Engine != "pathdiff" || policy.Targets != "192.0.2.10, 192.0.2.11" || policy.Port != "9911" || policy.SSL != "no-auth" || policy.Type != "asynchronous" || policy.Format != "xml" || policy.Events != "inode_change_events" {
 		t.Fatalf("unexpected policy: %#v", policy)
+	}
+	applyFPolicyEngineStates(policies, parseFPolicyEngineStates("node vserver policy-name server server-status\n---- ------- ----------- ------ -------------\nnode-1 finance track_inode_changes 192.0.2.10 disconnected\nnode-2 finance track_inode_changes 192.0.2.10 connected\n"))
+	if policies[0].State != "connected" {
+		t.Fatalf("policy state = %q", policies[0].State)
 	}
 	if filtered := filterFPolicyPolicies(policies, "finance", "", false); len(filtered) != 1 {
 		t.Fatalf("default filter excluded pathdiff policy: %#v", filtered)
@@ -426,6 +534,31 @@ func TestFPolicyActionCommands(t *testing.T) {
 	}
 }
 
+func TestFPolicySequenceConflict(t *testing.T) {
+	if !fpolicySequenceConflict("Error: sequence number 1 is already in use") {
+		t.Fatal("expected sequence conflict")
+	}
+	if fpolicySequenceConflict("Error: permission denied") {
+		t.Fatal("unexpected sequence conflict")
+	}
+}
+
+func TestFPolicyEngineConnectCommand(t *testing.T) {
+	policy := fpolicyPolicy{SVM: "finance", Name: "pathdiff_policy", Targets: "192.0.2.10"}
+	if got := "vserver fpolicy engine-connect -vserver " + shellQuote(policy.SVM) + " -policy-name " + shellQuote(policy.Name) + " -node " + shellQuote("node-1") + " -server " + shellQuote("192.0.2.10"); got != "vserver fpolicy engine-connect -vserver \"finance\" -policy-name \"pathdiff_policy\" -node \"node-1\" -server \"192.0.2.10\"" {
+		t.Fatalf("engine-connect command = %q", got)
+	}
+}
+
+func TestFPolicyEngineConnected(t *testing.T) {
+	if !fpolicyEngineConnected([]string{"connected", "CONNECTED"}) {
+		t.Fatal("expected connected engine states")
+	}
+	if fpolicyEngineConnected([]string{"connected", "disconnected"}) || fpolicyEngineConnected(nil) {
+		t.Fatal("unexpected connected engine states")
+	}
+}
+
 func TestServiceRefreshCommand(t *testing.T) {
 	service := newServiceCommand()
 	command, _, err := service.Find([]string{"refresh"})
@@ -434,6 +567,25 @@ func TestServiceRefreshCommand(t *testing.T) {
 	}
 	if controlPath, err := command.Flags().GetString("control"); err != nil || controlPath != defaultControl {
 		t.Fatalf("refresh control path = %q, err = %v", controlPath, err)
+	}
+}
+
+func TestServiceListPortsCommand(t *testing.T) {
+	service := newServiceCommand()
+	command, _, err := service.Find([]string{"list-ports"})
+	if err != nil || command == nil || command.Use != "list-ports" {
+		t.Fatalf("list-ports command = %#v, err = %v", command, err)
+	}
+	if controlPath, err := command.Flags().GetString("control"); err != nil || controlPath != defaultControl {
+		t.Fatalf("list-ports control path = %q, err = %v", controlPath, err)
+	}
+}
+
+func TestServiceRestartCommand(t *testing.T) {
+	service := newServiceCommand()
+	command, _, err := service.Find([]string{"restart"})
+	if err != nil || command == nil || command.Use != "restart" {
+		t.Fatalf("restart command = %#v, err = %v", command, err)
 	}
 }
 
