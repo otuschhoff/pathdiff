@@ -572,6 +572,13 @@ func (t *senderTracker) eventStored(sender string) {
 	t.mu.Unlock()
 }
 
+func (t *senderTracker) eventMetadata(sender string) (svmID, nodeID string) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	stats := t.sender(sender)
+	return stats.svmID, stats.nodeID
+}
+
 func (t *senderTracker) connectionCount() int {
 	t.mu.Lock()
 	defer t.mu.Unlock()
@@ -806,6 +813,7 @@ func storeScreenEvent(payload []byte, connection net.Conn, db *store.DB, tracker
 		fmt.Fprintf(os.Stderr, "decode ONTAP XML screen request from %s: %v\n", connection.RemoteAddr(), err)
 		return
 	}
+	annotateSenderEvent(&event, trackers, sender)
 	if err := db.Store(event); err != nil {
 		fmt.Fprintln(os.Stderr, "store ONTAP XML screen request:", err)
 		return
@@ -840,12 +848,18 @@ func storeXMLEvent(payload []byte, connection net.Conn, db *store.DB, trackers *
 		fmt.Fprintf(os.Stderr, "decode XML event from %s: %v\n", connection.RemoteAddr(), err)
 		return
 	}
+	annotateSenderEvent(&event, trackers, sender)
 	if err := db.Store(event); err != nil {
 		fmt.Fprintln(os.Stderr, "store XML event:", err)
 		return
 	}
 	trackers.eventStored(sender)
 	trackers.logf("sender=%s state=event_stored operation=%s path=%q", sender, event.Operation, event.Path)
+}
+
+func annotateSenderEvent(event *store.Event, trackers *senderTracker, sender string) {
+	event.SVMID, event.NodeID = trackers.eventMetadata(sender)
+	event.LIFIPv4 = sender
 }
 
 func acceptControls(context context.Context, listener net.Listener, db *store.DB, stop context.CancelFunc, trackers *senderTracker, activeConnections *connectionRegistry, connections *sync.WaitGroup, refresh func() error, ports func() []listenerPort) {
@@ -2242,6 +2256,12 @@ func generateCDOTKey(keyFile string) error {
 func printEngines(writer io.Writer, engines []engineInfo) error {
 	sort.Slice(engines, func(left, right int) bool { return engines[left].LIFIPv4 < engines[right].LIFIPv4 })
 	tableWriter := newTableWriter(writer)
+	tableWriter.SetColumnConfigs([]table.ColumnConfig{
+		{Name: "Port", Align: text.AlignRight, AlignHeader: text.AlignRight},
+		{Name: "Last Seen", Align: text.AlignRight, AlignHeader: text.AlignRight},
+		{Name: "Avg Event/s", Align: text.AlignRight, AlignHeader: text.AlignRight},
+		{Name: "Total Events", Align: text.AlignRight, AlignHeader: text.AlignRight},
+	})
 	tableWriter.AppendHeader(table.Row{"SVM", "Node", "LIF", "Port", "State", "Last Seen", "Since", "Avg Event/s", "Total Events"})
 	for _, engine := range engines {
 		engine.LIFHostname = shortHostname(resolveHostname(engine.LIFIPv4))
@@ -3180,6 +3200,7 @@ func newTableWriter(writer io.Writer) table.Writer {
 	tableWriter.SetStyle(table.StyleRounded)
 	tableWriter.Style().Color.Border = text.Colors{text.FgHiBlack}
 	tableWriter.Style().Color.Separator = text.Colors{text.FgHiBlack}
+	tableWriter.SetColumnConfigs([]table.ColumnConfig{{Name: "Port", Align: text.AlignRight, AlignHeader: text.AlignRight}})
 	return tableWriter
 }
 
@@ -3214,6 +3235,7 @@ func normalizePathSearch(search string) string {
 func newMonitorCommand() *cobra.Command {
 	var controlPath, sinceValue, path string
 	var interval time.Duration
+	var showNode, showLIF, hideOperation, hideTimestamp, hideSVM, hideVolume bool
 	command := &cobra.Command{Use: "monitor", Short: "Print newly observed path changes", RunE: func(command *cobra.Command, _ []string) error {
 		if interval <= 0 {
 			return errors.New("interval must be greater than zero")
@@ -3236,6 +3258,7 @@ func newMonitorCommand() *cobra.Command {
 			if err != nil {
 				return err
 			}
+			var events []store.Event
 			for _, event := range response.Events {
 				if path != "" && !strings.HasPrefix(event.Path, path) {
 					continue
@@ -3249,7 +3272,10 @@ func newMonitorCommand() *cobra.Command {
 					continue
 				}
 				seen[key] = struct{}{}
-				if err := json.NewEncoder(command.OutOrStdout()).Encode(event); err != nil {
+				events = append(events, event)
+			}
+			if len(events) > 0 {
+				if err := printMonitorEvents(command.OutOrStdout(), events, monitorOptions{ShowNode: showNode, ShowLIF: showLIF, HideOperation: hideOperation, HideTimestamp: hideTimestamp, HideSVM: hideSVM, HideVolume: hideVolume}); err != nil {
 					return err
 				}
 			}
@@ -3264,7 +3290,75 @@ func newMonitorCommand() *cobra.Command {
 	command.Flags().StringVar(&sinceValue, "since", "", "RFC3339 timestamp; defaults to now")
 	command.Flags().StringVar(&path, "path", "", "optional path prefix")
 	command.Flags().DurationVar(&interval, "interval", time.Second, "poll interval")
+	command.Flags().BoolVar(&showNode, "show-node", false, "include the ONTAP node ID")
+	command.Flags().BoolVar(&showLIF, "show-lif", false, "include the sender LIF IPv4")
+	command.Flags().BoolVar(&hideOperation, "hide-op", false, "hide the operation column")
+	command.Flags().BoolVar(&hideTimestamp, "hide-timestamp", false, "hide the timestamp column")
+	command.Flags().BoolVar(&hideSVM, "hide-svm", false, "hide the SVM column")
+	command.Flags().BoolVar(&hideVolume, "hide-volume", false, "hide the volume column")
 	return command
+}
+
+type monitorOptions struct {
+	ShowNode, ShowLIF                                 bool
+	HideOperation, HideTimestamp, HideSVM, HideVolume bool
+}
+
+func printMonitorEvents(writer io.Writer, events []store.Event, options monitorOptions) error {
+	tableWriter := newTableWriter(writer)
+	header := table.Row{}
+	if !options.HideTimestamp {
+		header = append(header, "Timestamp")
+	}
+	if !options.HideOperation {
+		header = append(header, "Operation")
+	}
+	if !options.HideVolume {
+		header = append(header, "Volume")
+	}
+	if !options.HideSVM {
+		header = append(header, "SVM")
+	}
+	if options.ShowNode {
+		header = append(header, "Node")
+	}
+	if options.ShowLIF {
+		header = append(header, "LIF")
+	}
+	header = append(header, "Path")
+	tableWriter.AppendHeader(header)
+	for _, event := range events {
+		row := table.Row{}
+		if !options.HideTimestamp {
+			row = append(row, event.Timestamp.UTC().Format(time.RFC3339Nano))
+		}
+		if !options.HideOperation {
+			row = append(row, event.Operation)
+		}
+		if !options.HideVolume {
+			row = append(row, eventVolume(event))
+		}
+		if !options.HideSVM {
+			row = append(row, eventSVM(event))
+		}
+		if options.ShowNode {
+			row = append(row, event.NodeID)
+		}
+		if options.ShowLIF {
+			row = append(row, event.LIFIPv4)
+		}
+		row = append(row, event.Path)
+		tableWriter.AppendRow(row)
+	}
+	tableWriter.Render()
+	return nil
+}
+
+func eventSVM(event store.Event) string {
+	if event.SVMName != "" {
+		return event.SVMName
+	}
+	return event.SVMID
 }
 
 func newControlCommand(name string) *cobra.Command {

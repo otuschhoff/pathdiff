@@ -18,7 +18,7 @@ bin/pathdiff service status
 bin/pathdiff service restart
 bin/pathdiff service refresh
 bin/pathdiff service list-ports
-bin/pathdiff service monitor --path /vol/finance/ --interval 2s
+bin/pathdiff service monitor --path /vol/finance/ --show-node --show-lif
 bin/pathdiff service stop
 bin/pathdiff engine list
 bin/pathdiff cdot node list
@@ -69,7 +69,7 @@ bin/pathdiff cdot volume list
 bin/pathdiff cdot svm list
 ```
 
-`monitor` prints newly observed events as JSON lines until interrupted. Add `--since RFC3339` to replay changes from a particular timestamp. The default control socket is `/tmp/pathdiff.sock`; set `--control` on both daemon and client to use another socket. The daemon commits both time and path indexes atomically to Pebble. Configure the FPolicy receiver or a protocol adapter to emit the line-delimited JSON above.
+`monitor` prints newly observed events as tables until interrupted. It shows timestamp, operation, volume, SVM, and path by default. Add `--show-node` or `--show-lif` for sender metadata; use `--hide-op`, `--hide-timestamp`, `--hide-svm`, or `--hide-volume` to suppress individual default columns. Add `--since RFC3339` to replay changes from a particular timestamp. The default control socket is `/tmp/pathdiff.sock`; set `--control` on both daemon and client to use another socket. The daemon commits both time and path indexes atomically to Pebble. Configure the FPolicy receiver or a protocol adapter to emit the line-delimited JSON above.
 
 `events --start` and `--end` accept RFC3339 timestamps, dates such as `2026-08-28`, or relative expressions: `10d`, `1m`, `5h10m`, and `1M4d` mean ten days, one minute, five hours ten minutes, and one month four days ago. Use uppercase `M` for calendar months; lowercase `m` always means minutes. Omit `--start` for the last 24 hours or `--end` for now.
 
