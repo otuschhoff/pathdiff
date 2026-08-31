@@ -62,7 +62,7 @@ func main() {
 func newRootCommand() *cobra.Command {
 	root := &cobra.Command{Use: "pathdiff", Short: "Store and inspect FPolicy path changes", SilenceUsage: true}
 	root.AddGroup(&cobra.Group{ID: "queries", Title: "Query Commands:"}, &cobra.Group{ID: "management", Title: "Management Commands:"}, &cobra.Group{ID: "service", Title: "Service Commands:"}, &cobra.Group{ID: "other", Title: "Other Commands:"})
-	root.AddCommand(newDaemonCommand(), newEventsCommand(), newPathCommand(), newDBCommand(), newEngineCommand(), newCDOTCommand(), newServiceCommand())
+	root.AddCommand(newDaemonCommand(), newEventsCommand(), newPathCommand(), newVolumeSummaryCommand(), newDBCommand(), newEngineCommand(), newCDOTCommand(), newServiceCommand())
 	root.SetHelpCommandGroupID("other")
 	root.InitDefaultCompletionCmd()
 	root.CompletionOptions.HiddenDefaultCmd = false
@@ -71,9 +71,9 @@ func newRootCommand() *cobra.Command {
 	}
 	for _, command := range root.Commands() {
 		switch command.Name() {
-		case "events", "path":
+		case "events", "path", "volume":
 			command.GroupID = "queries"
-		case "volume", "svm", "db", "engine", "cdot":
+		case "svm", "db", "engine", "cdot":
 			command.GroupID = "management"
 		case "service":
 			command.GroupID = "service"
@@ -2632,6 +2632,7 @@ func formatBytes(value uint64) string {
 func newEventsCommand() *cobra.Command {
 	var controlPath, pathPrefix, startValue, endValue string
 	var maxResults int
+	var filters eventFilters
 	command := &cobra.Command{Use: "events [path-search]", Args: cobra.MaximumNArgs(1), Short: "List changes below a path during a time range", RunE: func(command *cobra.Command, arguments []string) error {
 		now := time.Now().UTC()
 		start, err := parseTimeExpression("start", startValue, now, -24*time.Hour)
@@ -2653,13 +2654,14 @@ func newEventsCommand() *cobra.Command {
 		if len(arguments) == 1 {
 			wildcard = normalizePathSearch(arguments[0])
 		}
-		return printEvents(command.OutOrStdout(), response.Events, wildcard, maxResults)
+		return printEvents(command.OutOrStdout(), filters.filterEvents(response.Events), wildcard, maxResults)
 	}}
 	command.Flags().StringVar(&controlPath, "control", defaultControl, "Unix control socket")
 	command.Flags().StringVar(&pathPrefix, "path", "", "path prefix")
 	command.Flags().StringVar(&startValue, "start", "", "inclusive time; RFC3339, YYYY-MM-DD, or relative duration (default 24h ago)")
 	command.Flags().StringVar(&endValue, "end", "", "inclusive time; RFC3339, YYYY-MM-DD, or relative duration (default now)")
 	command.Flags().IntVar(&maxResults, "max", 100, "maximum results to display")
+	addEventFilterFlags(command, &filters)
 	return command
 }
 
@@ -2677,6 +2679,7 @@ func newPathParentCommand() *cobra.Command {
 	var controlPath, pathPrefix, startValue, endValue, sortBy string
 	var export pathExportOptions
 	var maxResults int
+	var filters eventFilters
 	command := &cobra.Command{Use: "parent [path-search]", Args: cobra.MaximumNArgs(1), Short: "List parent directories changed during a time range", RunE: func(command *cobra.Command, arguments []string) error {
 		start, end, err := eventRange(startValue, endValue, time.Now().UTC())
 		if err != nil {
@@ -2704,9 +2707,9 @@ func newPathParentCommand() *cobra.Command {
 			if err := sortParentSummaries(response.Parents, sortBy); err != nil {
 				return err
 			}
-			return exportPathRecords(command.OutOrStdout(), response.Parents, format, requestedFilename, "parent", time.Now().UTC())
+			return exportPathRecords(command.OutOrStdout(), filters.filterSummaries(response.Parents), format, requestedFilename, "parent", time.Now().UTC())
 		}
-		return printParentSummaries(command.OutOrStdout(), response.Parents, maxResults, sortBy)
+		return printParentSummaries(command.OutOrStdout(), filters.filterSummaries(response.Parents), maxResults, sortBy)
 	}}
 	command.Flags().StringVar(&controlPath, "control", defaultControl, "Unix control socket")
 	command.Flags().StringVar(&pathPrefix, "path", "", "path prefix")
@@ -2714,14 +2717,117 @@ func newPathParentCommand() *cobra.Command {
 	command.Flags().StringVar(&endValue, "end", "", "inclusive time; RFC3339, YYYY-MM-DD, or relative duration (default now)")
 	command.Flags().IntVar(&maxResults, "max", 100, "maximum paths to display")
 	command.Flags().StringVar(&sortBy, "sort", "path", "sort by path or timestamp")
+	addSummaryFilterFlags(command, &filters)
 	addPathExportFlags(command, &export)
 	return command
+}
+
+func newVolumeSummaryCommand() *cobra.Command {
+	var controlPath, pathPrefix, startValue, endValue string
+	var maxResults int
+	var filters eventFilters
+	command := &cobra.Command{Use: "volume [volume-search]", Args: cobra.MaximumNArgs(1), Short: "Summarize changed paths per SVM and volume", RunE: func(command *cobra.Command, arguments []string) error {
+		start, end, err := eventRange(startValue, endValue, time.Now().UTC())
+		if err != nil {
+			return err
+		}
+		response, err := callControl(controlPath, controlRequest{Command: "path-parents", Search: "*", Path: pathPrefix, Start: start, End: end})
+		if err != nil {
+			return err
+		}
+		if parentSummariesNeedResolution(response.Parents) {
+			volumes, err := queryMonitorVolumes()
+			if err != nil {
+				return err
+			}
+			resolveParentSummaries(response.Parents, volumes)
+			if err := cacheParentSummaryNames(controlPath, response.Parents); err != nil {
+				return err
+			}
+		}
+		search := "*"
+		if len(arguments) == 1 {
+			search = normalizePathSearch(arguments[0])
+		}
+		volumes, err := aggregateVolumeSummaries(filters.filterSummaries(response.Parents), search)
+		if err != nil {
+			return err
+		}
+		return printVolumeSummaries(command.OutOrStdout(), volumes, maxResults)
+	}}
+	command.Flags().StringVar(&controlPath, "control", defaultControl, "Unix control socket")
+	command.Flags().StringVar(&pathPrefix, "path", "", "path prefix")
+	command.Flags().StringVar(&startValue, "start", "", "inclusive time; RFC3339, YYYY-MM-DD, or relative duration (default 24h ago)")
+	command.Flags().StringVar(&endValue, "end", "", "inclusive time; RFC3339, YYYY-MM-DD, or relative duration (default now)")
+	command.Flags().IntVar(&maxResults, "max", 100, "maximum volumes to display")
+	addSummaryFilterFlags(command, &filters)
+	return command
+}
+
+type volumeSummary struct {
+	SVM     string `json:"svm"`
+	Volume  string `json:"volume"`
+	Changes uint64 `json:"changes"`
+}
+
+func aggregateVolumeSummaries(summaries []store.ParentSummary, search string) ([]volumeSummary, error) {
+	totals := make(map[string]*volumeSummary)
+	for _, summary := range summaries {
+		volume := parentVolume(summary)
+		matched, err := wildcardMatch(search, volume)
+		if err != nil {
+			return nil, fmt.Errorf("invalid volume search %q: %w", search, err)
+		}
+		if !matched {
+			continue
+		}
+		svm := parentSVM(summary)
+		total, found := totals[svm+"\x00"+volume]
+		if !found {
+			total = &volumeSummary{SVM: svm, Volume: volume}
+			totals[svm+"\x00"+volume] = total
+		}
+		total.Changes += summary.ChildCount
+	}
+	volumes := make([]volumeSummary, 0, len(totals))
+	for _, total := range totals {
+		volumes = append(volumes, *total)
+	}
+	sort.Slice(volumes, func(left, right int) bool {
+		if volumes[left].SVM != volumes[right].SVM {
+			return volumes[left].SVM < volumes[right].SVM
+		}
+		return volumes[left].Volume < volumes[right].Volume
+	})
+	return volumes, nil
+}
+
+func printVolumeSummaries(writer io.Writer, volumes []volumeSummary, maxResults int) error {
+	if maxResults < 1 {
+		return errors.New("max must be greater than zero")
+	}
+	if len(volumes) == 0 {
+		_, err := io.WriteString(writer, "No records found.\n")
+		return err
+	}
+	if len(volumes) > maxResults {
+		_, err := fmt.Fprintf(writer, "%s changed volumes match; increase %s and/or tighten the volume search, %s prefix, or time range.\n", highlightQueryHint(strconv.Itoa(len(volumes))), highlightQueryHint("--max"), highlightQueryHint("--path"))
+		return err
+	}
+	tableWriter := newTableWriter(writer)
+	tableWriter.AppendHeader(table.Row{"SVM", "Volume", "CNT"})
+	for _, volume := range volumes {
+		tableWriter.AppendRow(table.Row{volume.SVM, volume.Volume, volume.Changes})
+	}
+	tableWriter.Render()
+	return nil
 }
 
 func newPathQueryCommand(use, summary string, render func(io.Writer, []store.Event, string, int, string) error) *cobra.Command {
 	var controlPath, pathPrefix, startValue, endValue, sortBy string
 	var export pathExportOptions
 	var maxResults int
+	var filters eventFilters
 	command := &cobra.Command{Use: use, Args: cobra.MaximumNArgs(1), Short: summary, RunE: func(command *cobra.Command, arguments []string) error {
 		start, end, err := eventRange(startValue, endValue, time.Now().UTC())
 		if err != nil {
@@ -2731,18 +2837,19 @@ func newPathQueryCommand(use, summary string, render func(io.Writer, []store.Eve
 		if err != nil {
 			return err
 		}
+		events := filters.filterEvents(response.Events)
 		search := "*"
 		if len(arguments) == 1 {
 			search = normalizePathSearch(arguments[0])
 		}
 		if format, requestedFilename := export.selected(); format != "" {
-			results, err := pathRows(response.Events, search, sortBy, func(event store.Event) string { return event.Path })
+			results, err := pathRows(events, search, sortBy, func(event store.Event) string { return event.Path })
 			if err != nil {
 				return err
 			}
 			return exportPathRecords(command.OutOrStdout(), results, format, requestedFilename, "list", time.Now().UTC())
 		}
-		return render(command.OutOrStdout(), response.Events, search, maxResults, sortBy)
+		return render(command.OutOrStdout(), events, search, maxResults, sortBy)
 	}}
 	command.Flags().StringVar(&controlPath, "control", defaultControl, "Unix control socket")
 	command.Flags().StringVar(&pathPrefix, "path", "", "path prefix")
@@ -2750,6 +2857,7 @@ func newPathQueryCommand(use, summary string, render func(io.Writer, []store.Eve
 	command.Flags().StringVar(&endValue, "end", "", "inclusive time; RFC3339, YYYY-MM-DD, or relative duration (default now)")
 	command.Flags().IntVar(&maxResults, "max", 100, "maximum paths to display")
 	command.Flags().StringVar(&sortBy, "sort", "path", "sort by path or timestamp")
+	addEventFilterFlags(command, &filters)
 	addPathExportFlags(command, &export)
 	return command
 }
@@ -3084,6 +3192,7 @@ func newMonitorCommand() *cobra.Command {
 	var controlPath, sinceValue, path string
 	var interval time.Duration
 	var showNode, showLIF, showOperation, hideTimestamp, hideSVM, hideVolume, jsonOutput bool
+	var filters eventFilters
 	command := &cobra.Command{Use: "monitor", Short: "Print newly observed path changes", RunE: func(command *cobra.Command, _ []string) error {
 		if interval <= 0 {
 			return errors.New("interval must be greater than zero")
@@ -3129,6 +3238,9 @@ func newMonitorCommand() *cobra.Command {
 				}
 				seen[key] = struct{}{}
 				resolveMonitorEvent(&event, volumes)
+				if !filters.matches(event) {
+					continue
+				}
 				events = append(events, event)
 			}
 			if len(events) > 0 {
@@ -3155,6 +3267,7 @@ func newMonitorCommand() *cobra.Command {
 	command.Flags().StringVar(&sinceValue, "since", "", "RFC3339 timestamp; defaults to now")
 	command.Flags().StringVar(&path, "path", "", "optional path prefix")
 	command.Flags().DurationVar(&interval, "interval", time.Second, "poll interval")
+	addEventFilterFlags(command, &filters)
 	command.Flags().BoolVar(&showNode, "show-node", false, "include the ONTAP node ID")
 	command.Flags().BoolVar(&showLIF, "show-lif", false, "include the sender LIF IPv4")
 	command.Flags().BoolVar(&showOperation, "show-op", false, "include the operation column")
@@ -3163,6 +3276,75 @@ func newMonitorCommand() *cobra.Command {
 	command.Flags().BoolVar(&hideVolume, "hide-volume", false, "hide the volume column")
 	command.Flags().BoolVar(&jsonOutput, "json", false, "output resolved events as JSON lines")
 	return command
+}
+
+type eventFilters struct {
+	SVMs, Volumes, Nodes, LIFs []string
+}
+
+// Values within one filter match by OR; separate filters match by AND.
+func (f eventFilters) matches(event store.Event) bool {
+	return matchesFilter(f.SVMs, event.SVMName, event.SVMID) &&
+		matchesFilter(f.Volumes, event.VolumeName, event.VolumeMSID) &&
+		matchesFilter(f.Nodes, event.NodeID) &&
+		matchesFilter(f.LIFs, event.LIFIPv4)
+}
+
+func (f eventFilters) matchesSummary(summary store.ParentSummary) bool {
+	return matchesFilter(f.SVMs, summary.SVMName, summary.SVMID) &&
+		matchesFilter(f.Volumes, summary.VolumeName, summary.VolumeMSID)
+}
+
+func (f eventFilters) filterEvents(events []store.Event) []store.Event {
+	if len(f.SVMs)+len(f.Volumes)+len(f.Nodes)+len(f.LIFs) == 0 {
+		return events
+	}
+	filtered := make([]store.Event, 0, len(events))
+	for _, event := range events {
+		if f.matches(event) {
+			filtered = append(filtered, event)
+		}
+	}
+	return filtered
+}
+
+func (f eventFilters) filterSummaries(summaries []store.ParentSummary) []store.ParentSummary {
+	if len(f.SVMs)+len(f.Volumes) == 0 {
+		return summaries
+	}
+	filtered := make([]store.ParentSummary, 0, len(summaries))
+	for _, summary := range summaries {
+		if f.matchesSummary(summary) {
+			filtered = append(filtered, summary)
+		}
+	}
+	return filtered
+}
+
+func matchesFilter(patterns []string, values ...string) bool {
+	if len(patterns) == 0 {
+		return true
+	}
+	for _, pattern := range patterns {
+		for _, value := range values {
+			if value != "" && wildcardContains(value, pattern) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// Aggregated queries carry no sender metadata, so they omit the node and LIF filters.
+func addSummaryFilterFlags(command *cobra.Command, filters *eventFilters) {
+	command.Flags().StringArrayVar(&filters.SVMs, "svm", nil, "only show results for matching SVM names or IDs; repeatable")
+	command.Flags().StringArrayVar(&filters.Volumes, "volume", nil, "only show results for matching volume names or MSIDs; repeatable")
+}
+
+func addEventFilterFlags(command *cobra.Command, filters *eventFilters) {
+	addSummaryFilterFlags(command, filters)
+	command.Flags().StringArrayVar(&filters.Nodes, "node", nil, "only show events from matching node IDs; repeatable")
+	command.Flags().StringArrayVar(&filters.LIFs, "lif", nil, "only show events from matching sender LIF IPv4 addresses; repeatable")
 }
 
 type monitorVolume struct {
