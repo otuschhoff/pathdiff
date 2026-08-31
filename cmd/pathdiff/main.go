@@ -40,6 +40,9 @@ const (
 	defaultListen            = ":9911-9999"
 	fpolicyPolicyShowCommand = "vserver fpolicy policy show"
 	fpolicyEngineShowCommand = "vserver fpolicy policy external-engine show -fields primary-servers,secondary-servers,port,ssl-option"
+	minimumActivationDelay   = time.Minute
+	maximumActivationDelay   = time.Hour
+	cdotVerifyInterval       = 15 * time.Minute
 )
 
 var (
@@ -115,14 +118,15 @@ func runDaemon(dbPath, listenAddr, controlPath, recordDir string, verbose bool) 
 		DatabasePath:      dbPath,
 		ControlPath:       controlPath,
 		RecordDirectory:   recordDir,
-		RefreshInterval:   time.Minute,
+		RefreshInterval:   cdotVerifyInterval,
 		RetentionInterval: time.Minute,
+		RestoreListeners:  true,
 	})
 	if err != nil {
 		return err
 	}
 	discovery := newFPolicyReceiverDiscovery(listenerEndpoints, receiverEndpoints, receiver.Database(), verbose)
-	receiver.SetRefresh(discovery.Refresh, time.Minute)
+	receiver.SetRefresh(discovery.Refresh, cdotVerifyInterval)
 	return receiver.Run(ctx)
 }
 
@@ -130,12 +134,12 @@ type fpolicyReceiverDiscovery struct {
 	mu                sync.Mutex
 	listenEndpoints   map[int]*net.TCPAddr
 	receiverEndpoints []*net.TCPAddr
-	db                reachabilityDatabase
+	db                discoveryDatabase
 	enabledPolicies   map[string]struct{}
 	verbose           bool
 }
 
-func newFPolicyReceiverDiscovery(listenEndpoints, receiverEndpoints []*net.TCPAddr, db reachabilityDatabase, verbose bool) *fpolicyReceiverDiscovery {
+func newFPolicyReceiverDiscovery(listenEndpoints, receiverEndpoints []*net.TCPAddr, db discoveryDatabase, verbose bool) *fpolicyReceiverDiscovery {
 	endpoints := make(map[int]*net.TCPAddr, len(listenEndpoints))
 	for _, endpoint := range listenEndpoints {
 		endpoints[endpoint.Port] = endpoint
@@ -146,10 +150,12 @@ func newFPolicyReceiverDiscovery(listenEndpoints, receiverEndpoints []*net.TCPAd
 func (d *fpolicyReceiverDiscovery) Refresh(ctx context.Context, receiver *pathdifflib.Receiver) error {
 	d.mu.Lock()
 	defer d.mu.Unlock()
-	expected, err := discoverFPolicySenders(ctx, d.receiverEndpoints)
+	discovery, err := discoverFPolicySenders(ctx, d.receiverEndpoints)
 	if err != nil {
 		return err
 	}
+	expected := discovery.Senders
+	d.cacheInventory(discovery)
 	configs := make([]pathdifflib.ListenerConfig, 0, len(expected))
 	expectedPolicies := make(map[string]struct{})
 	for port, sender := range expected {
@@ -180,6 +186,13 @@ func (d *fpolicyReceiverDiscovery) Refresh(ctx context.Context, receiver *pathdi
 			if _, enabled := d.enabledPolicies[key]; enabled {
 				continue
 			}
+			now := time.Now().UTC()
+			activation, err := d.db.FPolicyActivation(policy.SVM, policy.Name)
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "read FPolicy activation state for SVM %s policy %s: %v\n", policy.SVM, policy.Name, err)
+			} else if now.Before(activation.RetryAt) {
+				continue
+			}
 			if err := tryEnableFPolicyPolicy(ctx, d.db, policy); err != nil {
 				if errors.Is(err, context.Canceled) {
 					return context.Canceled
@@ -188,13 +201,74 @@ func (d *fpolicyReceiverDiscovery) Refresh(ctx context.Context, receiver *pathdi
 				if errors.As(err, &reachability) && reachability.Known {
 					continue
 				}
-				fmt.Fprintf(os.Stderr, "FPolicy activation failed for SVM %s policy %s: %v; will retry on the next cDOT refresh\n", policy.SVM, policy.Name, err)
+				d.recordActivationFailure(policy, activation, err, now)
 				continue
+			}
+			if err := d.db.ClearFPolicyActivation(policy.SVM, policy.Name); err != nil {
+				fmt.Fprintf(os.Stderr, "clear FPolicy activation state for SVM %s policy %s: %v\n", policy.SVM, policy.Name, err)
 			}
 			d.enabledPolicies[key] = struct{}{}
 		}
 	}
 	return nil
+}
+
+// cacheInventory refreshes the persisted sender, SVM, and volume metadata verified against cDOT.
+func (d *fpolicyReceiverDiscovery) cacheInventory(discovery fpolicyDiscovery) {
+	now := time.Now().UTC()
+	for _, lif := range discovery.LIFs {
+		sender, err := d.db.Sender(lif.Address)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "read persisted sender %s: %v\n", lif.Address, err)
+			continue
+		}
+		if sender.LIFName == lif.Name && sender.SVMName == lif.SVM && sender.NodeName == lif.Node {
+			continue
+		}
+		sender.LIFIPv4, sender.LIFName, sender.SVMName, sender.NodeName, sender.UpdatedAt = lif.Address, lif.Name, lif.SVM, lif.Node, now
+		if err := d.db.SetSender(sender); err != nil {
+			fmt.Fprintf(os.Stderr, "persist sender %s: %v\n", lif.Address, err)
+		}
+	}
+	for _, volume := range discovery.Volumes {
+		if volume.ID == "" || volume.Name == "" {
+			continue
+		}
+		if err := d.db.SetVolumeName(volume.ID, volume.Name); err != nil {
+			fmt.Fprintf(os.Stderr, "persist volume %s: %v\n", volume.ID, err)
+			continue
+		}
+		if volume.Vserver != "" {
+			if err := d.db.SetVolumeSVMName(volume.ID, volume.Vserver); err != nil {
+				fmt.Fprintf(os.Stderr, "persist volume SVM %s: %v\n", volume.ID, err)
+			}
+		}
+	}
+}
+
+func (d *fpolicyReceiverDiscovery) recordActivationFailure(policy fpolicyPolicy, activation pathdifflib.FPolicyActivation, failure error, now time.Time) {
+	activation.Failures++
+	activation.Reason = failure.Error()
+	delay := nextActivationDelay(activation.Failures)
+	activation.RetryAt = now.Add(delay)
+	if err := d.db.SetFPolicyActivation(policy.SVM, policy.Name, activation); err != nil {
+		fmt.Fprintf(os.Stderr, "persist FPolicy activation state for SVM %s policy %s: %v\n", policy.SVM, policy.Name, err)
+	}
+	fmt.Fprintf(os.Stderr, "FPolicy activation failed for SVM %s policy %s (attempt %d): %v; retrying in %s\n", policy.SVM, policy.Name, activation.Failures, failure, delay)
+}
+
+func nextActivationDelay(failures uint64) time.Duration {
+	if failures < 1 {
+		failures = 1
+	}
+	delay := minimumActivationDelay
+	for range failures - 1 {
+		delay *= 2
+		if delay >= maximumActivationDelay {
+			return maximumActivationDelay
+		}
+	}
+	return delay
 }
 
 func fpolicySenderSVMs(sender *expectedFPolicySender) []string {
@@ -215,6 +289,17 @@ func fpolicySenderSVMs(sender *expectedFPolicySender) []string {
 type reachabilityDatabase interface {
 	FPolicyLIFUnreachable(svm, lif, address string) (bool, error)
 	MarkFPolicyLIFUnreachable(svm, lif, address string) error
+}
+
+type discoveryDatabase interface {
+	reachabilityDatabase
+	FPolicyActivation(svm, policy string) (pathdifflib.FPolicyActivation, error)
+	SetFPolicyActivation(svm, policy string, activation pathdifflib.FPolicyActivation) error
+	ClearFPolicyActivation(svm, policy string) error
+	Sender(lifIPv4 string) (pathdifflib.Sender, error)
+	SetSender(sender pathdifflib.Sender) error
+	SetVolumeName(msid, name string) error
+	SetVolumeSVMName(msid, name string) error
 }
 
 func tryEnableFPolicyPolicy(context context.Context, db reachabilityDatabase, policy fpolicyPolicy) error {
@@ -622,35 +707,46 @@ type fpolicyLIF struct {
 	Address string
 }
 
-func discoverFPolicySenders(context context.Context, endpoints []*net.TCPAddr) (map[int]*expectedFPolicySender, error) {
+// fpolicyDiscovery is one cDOT verification pass: expected senders plus the inventory that resolves them.
+type fpolicyDiscovery struct {
+	Senders map[int]*expectedFPolicySender
+	LIFs    []fpolicyLIF
+	Volumes []cdotMapping
+}
+
+func discoverFPolicySenders(context context.Context, endpoints []*net.TCPAddr) (fpolicyDiscovery, error) {
 	host := defaultCDOTCluster()
 	if host == "" {
-		return nil, errors.New("cDOT host is required to discover FPolicy senders")
+		return fpolicyDiscovery{}, errors.New("cDOT host is required to discover FPolicy senders")
 	}
 	keyFile, err := cdotKeyFile("")
 	if err != nil {
-		return nil, err
+		return fpolicyDiscovery{}, err
 	}
 	knownHostsFile, err := cdotKnownHostsFile()
 	if err != nil {
-		return nil, err
+		return fpolicyDiscovery{}, err
 	}
 	client, err := openCDOTClient(host, "pathdiff", keyFile, knownHostsFile, false)
 	if err != nil {
-		return nil, err
+		return fpolicyDiscovery{}, err
 	}
 	defer client.Close()
 	policyOutput, err := runSSHCommandContext(context, client, fpolicyPolicyShowCommand+" -instance", nil)
 	if err != nil {
-		return nil, fmt.Errorf("query cDOT FPolicy policies: %w", err)
+		return fpolicyDiscovery{}, fmt.Errorf("query cDOT FPolicy policies: %w", err)
 	}
 	engineOutput, err := runSSHCommandContext(context, client, "vserver fpolicy policy external-engine show -instance", nil)
 	if err != nil {
-		return nil, fmt.Errorf("query cDOT FPolicy external engines: %w", err)
+		return fpolicyDiscovery{}, fmt.Errorf("query cDOT FPolicy external engines: %w", err)
 	}
 	lifOutput, err := runSSHCommandContext(context, client, "network interface show -instance", nil)
 	if err != nil {
-		return nil, fmt.Errorf("query cDOT LIFs: %w", err)
+		return fpolicyDiscovery{}, fmt.Errorf("query cDOT LIFs: %w", err)
+	}
+	volumeOutput, err := runSSHCommandContext(context, client, "volume show -fields vserver,volume,msid", nil)
+	if err != nil {
+		return fpolicyDiscovery{}, fmt.Errorf("query cDOT volumes: %w", err)
 	}
 	endpointIPs := make(map[string]struct{}, len(endpoints))
 	endpointPorts := make(map[int]struct{}, len(endpoints))
@@ -674,7 +770,8 @@ func discoverFPolicySenders(context context.Context, endpoints []*net.TCPAddr) (
 		}
 		sender.Policies = append(sender.Policies, policy)
 	}
-	for _, lif := range fpolicyClientLIFs(parseONTAPInstances(string(lifOutput))) {
+	lifs := fpolicyClientLIFs(parseONTAPInstances(string(lifOutput)))
+	for _, lif := range lifs {
 		for _, sender := range expected {
 			for _, policy := range sender.Policies {
 				if policy.SVM == lif.SVM {
@@ -684,7 +781,7 @@ func discoverFPolicySenders(context context.Context, endpoints []*net.TCPAddr) (
 			}
 		}
 	}
-	return expected, nil
+	return fpolicyDiscovery{Senders: expected, LIFs: lifs, Volumes: parseONTAPVolumeTable(string(volumeOutput))}, nil
 }
 
 func fpolicyClientLIFs(records []map[string]string) []fpolicyLIF {

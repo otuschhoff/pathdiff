@@ -386,6 +386,157 @@ func (d *DB) ListSVMMappings() ([]Mapping, error) {
 	return d.listMappings("s:")
 }
 
+// FPolicyActivation persists activation backoff so retries survive daemon restarts.
+type FPolicyActivation struct {
+	Failures uint64    `json:"failures"`
+	RetryAt  time.Time `json:"retry_at"`
+	Reason   string    `json:"reason,omitempty"`
+}
+
+func fpolicyActivationKey(svm, policy string) []byte {
+	return []byte("a:" + svm + "\x00" + policy)
+}
+
+func (d *DB) FPolicyActivation(svm, policy string) (FPolicyActivation, error) {
+	if svm == "" || policy == "" {
+		return FPolicyActivation{}, errors.New("SVM and policy are required")
+	}
+	value, closer, err := d.db.Get(fpolicyActivationKey(svm, policy))
+	if errors.Is(err, pebble.ErrNotFound) {
+		return FPolicyActivation{}, nil
+	}
+	if err != nil {
+		return FPolicyActivation{}, fmt.Errorf("look up FPolicy activation state: %w", err)
+	}
+	defer closer.Close()
+	var activation FPolicyActivation
+	if err := json.Unmarshal(value, &activation); err != nil {
+		return FPolicyActivation{}, fmt.Errorf("decode FPolicy activation state: %w", err)
+	}
+	return activation, nil
+}
+
+func (d *DB) SetFPolicyActivation(svm, policy string, activation FPolicyActivation) error {
+	if svm == "" || policy == "" {
+		return errors.New("SVM and policy are required")
+	}
+	value, err := json.Marshal(activation)
+	if err != nil {
+		return fmt.Errorf("encode FPolicy activation state: %w", err)
+	}
+	return d.db.Set(fpolicyActivationKey(svm, policy), value, pebble.NoSync)
+}
+
+func (d *DB) ClearFPolicyActivation(svm, policy string) error {
+	if svm == "" || policy == "" {
+		return errors.New("SVM and policy are required")
+	}
+	return d.db.Delete(fpolicyActivationKey(svm, policy), pebble.NoSync)
+}
+
+// ListenerConfig describes one receiver endpoint and the senders it accepts.
+type ListenerConfig struct {
+	Address        string   `json:"address"`
+	AllowedSources []string `json:"allowed_sources,omitempty"`
+	SVMs           []string `json:"svms,omitempty"`
+}
+
+// ListenerSnapshot is the last known endpoint configuration, reused on startup.
+type ListenerSnapshot struct {
+	UpdatedAt time.Time        `json:"updated_at"`
+	Listeners []ListenerConfig `json:"listeners,omitempty"`
+}
+
+var listenerSnapshotKey = []byte("c:listeners")
+
+func (d *DB) SetListenerSnapshot(snapshot ListenerSnapshot) error {
+	value, err := json.Marshal(snapshot)
+	if err != nil {
+		return fmt.Errorf("encode listener snapshot: %w", err)
+	}
+	return d.db.Set(listenerSnapshotKey, value, pebble.NoSync)
+}
+
+func (d *DB) ListenerSnapshot() (ListenerSnapshot, error) {
+	value, closer, err := d.db.Get(listenerSnapshotKey)
+	if errors.Is(err, pebble.ErrNotFound) {
+		return ListenerSnapshot{}, nil
+	}
+	if err != nil {
+		return ListenerSnapshot{}, fmt.Errorf("look up listener snapshot: %w", err)
+	}
+	defer closer.Close()
+	var snapshot ListenerSnapshot
+	if err := json.Unmarshal(value, &snapshot); err != nil {
+		return ListenerSnapshot{}, fmt.Errorf("decode listener snapshot: %w", err)
+	}
+	return snapshot, nil
+}
+
+// Sender is the last known state of one FPolicy sender, kept across restarts.
+type Sender struct {
+	LIFIPv4     string    `json:"lif_ipv4"`
+	LIFName     string    `json:"lif_name,omitempty"`
+	SVMID       string    `json:"svm_id,omitempty"`
+	SVMName     string    `json:"svm_name,omitempty"`
+	NodeID      string    `json:"node_id,omitempty"`
+	NodeName    string    `json:"node_name,omitempty"`
+	LocalPort   string    `json:"local_port,omitempty"`
+	Connected   bool      `json:"connected"`
+	FirstSeen   time.Time `json:"first_seen,omitempty"`
+	LastSeen    time.Time `json:"last_seen,omitempty"`
+	TotalEvents uint64    `json:"total_events,omitempty"`
+	UpdatedAt   time.Time `json:"updated_at"`
+}
+
+func (d *DB) SetSender(sender Sender) error {
+	if sender.LIFIPv4 == "" {
+		return errors.New("sender LIF IPv4 is required")
+	}
+	value, err := json.Marshal(sender)
+	if err != nil {
+		return fmt.Errorf("encode sender state: %w", err)
+	}
+	return d.db.Set(append([]byte("n:"), sender.LIFIPv4...), value, pebble.NoSync)
+}
+
+func (d *DB) Sender(lifIPv4 string) (Sender, error) {
+	if lifIPv4 == "" {
+		return Sender{}, errors.New("sender LIF IPv4 is required")
+	}
+	value, closer, err := d.db.Get(append([]byte("n:"), lifIPv4...))
+	if errors.Is(err, pebble.ErrNotFound) {
+		return Sender{}, nil
+	}
+	if err != nil {
+		return Sender{}, fmt.Errorf("look up sender state: %w", err)
+	}
+	defer closer.Close()
+	var sender Sender
+	if err := json.Unmarshal(value, &sender); err != nil {
+		return Sender{}, fmt.Errorf("decode sender state: %w", err)
+	}
+	return sender, nil
+}
+
+func (d *DB) Senders() ([]Sender, error) {
+	prefix := []byte("n:")
+	iter, err := d.db.NewIter(&pebble.IterOptions{LowerBound: prefix, UpperBound: prefixEnd(prefix)})
+	if err != nil {
+		return nil, err
+	}
+	defer iter.Close()
+	var senders []Sender
+	for iter.First(); iter.Valid() && bytes.HasPrefix(iter.Key(), prefix); iter.Next() {
+		var sender Sender
+		if err := json.Unmarshal(iter.Value(), &sender); err != nil {
+			return nil, fmt.Errorf("decode sender state: %w", err)
+		}
+		senders = append(senders, sender)
+	}
+	return senders, iter.Error()
+}
+
 func (d *DB) listMappings(prefix string) ([]Mapping, error) {
 	prefixBytes := []byte(prefix)
 	iter, err := d.db.NewIter(&pebble.IterOptions{LowerBound: prefixBytes, UpperBound: prefixEnd(prefixBytes)})

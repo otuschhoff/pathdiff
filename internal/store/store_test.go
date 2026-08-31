@@ -511,3 +511,46 @@ func TestFPolicyLIFUnreachable(t *testing.T) {
 		t.Fatalf("changed address unreachable = %t, err = %v", unreachable, err)
 	}
 }
+
+func TestFPolicyActivationSurvivesReopen(t *testing.T) {
+	directory := t.TempDir()
+	db, err := Open(directory)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if activation, err := db.FPolicyActivation("finance", "pathdiff_policy"); err != nil || activation.Failures != 0 || !activation.RetryAt.IsZero() {
+		t.Fatalf("initial activation = %#v, err = %v", activation, err)
+	}
+	retryAt := time.Now().UTC().Add(4 * time.Minute).Truncate(time.Millisecond)
+	if err := db.SetFPolicyActivation("finance", "pathdiff_policy", FPolicyActivation{Failures: 3, RetryAt: retryAt, Reason: "handshake timeout"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	db, err = Open(directory)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	activation, err := db.FPolicyActivation("finance", "pathdiff_policy")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if activation.Failures != 3 || activation.Reason != "handshake timeout" || !activation.RetryAt.Equal(retryAt) {
+		t.Fatalf("reopened activation = %#v", activation)
+	}
+	if other, err := db.FPolicyActivation("finance", "other_policy"); err != nil || other.Failures != 0 {
+		t.Fatalf("unrelated policy activation = %#v, err = %v", other, err)
+	}
+	if err := db.ClearFPolicyActivation("finance", "pathdiff_policy"); err != nil {
+		t.Fatal(err)
+	}
+	if activation, err := db.FPolicyActivation("finance", "pathdiff_policy"); err != nil || activation.Failures != 0 {
+		t.Fatalf("cleared activation = %#v, err = %v", activation, err)
+	}
+	if err := db.SetFPolicyActivation("", "pathdiff_policy", FPolicyActivation{}); err == nil {
+		t.Fatal("empty SVM was accepted")
+	}
+}

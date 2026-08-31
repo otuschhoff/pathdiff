@@ -18,6 +18,7 @@ import (
 	"time"
 
 	"github.com/otuschhoff/pathdiff/internal/fpolicy"
+	"github.com/otuschhoff/pathdiff/internal/store"
 )
 
 // Config configures an embeddable Receiver.
@@ -40,14 +41,13 @@ type Config struct {
 	RefreshInterval time.Duration
 	// RetentionInterval periodically applies the persisted retention policy.
 	RetentionInterval time.Duration
+	// RestoreListeners opens the last persisted endpoints at Start so the receiver
+	// accepts senders before discovery completes.
+	RestoreListeners bool
 }
 
 // ListenerConfig describes one receiver endpoint and its accepted sources.
-type ListenerConfig struct {
-	Address        string
-	AllowedSources []string
-	SVMs           []string
-}
+type ListenerConfig = store.ListenerConfig
 
 // ListenerInfo describes a running receiver endpoint.
 type ListenerInfo struct {
@@ -186,7 +186,7 @@ func (r *Receiver) Start(ctx context.Context) error {
 	r.startedAt = time.Now().UTC()
 	r.mu.Unlock()
 
-	if err := r.SetListeners(r.config.Listeners); err != nil {
+	if err := r.SetListeners(r.startupListeners()); err != nil {
 		r.cancel()
 		r.shutdown()
 		return err
@@ -199,9 +199,13 @@ func (r *Receiver) Start(ctx context.Context) error {
 		}
 	}
 	if r.config.Refresh != nil {
-		if err := r.Refresh(); err != nil {
-			r.logf("initial receiver refresh: %v", err)
-		}
+		r.workers.Add(1)
+		go func() {
+			defer r.workers.Done()
+			if err := r.Refresh(); err != nil && !errors.Is(err, context.Canceled) {
+				r.logf("initial receiver refresh: %v", err)
+			}
+		}()
 	}
 	go func() {
 		<-r.ctx.Done()
@@ -268,6 +272,43 @@ func (r *Receiver) Refresh() error {
 
 // SetListeners atomically reconciles the running listener set.
 func (r *Receiver) SetListeners(configs []ListenerConfig) error {
+	if err := r.setListeners(configs); err != nil {
+		return err
+	}
+	if err := r.db.SetListenerSnapshot(store.ListenerSnapshot{UpdatedAt: time.Now().UTC(), Listeners: r.listenerConfigs()}); err != nil {
+		r.logf("persist listener configuration: %v", err)
+	}
+	return nil
+}
+
+// startupListeners prefers explicit configuration and otherwise reuses the last persisted endpoints.
+func (r *Receiver) startupListeners() []ListenerConfig {
+	if len(r.config.Listeners) > 0 || !r.config.RestoreListeners {
+		return r.config.Listeners
+	}
+	snapshot, err := r.db.ListenerSnapshot()
+	if err != nil {
+		r.logf("restore persisted listener configuration: %v", err)
+		return nil
+	}
+	if len(snapshot.Listeners) > 0 {
+		r.logf("restored %d persisted listeners discovered at %s", len(snapshot.Listeners), snapshot.UpdatedAt.Format(time.RFC3339))
+	}
+	return snapshot.Listeners
+}
+
+func (r *Receiver) listenerConfigs() []ListenerConfig {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	configs := make([]ListenerConfig, 0, len(r.listeners))
+	for _, current := range r.listeners {
+		configs = append(configs, current.config)
+	}
+	sort.Slice(configs, func(left, right int) bool { return configs[left].Address < configs[right].Address })
+	return configs
+}
+
+func (r *Receiver) setListeners(configs []ListenerConfig) error {
 	validated := make(map[string]ListenerConfig, len(configs))
 	for _, config := range configs {
 		if config.Address == "" {
@@ -371,7 +412,6 @@ func (r *Receiver) Status() (Status, error) {
 // Engines returns active sender metrics.
 func (r *Receiver) Engines() []EngineInfo {
 	r.mu.Lock()
-	defer r.mu.Unlock()
 	now := time.Now().UTC()
 	engines := make([]EngineInfo, 0, len(r.senders))
 	for address, sender := range r.senders {
@@ -384,6 +424,22 @@ func (r *Receiver) Engines() []EngineInfo {
 			rate = float64(sender.totalEvents) / elapsed
 		}
 		engines = append(engines, EngineInfo{Since: sender.connectedSince, TotalEvents: sender.totalEvents, AverageRate: rate, LIFIPv4: address, NodeID: sender.nodeID, SVMID: sender.svmID, LocalPort: sender.localPort, LastSeen: sender.lastSeen})
+	}
+	r.mu.Unlock()
+	for index := range engines {
+		stored, err := r.db.Sender(engines[index].LIFIPv4)
+		if err != nil {
+			r.logf("read persisted sender %s: %v", engines[index].LIFIPv4, err)
+			continue
+		}
+		engines[index].SVMName = stored.SVMName
+		engines[index].NodeName = stored.NodeName
+		if engines[index].SVMID == "" {
+			engines[index].SVMID = stored.SVMID
+		}
+		if engines[index].NodeID == "" {
+			engines[index].NodeID = stored.NodeID
+		}
 	}
 	return engines
 }
@@ -419,6 +475,7 @@ func (r *Receiver) accept(current *receiverListener) {
 		}
 		state.active++
 		r.mu.Unlock()
+		r.persistSender(sender)
 		r.workers.Add(1)
 		go r.readConnection(connection, sender)
 	}
@@ -530,6 +587,7 @@ func (r *Receiver) readONTAPXML(reader io.Reader, connection net.Conn, sender st
 	state.nodeID = message.NodeID
 	state.svmID = message.VserverUUID
 	r.mu.Unlock()
+	r.persistSender(sender)
 	for {
 		message, err := fpolicy.ReadONTAPXMLFrame(reader)
 		if errors.Is(err, io.EOF) || errors.Is(err, net.ErrClosed) {
@@ -584,13 +642,84 @@ func (r *Receiver) storeEvent(sender string, event Event) bool {
 func (r *Receiver) disconnected(connection net.Conn, sender string) {
 	r.mu.Lock()
 	delete(r.connections, connection)
+	record := store.Sender{LIFIPv4: sender}
 	if state := r.senders[sender]; state != nil {
 		state.active--
 		if state.active <= 0 {
 			delete(r.senders, sender)
 		}
+		record = senderRecord(sender, state)
 	}
 	r.mu.Unlock()
+	r.persistSenderRecord(record)
+}
+
+func (r *Receiver) persistSender(address string) {
+	r.mu.Lock()
+	record := senderRecord(address, r.senders[address])
+	r.mu.Unlock()
+	r.persistSenderRecord(record)
+}
+
+func senderRecord(address string, state *senderState) store.Sender {
+	record := store.Sender{LIFIPv4: address, UpdatedAt: time.Now().UTC()}
+	if state == nil {
+		return record
+	}
+	record.Connected = state.active > 0
+	record.SVMID = state.svmID
+	record.NodeID = state.nodeID
+	record.LocalPort = state.localPort
+	record.FirstSeen = state.connectedSince
+	record.LastSeen = state.lastSeen
+	record.TotalEvents = state.totalEvents
+	return record
+}
+
+// persistSenderRecord keeps the last known sender session queryable after restarts,
+// retaining the cDOT names that only configuration verification can supply.
+func (r *Receiver) persistSenderRecord(sender store.Sender) {
+	if sender.LIFIPv4 == "" {
+		return
+	}
+	if sender.UpdatedAt.IsZero() {
+		sender.UpdatedAt = time.Now().UTC()
+	}
+	stored, err := r.db.Sender(sender.LIFIPv4)
+	if err != nil {
+		r.logf("read persisted sender %s: %v", sender.LIFIPv4, err)
+		stored = store.Sender{}
+	}
+	sender.LIFName = stored.LIFName
+	sender.SVMName = stored.SVMName
+	sender.NodeName = stored.NodeName
+	if sender.SVMID == "" {
+		sender.SVMID = stored.SVMID
+	}
+	if sender.NodeID == "" {
+		sender.NodeID = stored.NodeID
+	}
+	if sender.LocalPort == "" {
+		sender.LocalPort = stored.LocalPort
+	}
+	if sender.FirstSeen.IsZero() {
+		sender.FirstSeen = stored.FirstSeen
+	}
+	if err := r.db.SetSender(sender); err != nil {
+		r.logf("persist sender %s: %v", sender.LIFIPv4, err)
+	}
+}
+
+func (r *Receiver) persistSenders() {
+	r.mu.Lock()
+	addresses := make([]string, 0, len(r.senders))
+	for address := range r.senders {
+		addresses = append(addresses, address)
+	}
+	r.mu.Unlock()
+	for _, address := range addresses {
+		r.persistSender(address)
+	}
 }
 
 func (r *Receiver) sender(address string) *senderState {
@@ -624,6 +753,7 @@ func (r *Receiver) retainEvery() {
 		if _, err := r.db.ApplyRetention(time.Now().UTC()); err != nil {
 			r.logf("apply event retention: %v", err)
 		}
+		r.persistSenders()
 	}
 	apply()
 	ticker := time.NewTicker(r.config.RetentionInterval)
@@ -662,6 +792,7 @@ func (r *Receiver) shutdown() {
 		_ = connection.Close()
 	}
 	r.workers.Wait()
+	r.persistSenders()
 	if r.config.ControlPath != "" {
 		if err := os.Remove(r.config.ControlPath); err != nil && !errors.Is(err, os.ErrNotExist) {
 			r.mu.Lock()
