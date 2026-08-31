@@ -430,6 +430,133 @@ func TestResolveMonitorEvent(t *testing.T) {
 	}
 }
 
+func TestEventFilters(t *testing.T) {
+	event := store.Event{Path: "/vol/finance/report.csv", SVMName: "ncl1-1-vs-50", SVMID: "svm-1", VolumeName: "finance", VolumeMSID: "2163258291", NodeID: "ncl1-1-ps-07", LIFIPv4: "192.0.2.10"}
+	for _, test := range []struct {
+		name    string
+		filters eventFilters
+		want    bool
+	}{
+		{name: "no filters", want: true},
+		{name: "svm name", filters: eventFilters{SVMs: []string{"vs-50"}}, want: true},
+		{name: "svm id", filters: eventFilters{SVMs: []string{"svm-1"}}, want: true},
+		{name: "svm alternatives", filters: eventFilters{SVMs: []string{"vs-60", "vs-50"}}, want: true},
+		{name: "svm mismatch", filters: eventFilters{SVMs: []string{"vs-60"}}, want: false},
+		{name: "volume msid", filters: eventFilters{Volumes: []string{"2163258291"}}, want: true},
+		{name: "volume wildcard", filters: eventFilters{Volumes: []string{"fin*"}}, want: true},
+		{name: "node", filters: eventFilters{Nodes: []string{"ps-07"}}, want: true},
+		{name: "lif", filters: eventFilters{LIFs: []string{"192.0.2.10"}}, want: true},
+		{name: "combined match", filters: eventFilters{SVMs: []string{"vs-50"}, Volumes: []string{"finance"}, Nodes: []string{"ps-07"}, LIFs: []string{"192.0.2.10"}}, want: true},
+		{name: "combined mismatch", filters: eventFilters{SVMs: []string{"vs-50"}, Volumes: []string{"home"}}, want: false},
+	} {
+		if got := test.filters.matches(event); got != test.want {
+			t.Fatalf("%s: matches() = %t, want %t", test.name, got, test.want)
+		}
+	}
+	if matchesFilter([]string{"node-1"}, "") {
+		t.Fatal("empty event metadata matched a filter")
+	}
+	filters := eventFilters{SVMs: []string{"vs-50"}}
+	events := filters.filterEvents([]store.Event{event, {Path: "/other", SVMName: "ncl1-1-vs-60"}})
+	if len(events) != 1 || events[0].Path != event.Path {
+		t.Fatalf("filterEvents() = %#v", events)
+	}
+	summaries := filters.filterSummaries([]store.ParentSummary{{Path: "/vol/finance", SVMName: "ncl1-1-vs-50"}, {Path: "/vol/other", SVMID: "svm-9"}})
+	if len(summaries) != 1 || summaries[0].Path != "/vol/finance" {
+		t.Fatalf("filterSummaries() = %#v", summaries)
+	}
+}
+
+func TestFilterFlagsAreRepeatable(t *testing.T) {
+	for _, test := range []struct {
+		command *cobra.Command
+		names   []string
+	}{
+		{command: newMonitorCommand(), names: []string{"svm", "volume", "node", "lif"}},
+		{command: newEventsCommand(), names: []string{"svm", "volume", "node", "lif"}},
+		{command: newPathListCommand(), names: []string{"svm", "volume", "node", "lif"}},
+		{command: newPathParentCommand(), names: []string{"svm", "volume"}},
+		{command: newVolumeSummaryCommand(), names: []string{"svm", "volume"}},
+	} {
+		for _, name := range test.names {
+			flag := test.command.Flags().Lookup(name)
+			if flag == nil {
+				t.Fatalf("%s: --%s is not registered", test.command.Name(), name)
+			}
+			if flag.Value.Type() != "stringArray" {
+				t.Fatalf("%s: --%s type = %s, want stringArray", test.command.Name(), name, flag.Value.Type())
+			}
+		}
+	}
+}
+
+func TestAggregateVolumeSummaries(t *testing.T) {
+	summaries := []store.ParentSummary{
+		{Path: "/vol/finance/reports", SVMName: "ncl1-1-vs-50", VolumeName: "finance", ChildCount: 3},
+		{Path: "/vol/finance/archive", SVMName: "ncl1-1-vs-50", VolumeName: "finance", ChildCount: 4},
+		{Path: "/vol/home/users", SVMName: "ncl1-1-vs-50", VolumeMSID: "2163258291", ChildCount: 2},
+		{Path: "/vol/finance/shared", SVMID: "svm-9", VolumeName: "finance", ChildCount: 1},
+	}
+	volumes, err := aggregateVolumeSummaries(summaries, "*")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(volumes) != 3 {
+		t.Fatalf("volumes = %#v", volumes)
+	}
+	if volumes[0].SVM != "ncl1-1-vs-50" || volumes[0].Volume != "2163258291" || volumes[0].Changes != 2 {
+		t.Fatalf("first volume = %#v", volumes[0])
+	}
+	if volumes[1].Volume != "finance" || volumes[1].Changes != 7 {
+		t.Fatalf("aggregated volume = %#v", volumes[1])
+	}
+	if volumes[2].SVM != "svm-9" || volumes[2].Changes != 1 {
+		t.Fatalf("unresolved SVM volume = %#v", volumes[2])
+	}
+	filtered, err := aggregateVolumeSummaries(summaries, normalizePathSearch("fin"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(filtered) != 2 || filtered[0].Volume != "finance" {
+		t.Fatalf("filtered volumes = %#v", filtered)
+	}
+}
+
+func TestPrintVolumeSummaries(t *testing.T) {
+	var output bytes.Buffer
+	if err := printVolumeSummaries(&output, []volumeSummary{{SVM: "ncl1-1-vs-50", Volume: "finance", Changes: 7}}, 100); err != nil {
+		t.Fatal(err)
+	}
+	if got := output.String(); !strings.Contains(got, "SVM") || !strings.Contains(got, "CNT") || !strings.Contains(got, "finance") || !strings.Contains(got, "7") || strings.Contains(got, "Parent") {
+		t.Fatalf("unexpected volume table: %s", got)
+	}
+	output.Reset()
+	if err := printVolumeSummaries(&output, nil, 100); err != nil {
+		t.Fatal(err)
+	}
+	if got := output.String(); !strings.Contains(got, "No records found.") {
+		t.Fatalf("unexpected empty output: %s", got)
+	}
+	output.Reset()
+	if err := printVolumeSummaries(&output, []volumeSummary{{Volume: "one"}, {Volume: "two"}}, 1); err != nil {
+		t.Fatal(err)
+	}
+	if got := output.String(); !strings.Contains(got, "changed volumes match") {
+		t.Fatalf("unexpected over-limit output: %s", got)
+	}
+}
+
+func TestVolumeCommandRegistered(t *testing.T) {
+	root := newRootCommand()
+	command, remaining, err := root.Find([]string{"volume"})
+	if err != nil || len(remaining) != 0 || command == nil || command.Name() != "volume" {
+		t.Fatalf("Find(volume) = command %v, remaining %v, err %v", command, remaining, err)
+	}
+	if command.GroupID != "queries" {
+		t.Fatalf("volume group = %q", command.GroupID)
+	}
+}
+
 func TestMonitorJSONOutput(t *testing.T) {
 	event := store.Event{Path: "/vol/finance/report.csv", VolumeName: "finance", SVMName: "ncl1-1-vs-50"}
 	var output bytes.Buffer

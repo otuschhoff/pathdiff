@@ -60,6 +60,7 @@ bin/pathdiff service restart
 bin/pathdiff service refresh
 bin/pathdiff service list-ports
 bin/pathdiff service monitor --path /vol/finance/ --show-node --show-lif
+bin/pathdiff service monitor --svm ncl1-1-vs-50 --svm ncl1-1-vs-70 --volume finance
 bin/pathdiff service stop
 bin/pathdiff engine list
 bin/pathdiff cdot node list
@@ -104,6 +105,9 @@ bin/pathdiff events --path /vol/finance/ --start 10d
 bin/pathdiff events --path /vol/finance/ --start 1M4d --end 2026-08-28
 bin/pathdiff path list firefox --start 10d
 bin/pathdiff path parent --path /vol/finance/ --sort timestamp --max 250
+bin/pathdiff events --svm ncl1-1-vs-50 --node ncl1-1-ps-07 --start 10d
+bin/pathdiff volume
+bin/pathdiff volume 'fin*' --start 10d --svm ncl1-1-vs-50
 bin/pathdiff path list firefox --json
 bin/pathdiff path list firefox --json=changed-paths.json
 bin/pathdiff path parent --path /vol/finance/ --jsonl=changed-parents.jsonl
@@ -115,7 +119,7 @@ bin/pathdiff cdot volume list
 bin/pathdiff cdot svm list
 ```
 
-`monitor` prints newly observed events as tables until interrupted. It shows timestamp, SVM, volume, and path by default, coalescing each batch to the newest event for every path. Add `--show-op`, `--show-node`, or `--show-lif` for operation and sender metadata; use `--hide-timestamp`, `--hide-svm`, or `--hide-volume` to suppress individual default columns. Use `--json` for resolved JSON-line events instead of tables. Add `--since RFC3339` to replay changes from a particular timestamp. The default control socket is `/tmp/pathdiff.sock`; set `--control` on both daemon and client to use another socket. The daemon commits both time and path indexes atomically to Pebble. Configure the FPolicy receiver or a protocol adapter to emit the line-delimited JSON above.
+`monitor` prints newly observed events as tables until interrupted. It shows timestamp, SVM, volume, and path by default, coalescing each batch to the newest event for every path. Add `--show-op`, `--show-node`, or `--show-lif` for operation and sender metadata; use `--hide-timestamp`, `--hide-svm`, or `--hide-volume` to suppress individual default columns. Filter the stream with `--svm`, `--volume`, `--node`, and `--lif`; each accepts a case-insensitive substring or a `*`/`?` wildcard, may be repeated to match any of several values, and different filter flags combine so an event must match all of them. `--svm` matches the resolved SVM name or its ID, and `--volume` matches the resolved volume name or its MSID. Use `--json` for resolved JSON-line events instead of tables. Add `--since RFC3339` to replay changes from a particular timestamp. The default control socket is `/tmp/pathdiff.sock`; set `--control` on both daemon and client to use another socket. The daemon commits both time and path indexes atomically to Pebble. Configure the FPolicy receiver or a protocol adapter to emit the line-delimited JSON above.
 
 `events --start` and `--end` accept RFC3339 timestamps, dates such as `2026-08-28`, or relative expressions: `10d`, `1m`, `5h10m`, and `1M4d` mean ten days, one minute, five hours ten minutes, and one month four days ago. Use uppercase `M` for calendar months; lowercase `m` always means minutes. Omit `--start` for the last 24 hours or `--end` for now.
 
@@ -124,6 +128,10 @@ bin/pathdiff cdot svm list
 `path list` accepts the same optional path search and `--path`, `--start`, `--end`, `--max`, and `--control` flags as `events`. It coalesces repeated changes to each volume/path pair and renders `Last Change`, `Volume`, and `Path`.
 
 `path parent` accepts the same flags but aggregates matching events inside the daemon and returns only parent summaries, avoiding transfer and retention of every matching event. It renders `Last Change`, `SVM`, `Volume`, `CNT`, and `Parent`, resolving SVM and volume names from persisted mappings or one bulk cDOT lookup. `CNT` is the number of distinct changed child paths beneath that parent. The parent view sorts by SVM, volume, and path by default; pass `--sort timestamp` to list newest changes first.
+
+`volume [<volumeNameWildcard>]` aggregates the same parent summaries one level further and renders only `SVM`, `Volume`, and `CNT`, where `CNT` is the total number of distinct changed paths in that volume during the time range. Its optional argument is a case-insensitive volume-name search that also accepts `*` and `?` wildcards, and it accepts the same `--path`, `--start`, `--end`, `--max`, and `--control` flags as the other query commands.
+
+`events`, `path list`, `path parent`, `volume`, and `service monitor` share the `--svm`, `--volume`, `--node`, and `--lif` result filters described for `monitor`. Because `path parent` and `volume` operate on aggregated summaries that carry no sender metadata, they accept only `--svm` and `--volume`.
 
 Both `path list` and `path parent` accept `--json[=<filename>]` and `--jsonl[=<filename>]`. A bare flag creates a timestamped filename such as `pathdiff-path-list-20260830T103456.123456789Z.json`; use the `=<filename>` form to choose another path without ambiguity with the optional path-search argument. JSON exports contain one array, while JSONL exports contain one object per line. Export queries always write every matching, coalesced result and ignore the display-only `--max` limit. The two export flags are mutually exclusive.
 
