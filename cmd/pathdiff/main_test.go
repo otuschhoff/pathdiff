@@ -18,6 +18,7 @@ import (
 	"testing"
 	"time"
 
+	pathdifflib "github.com/otuschhoff/pathdiff"
 	"github.com/otuschhoff/pathdiff/internal/store"
 
 	"github.com/jedib0t/go-pretty/v6/text"
@@ -555,6 +556,127 @@ func TestVolumeCommandRegistered(t *testing.T) {
 	if command.GroupID != "queries" {
 		t.Fatalf("volume group = %q", command.GroupID)
 	}
+}
+
+func TestCacheInventoryPersistsVerifiedConfiguration(t *testing.T) {
+	db := &fakeActivationDatabase{activations: make(map[string]pathdifflib.FPolicyActivation)}
+	db.senders = map[string]pathdifflib.Sender{"192.0.2.10": {LIFIPv4: "192.0.2.10", TotalEvents: 42, LocalPort: "9911"}}
+	discovery := newFPolicyReceiverDiscovery(nil, nil, db, false)
+
+	discovery.cacheInventory(fpolicyDiscovery{
+		LIFs:    []fpolicyLIF{{Name: "finance_fpolicy", SVM: "ncl1-1-vs-50", Node: "ncl1-1-ps-07", Address: "192.0.2.10"}},
+		Volumes: []cdotMapping{{ID: "2163258291", Name: "finance", Vserver: "ncl1-1-vs-50"}, {ID: "", Name: "skipped"}},
+	})
+
+	sender := db.senders["192.0.2.10"]
+	if sender.LIFName != "finance_fpolicy" || sender.SVMName != "ncl1-1-vs-50" || sender.NodeName != "ncl1-1-ps-07" {
+		t.Fatalf("cached sender = %#v", sender)
+	}
+	if sender.TotalEvents != 42 || sender.LocalPort != "9911" {
+		t.Fatalf("cached sender lost receiver counters: %#v", sender)
+	}
+	if sender.UpdatedAt.IsZero() {
+		t.Fatal("cached sender has no verification timestamp")
+	}
+	if db.volumes["2163258291"] != "finance" || db.volumeSVMs["2163258291"] != "ncl1-1-vs-50" {
+		t.Fatalf("cached volumes = %#v, svms = %#v", db.volumes, db.volumeSVMs)
+	}
+	if len(db.volumes) != 1 {
+		t.Fatalf("incomplete volume mapping was cached: %#v", db.volumes)
+	}
+}
+
+func TestNextActivationDelayGrowsAndIsCapped(t *testing.T) {
+	for _, test := range []struct {
+		failures uint64
+		want     time.Duration
+	}{
+		{failures: 0, want: time.Minute},
+		{failures: 1, want: time.Minute},
+		{failures: 2, want: 2 * time.Minute},
+		{failures: 3, want: 4 * time.Minute},
+		{failures: 6, want: 32 * time.Minute},
+		{failures: 7, want: time.Hour},
+		{failures: 500, want: time.Hour},
+	} {
+		if got := nextActivationDelay(test.failures); got != test.want {
+			t.Fatalf("nextActivationDelay(%d) = %s, want %s", test.failures, got, test.want)
+		}
+	}
+}
+
+func TestRecordActivationFailurePersistsBackoff(t *testing.T) {
+	db := &fakeActivationDatabase{activations: make(map[string]pathdifflib.FPolicyActivation)}
+	discovery := newFPolicyReceiverDiscovery(nil, nil, db, false)
+	policy := fpolicyPolicy{SVM: "finance", Name: "pathdiff_policy"}
+	now := time.Date(2026, 8, 31, 10, 0, 0, 0, time.UTC)
+
+	discovery.recordActivationFailure(policy, pathdifflib.FPolicyActivation{}, errors.New("handshake timeout"), now)
+	activation := db.activations["finance\x00pathdiff_policy"]
+	if activation.Failures != 1 || activation.Reason != "handshake timeout" || !activation.RetryAt.Equal(now.Add(time.Minute)) {
+		t.Fatalf("first failure = %#v", activation)
+	}
+
+	discovery.recordActivationFailure(policy, activation, errors.New("handshake timeout"), now)
+	activation = db.activations["finance\x00pathdiff_policy"]
+	if activation.Failures != 2 || !activation.RetryAt.Equal(now.Add(2*time.Minute)) {
+		t.Fatalf("second failure = %#v", activation)
+	}
+}
+
+type fakeActivationDatabase struct {
+	activations map[string]pathdifflib.FPolicyActivation
+	senders     map[string]pathdifflib.Sender
+	volumes     map[string]string
+	volumeSVMs  map[string]string
+}
+
+func (f *fakeActivationDatabase) Sender(lifIPv4 string) (pathdifflib.Sender, error) {
+	return f.senders[lifIPv4], nil
+}
+
+func (f *fakeActivationDatabase) SetSender(sender pathdifflib.Sender) error {
+	if f.senders == nil {
+		f.senders = make(map[string]pathdifflib.Sender)
+	}
+	f.senders[sender.LIFIPv4] = sender
+	return nil
+}
+
+func (f *fakeActivationDatabase) SetVolumeName(msid, name string) error {
+	if f.volumes == nil {
+		f.volumes = make(map[string]string)
+	}
+	f.volumes[msid] = name
+	return nil
+}
+
+func (f *fakeActivationDatabase) SetVolumeSVMName(msid, name string) error {
+	if f.volumeSVMs == nil {
+		f.volumeSVMs = make(map[string]string)
+	}
+	f.volumeSVMs[msid] = name
+	return nil
+}
+
+func (f *fakeActivationDatabase) FPolicyLIFUnreachable(string, string, string) (bool, error) {
+	return false, nil
+}
+
+func (f *fakeActivationDatabase) MarkFPolicyLIFUnreachable(string, string, string) error { return nil }
+
+func (f *fakeActivationDatabase) FPolicyActivation(svm, policy string) (pathdifflib.FPolicyActivation, error) {
+	return f.activations[svm+"\x00"+policy], nil
+}
+
+func (f *fakeActivationDatabase) SetFPolicyActivation(svm, policy string, activation pathdifflib.FPolicyActivation) error {
+	f.activations[svm+"\x00"+policy] = activation
+	return nil
+}
+
+func (f *fakeActivationDatabase) ClearFPolicyActivation(svm, policy string) error {
+	delete(f.activations, svm+"\x00"+policy)
+	return nil
 }
 
 func TestMonitorJSONOutput(t *testing.T) {

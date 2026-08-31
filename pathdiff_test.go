@@ -31,6 +31,69 @@ func TestDatabasePublicAPI(t *testing.T) {
 	}
 }
 
+func TestReceiverRestoresPersistedListeners(t *testing.T) {
+	directory := t.TempDir()
+	database, err := pathdiff.OpenDatabase(directory)
+	if err != nil {
+		t.Fatal(err)
+	}
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	address := listener.Addr().String()
+	if err := listener.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := database.SetListenerSnapshot(pathdiff.ListenerSnapshot{UpdatedAt: time.Now().UTC(), Listeners: []pathdiff.ListenerConfig{{Address: address, AllowedSources: []string{"127.0.0.1"}}}}); err != nil {
+		t.Fatal(err)
+	}
+	if err := database.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	receiver, err := pathdiff.NewReceiver(pathdiff.Config{DatabasePath: directory, RestoreListeners: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	if err := receiver.Start(ctx); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = receiver.Close() })
+	listeners := receiver.Listeners()
+	if len(listeners) != 1 || listeners[0].Address != address {
+		t.Fatalf("restored listeners = %#v", listeners)
+	}
+
+	event := pathdiff.Event{Path: "/vol/app/file", Operation: "write", Timestamp: time.Now().UTC()}
+	connection, err := net.Dial("tcp", address)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := json.NewEncoder(connection).Encode(event); err != nil {
+		t.Fatal(err)
+	}
+	if err := connection.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		senders, err := receiver.Database().Senders()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(senders) == 1 && senders[0].LIFIPv4 == "127.0.0.1" && senders[0].TotalEvents == 1 {
+			return
+		}
+		time.Sleep(time.Millisecond)
+	}
+	senders, _ := receiver.Database().Senders()
+	t.Fatalf("persisted senders = %#v", senders)
+}
+
 func TestEmbeddedReceiverAndRemoteClient(t *testing.T) {
 	controlPath := filepath.Join(t.TempDir(), "pathdiff.sock")
 	receiver, err := pathdiff.NewReceiver(pathdiff.Config{

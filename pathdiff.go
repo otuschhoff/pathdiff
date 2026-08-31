@@ -22,6 +22,15 @@ type Mapping = store.Mapping
 // DatabaseStats describes the database's path and on-disk size.
 type DatabaseStats = store.Stats
 
+// FPolicyActivation is the persisted activation backoff for one SVM policy.
+type FPolicyActivation = store.FPolicyActivation
+
+// ListenerSnapshot is the last persisted receiver endpoint configuration.
+type ListenerSnapshot = store.ListenerSnapshot
+
+// Sender is the last known state of one FPolicy sender.
+type Sender = store.Sender
+
 // Database provides direct, concurrency-safe access to pathdiff's event store.
 type Database struct {
 	store *store.DB
@@ -124,4 +133,44 @@ func (d *Database) FPolicyLIFUnreachable(svm, lif, address string) (bool, error)
 // MarkFPolicyLIFUnreachable persists an unreachable LIF address.
 func (d *Database) MarkFPolicyLIFUnreachable(svm, lif, address string) error {
 	return d.store.MarkFPolicyLIFUnreachable(svm, lif, address)
+}
+
+// FPolicyActivation returns the persisted activation backoff for a policy.
+func (d *Database) FPolicyActivation(svm, policy string) (FPolicyActivation, error) {
+	return d.store.FPolicyActivation(svm, policy)
+}
+
+// SetFPolicyActivation persists activation backoff so it survives restarts.
+func (d *Database) SetFPolicyActivation(svm, policy string, activation FPolicyActivation) error {
+	return d.store.SetFPolicyActivation(svm, policy, activation)
+}
+
+// ClearFPolicyActivation removes persisted activation backoff after success.
+func (d *Database) ClearFPolicyActivation(svm, policy string) error {
+	return d.store.ClearFPolicyActivation(svm, policy)
+}
+
+// ListenerSnapshot returns the last persisted receiver endpoint configuration.
+func (d *Database) ListenerSnapshot() (ListenerSnapshot, error) {
+	return d.store.ListenerSnapshot()
+}
+
+// SetListenerSnapshot persists the current receiver endpoint configuration.
+func (d *Database) SetListenerSnapshot(snapshot ListenerSnapshot) error {
+	return d.store.SetListenerSnapshot(snapshot)
+}
+
+// Sender returns the last known state of one FPolicy sender.
+func (d *Database) Sender(lifIPv4 string) (Sender, error) {
+	return d.store.Sender(lifIPv4)
+}
+
+// Senders returns the last known state of every observed FPolicy sender.
+func (d *Database) Senders() ([]Sender, error) {
+	return d.store.Senders()
+}
+
+// SetSender persists the last known state of one FPolicy sender.
+func (d *Database) SetSender(sender Sender) error {
+	return d.store.SetSender(sender)
 }
