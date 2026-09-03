@@ -679,6 +679,37 @@ func (f *fakeActivationDatabase) ClearFPolicyActivation(svm, policy string) erro
 	return nil
 }
 
+func TestMonitorAcceptsPathSearchArgument(t *testing.T) {
+	command := newServiceMonitorCommand()
+	if command.Use != "monitor [path-search]" {
+		t.Fatalf("monitor use = %q", command.Use)
+	}
+	if err := command.Args(command, []string{"firefox"}); err != nil {
+		t.Fatalf("one argument rejected: %v", err)
+	}
+	if err := command.Args(command, []string{"firefox", "extra"}); err == nil {
+		t.Fatal("two arguments were accepted")
+	}
+	for _, test := range []struct {
+		search string
+		path   string
+		want   bool
+	}{
+		{search: normalizePathSearch("firefox"), path: "/vol/home/user/.mozilla/firefox/prefs.js", want: true},
+		{search: normalizePathSearch("firefox"), path: "/vol/home/user/notes.txt", want: false},
+		{search: normalizePathSearch("*.csv"), path: "/vol/finance/report.csv", want: true},
+		{search: "*", path: "/vol/finance/report.csv", want: true},
+	} {
+		matched, err := wildcardMatch(test.search, test.path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if matched != test.want {
+			t.Fatalf("wildcardMatch(%q, %q) = %t, want %t", test.search, test.path, matched, test.want)
+		}
+	}
+}
+
 func TestMonitorJSONOutput(t *testing.T) {
 	event := store.Event{Path: "/vol/finance/report.csv", VolumeName: "finance", SVMName: "ncl1-1-vs-50"}
 	var output bytes.Buffer

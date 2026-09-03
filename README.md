@@ -60,6 +60,8 @@ bin/pathdiff service restart
 bin/pathdiff service refresh
 bin/pathdiff service list-ports
 bin/pathdiff service monitor --path /vol/finance/ --show-node --show-lif
+bin/pathdiff service monitor firefox
+bin/pathdiff service monitor '*.csv' --svm ncl1-1-vs-50
 bin/pathdiff service monitor --svm ncl1-1-vs-50 --svm ncl1-1-vs-70 --volume finance
 bin/pathdiff service stop
 bin/pathdiff engine list
@@ -119,7 +121,7 @@ bin/pathdiff cdot volume list
 bin/pathdiff cdot svm list
 ```
 
-`monitor` prints newly observed events as tables until interrupted. It shows timestamp, SVM, volume, and path by default, coalescing each batch to the newest event for every path. Add `--show-op`, `--show-node`, or `--show-lif` for operation and sender metadata; use `--hide-timestamp`, `--hide-svm`, or `--hide-volume` to suppress individual default columns. Filter the stream with `--svm`, `--volume`, `--node`, and `--lif`; each accepts a case-insensitive substring or a `*`/`?` wildcard, may be repeated to match any of several values, and different filter flags combine so an event must match all of them. `--svm` matches the resolved SVM name or its ID, and `--volume` matches the resolved volume name or its MSID. Use `--json` for resolved JSON-line events instead of tables. Add `--since RFC3339` to replay changes from a particular timestamp. The default control socket is `/tmp/pathdiff.sock`; set `--control` on both daemon and client to use another socket. The daemon commits both time and path indexes atomically to Pebble. Configure the FPolicy receiver or a protocol adapter to emit the line-delimited JSON above.
+`monitor` prints newly observed events as tables until interrupted. Its optional first argument is a case-insensitive path search that behaves like the one accepted by `events`: `firefox` matches any path containing `firefox`, while `*` and `?` are treated as explicit wildcards. It shows timestamp, SVM, volume, and path by default, coalescing each batch to the newest event for every path. Add `--show-op`, `--show-node`, or `--show-lif` for operation and sender metadata; use `--hide-timestamp`, `--hide-svm`, or `--hide-volume` to suppress individual default columns. Filter the stream with `--svm`, `--volume`, `--node`, and `--lif`; each accepts a case-insensitive substring or a `*`/`?` wildcard, may be repeated to match any of several values, and different filter flags combine so an event must match all of them. `--svm` matches the resolved SVM name or its ID, and `--volume` matches the resolved volume name or its MSID. Use `--json` for resolved JSON-line events instead of tables. Add `--since RFC3339` to replay changes from a particular timestamp. The default control socket is `/tmp/pathdiff.sock`; set `--control` on both daemon and client to use another socket. The daemon commits both time and path indexes atomically to Pebble. Configure the FPolicy receiver or a protocol adapter to emit the line-delimited JSON above.
 
 `events --start` and `--end` accept RFC3339 timestamps, dates such as `2026-08-28`, or relative expressions: `10d`, `1m`, `5h10m`, and `1M4d` mean ten days, one minute, five hours ten minutes, and one month four days ago. Use uppercase `M` for calendar months; lowercase `m` always means minutes. Omit `--start` for the last 24 hours or `--end` for now.
 

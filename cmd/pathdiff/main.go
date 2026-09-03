@@ -2602,7 +2602,6 @@ func newServiceStopCommand() *cobra.Command {
 
 func newServiceMonitorCommand() *cobra.Command {
 	command := newMonitorCommand()
-	command.Use = "monitor"
 	command.Short = "Monitor newly observed path changes"
 	return command
 }
@@ -3290,9 +3289,16 @@ func newMonitorCommand() *cobra.Command {
 	var interval time.Duration
 	var showNode, showLIF, showOperation, hideTimestamp, hideSVM, hideVolume, jsonOutput bool
 	var filters eventFilters
-	command := &cobra.Command{Use: "monitor", Short: "Print newly observed path changes", RunE: func(command *cobra.Command, _ []string) error {
+	command := &cobra.Command{Use: "monitor [path-search]", Args: cobra.MaximumNArgs(1), Short: "Print newly observed path changes", RunE: func(command *cobra.Command, arguments []string) error {
 		if interval <= 0 {
 			return errors.New("interval must be greater than zero")
+		}
+		search := "*"
+		if len(arguments) == 1 {
+			search = normalizePathSearch(arguments[0])
+		}
+		if _, err := wildcardMatch(search, ""); err != nil {
+			return fmt.Errorf("invalid path search %q: %w", search, err)
 		}
 		since := time.Now().UTC()
 		var err error
@@ -3336,6 +3342,9 @@ func newMonitorCommand() *cobra.Command {
 				seen[key] = struct{}{}
 				resolveMonitorEvent(&event, volumes)
 				if !filters.matches(event) {
+					continue
+				}
+				if matched, err := wildcardMatch(search, event.Path); err != nil || !matched {
 					continue
 				}
 				events = append(events, event)
