@@ -61,17 +61,17 @@ bin/pathdiff service refresh
 bin/pathdiff service list-ports
 bin/pathdiff service monitor --path /vol/finance/ --show-node --show-lif
 bin/pathdiff service monitor firefox
-bin/pathdiff service monitor '*.csv' --svm svm-50
-bin/pathdiff service monitor --svm svm-50 --svm svm-70 --volume finance
+bin/pathdiff service monitor '*.csv' --svm svm-finance
+bin/pathdiff service monitor --svm svm-finance --svm svm-research --volume finance
 bin/pathdiff service stop
 bin/pathdiff engine list
 bin/pathdiff cdot node list
 bin/pathdiff cdot lif list
 bin/pathdiff cdot fpolicy list
 bin/pathdiff cdot fpolicy scope list
-bin/pathdiff cdot fpolicy create svm-70
-bin/pathdiff cdot fpolicy start svm-50
-bin/pathdiff cdot fpolicy stop svm-50
+bin/pathdiff cdot fpolicy create svm-research
+bin/pathdiff cdot fpolicy start svm-finance
+bin/pathdiff cdot fpolicy stop svm-finance
 bin/pathdiff cdot pubkey generate
 bin/pathdiff cdot pubkey show
 bin/pathdiff cdot set-cluster cluster.example.test
@@ -84,7 +84,17 @@ On first start, `pathdiff` writes `~/.config/systemd/user/pathdiff.service`, rel
 
 `cdot node list` and `cdot lif list` render live ONTAP inventory over SSH. `engine list` uses that inventory to resolve each active sender's node and SVM names, hides raw LIF IPv4 by default, and renders connection time, human-readable time since the last accepted event, total events, average event rate, FPolicy connection status when ONTAP permits the status query, hostname, and local listener port. The daemon also stores each sender's last known identity and session counters in Pebble, so node and SVM names are available from cache even before the next cDOT verification pass.
 
-`cdot fpolicy list [<svmWildcardSearchTerm>]` lists the SVM, external engine, target addresses, port, SSL option, engine type and format, policy class, and event class for FPolicy external-engine configurations. It shows `pathdiff*` policy or engine names by default; use `--all` (or `-a`) for every configured policy. `cdot fpolicy scope list` applies the same filter and lists policy scopes. `cdot fpolicy create [<svmWildcardSearch>]` prints paste-ready setup commands for matching data SVMs that do not yet have a `pathdiff*` policy or engine. It resolves the receiver IPv4 and port from the managed pathdiff service, reads configured policies to choose the next sequence number, and does not change cDOT. `cdot fpolicy start [<svmWildcardSearchTerm> [<policyClass>]]` refreshes receiver listeners, verifies every operational `data-fpolicy-client` LIF can reach each receiver target with `network ping`, then disables and enables matching policy classes, connects their engines, and waits up to 30 seconds for ONTAP to confirm all engine connections before reporting success. Automatic activation retries each ping up to five times with exponential backoff; an unreachable LIF address is persisted and skipped across service restarts until cDOT reports that LIF at a new address. When automatic activation itself keeps failing, for example because a receiver handshake never completes, the daemon backs off exponentially per SVM policy from one minute up to one hour and persists that schedule in Pebble, so a service restart does not reset it into a per-minute retry loop. Each failure logs the attempt number and the next retry delay; a successful activation clears the persisted backoff, and `cdot fpolicy start` activates immediately regardless of it. `cdot fpolicy stop` disables policies using the same arguments and filtering. Both select the `pathdiff*` policy or engine by default, accept an explicit policy-class filter as their second argument, and use `--all` to operate on every matching policy.
+### FPolicy subcommands
+
+`cdot fpolicy list [<svmWildcardSearchTerm>]` lists each FPolicy external-engine configuration, including its SVM, engine, target addresses, port, SSL option, engine type and format, policy class, and event class. It shows `pathdiff*` policy or engine names by default; use `--all` (or `-a`) to show every configured policy. `cdot fpolicy scope list` applies the same filter and lists policy scopes.
+
+`cdot fpolicy create [<svmWildcardSearch>]` prints paste-ready setup commands for matching data SVMs that do not yet have a `pathdiff*` policy or engine. It resolves the receiver IPv4 and port from the managed pathdiff service and reads configured policies to choose the next sequence number. It does not change cDOT.
+
+`cdot fpolicy start [<svmWildcardSearchTerm> [<policyClass>]]` refreshes receiver listeners and verifies that every operational `data-fpolicy-client` LIF can reach each receiver target with `network ping`. It then disables and enables matching policy classes, connects their engines, and waits up to 30 seconds for ONTAP to confirm all engine connections.
+
+Automatic activation retries each ping up to five times with exponential backoff. An unreachable LIF address is persisted and skipped across service restarts until cDOT reports that LIF at a new address. If activation continues to fail, such as when a receiver handshake never completes, the daemon backs off per SVM policy from one minute up to one hour and persists the schedule in Pebble. Each failure logs the attempt number and next retry delay. A successful activation clears the backoff, while an explicit `cdot fpolicy start` always activates immediately.
+
+`cdot fpolicy stop [<svmWildcardSearchTerm> [<policyClass>]]` disables policies using the same arguments and filtering as `start`. Both commands select the `pathdiff*` policy or engine by default, accept a policy-class filter as their second argument, and use `--all` to operate on every matching policy.
 
 `cdot pubkey generate` creates a non-interactive Ed25519 keypair at `$XDG_DATA_HOME/pathdiff/cdot_ed25519`, or `~/.local/share/pathdiff/cdot_ed25519` when `XDG_DATA_HOME` is unset. It uses Go cryptography and SSH libraries rather than external SSH commands, prints the public-key path, and will not overwrite an existing key. Use `cdot pubkey show` to print the public key for adding to ONTAP. Future cDOT SSH operations default to user `pathdiff`; pass `cdot --user <user>` to override it.
 
@@ -107,9 +117,9 @@ bin/pathdiff events --path /vol/finance/ --start 10d
 bin/pathdiff events --path /vol/finance/ --start 1M4d --end 2026-08-28
 bin/pathdiff path list firefox --start 10d
 bin/pathdiff path parent --path /vol/finance/ --sort timestamp --max 250
-bin/pathdiff events --svm svm-50 --node node-07 --start 10d
+bin/pathdiff events --svm svm-finance --node node-07 --start 10d
 bin/pathdiff volume
-bin/pathdiff volume 'fin*' --start 10d --svm svm-50
+bin/pathdiff volume 'fin*' --start 10d --svm svm-finance
 bin/pathdiff path list firefox --json
 bin/pathdiff path list firefox --json=changed-paths.json
 bin/pathdiff path parent --path /vol/finance/ --jsonl=changed-parents.jsonl

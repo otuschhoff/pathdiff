@@ -375,8 +375,8 @@ func TestResolveParentSummaries(t *testing.T) {
 	if !parentSummariesNeedResolution(summaries) {
 		t.Fatal("unresolved parent summary was not detected")
 	}
-	resolveParentSummaries(summaries, map[string]monitorVolume{"2163258291": {Name: "asic_user", SVM: "svm-50"}})
-	if summaries[0].VolumeName != "asic_user" || summaries[0].SVMName != "svm-50" || parentSummariesNeedResolution(summaries) {
+	resolveParentSummaries(summaries, map[string]monitorVolume{"2163258291": {Name: "asic_user", SVM: "svm-finance"}})
+	if summaries[0].VolumeName != "asic_user" || summaries[0].SVMName != "svm-finance" || parentSummariesNeedResolution(summaries) {
 		t.Fatalf("parent summary was not resolved: %#v", summaries[0])
 	}
 }
@@ -398,7 +398,7 @@ func TestServiceFormatting(t *testing.T) {
 }
 
 func TestPrintMonitorEvents(t *testing.T) {
-	events := []store.Event{{Path: "/vol/finance/report.csv", Operation: "write", Timestamp: time.Date(2026, 8, 30, 12, 0, 0, 0, time.UTC), VolumeName: "finance", SVMName: "svm-50", NodeID: "node-1", LIFIPv4: "192.0.2.10"}}
+	events := []store.Event{{Path: "/vol/finance/report.csv", Operation: "write", Timestamp: time.Date(2026, 8, 30, 12, 0, 0, 0, time.UTC), VolumeName: "finance", SVMName: "svm-finance", NodeID: "node-1", LIFIPv4: "192.0.2.10"}}
 	var output bytes.Buffer
 	if err := printMonitorEvents(&output, events, monitorOptions{ShowNode: true, ShowLIF: true, ShowOperation: true}); err != nil {
 		t.Fatal(err)
@@ -425,30 +425,30 @@ func TestNewestMonitorEventsByPath(t *testing.T) {
 
 func TestResolveMonitorEvent(t *testing.T) {
 	event := store.Event{VolumeMSID: "2163258291"}
-	resolveMonitorEvent(&event, map[string]monitorVolume{"2163258291": {Name: "home", SVM: "svm-50"}})
-	if event.VolumeName != "home" || event.SVMName != "svm-50" {
+	resolveMonitorEvent(&event, map[string]monitorVolume{"2163258291": {Name: "home", SVM: "svm-finance"}})
+	if event.VolumeName != "home" || event.SVMName != "svm-finance" {
 		t.Fatalf("resolved event = %#v", event)
 	}
 }
 
 func TestEventFilters(t *testing.T) {
-	event := store.Event{Path: "/vol/finance/report.csv", SVMName: "svm-50", SVMID: "svm-1", VolumeName: "finance", VolumeMSID: "2163258291", NodeID: "node-07", LIFIPv4: "192.0.2.10"}
+	event := store.Event{Path: "/vol/finance/report.csv", SVMName: "svm-finance", SVMID: "svm-1", VolumeName: "finance", VolumeMSID: "2163258291", NodeID: "node-07", LIFIPv4: "192.0.2.10"}
 	for _, test := range []struct {
 		name    string
 		filters eventFilters
 		want    bool
 	}{
 		{name: "no filters", want: true},
-		{name: "svm name", filters: eventFilters{SVMs: []string{"vs-50"}}, want: true},
+		{name: "svm name", filters: eventFilters{SVMs: []string{"finance"}}, want: true},
 		{name: "svm id", filters: eventFilters{SVMs: []string{"svm-1"}}, want: true},
-		{name: "svm alternatives", filters: eventFilters{SVMs: []string{"vs-60", "vs-50"}}, want: true},
-		{name: "svm mismatch", filters: eventFilters{SVMs: []string{"vs-60"}}, want: false},
+		{name: "svm alternatives", filters: eventFilters{SVMs: []string{"other", "finance"}}, want: true},
+		{name: "svm mismatch", filters: eventFilters{SVMs: []string{"other"}}, want: false},
 		{name: "volume msid", filters: eventFilters{Volumes: []string{"2163258291"}}, want: true},
 		{name: "volume wildcard", filters: eventFilters{Volumes: []string{"fin*"}}, want: true},
-		{name: "node", filters: eventFilters{Nodes: []string{"ps-07"}}, want: true},
+		{name: "node", filters: eventFilters{Nodes: []string{"node-07"}}, want: true},
 		{name: "lif", filters: eventFilters{LIFs: []string{"192.0.2.10"}}, want: true},
-		{name: "combined match", filters: eventFilters{SVMs: []string{"vs-50"}, Volumes: []string{"finance"}, Nodes: []string{"ps-07"}, LIFs: []string{"192.0.2.10"}}, want: true},
-		{name: "combined mismatch", filters: eventFilters{SVMs: []string{"vs-50"}, Volumes: []string{"home"}}, want: false},
+		{name: "combined match", filters: eventFilters{SVMs: []string{"finance"}, Volumes: []string{"finance"}, Nodes: []string{"node-07"}, LIFs: []string{"192.0.2.10"}}, want: true},
+		{name: "combined mismatch", filters: eventFilters{SVMs: []string{"finance"}, Volumes: []string{"home"}}, want: false},
 	} {
 		if got := test.filters.matches(event); got != test.want {
 			t.Fatalf("%s: matches() = %t, want %t", test.name, got, test.want)
@@ -457,12 +457,12 @@ func TestEventFilters(t *testing.T) {
 	if matchesFilter([]string{"node-1"}, "") {
 		t.Fatal("empty event metadata matched a filter")
 	}
-	filters := eventFilters{SVMs: []string{"vs-50"}}
-	events := filters.filterEvents([]store.Event{event, {Path: "/other", SVMName: "svm-60"}})
+	filters := eventFilters{SVMs: []string{"finance"}}
+	events := filters.filterEvents([]store.Event{event, {Path: "/other", SVMName: "svm-other"}})
 	if len(events) != 1 || events[0].Path != event.Path {
 		t.Fatalf("filterEvents() = %#v", events)
 	}
-	summaries := filters.filterSummaries([]store.ParentSummary{{Path: "/vol/finance", SVMName: "svm-50"}, {Path: "/vol/other", SVMID: "svm-9"}})
+	summaries := filters.filterSummaries([]store.ParentSummary{{Path: "/vol/finance", SVMName: "svm-finance"}, {Path: "/vol/other", SVMID: "svm-9"}})
 	if len(summaries) != 1 || summaries[0].Path != "/vol/finance" {
 		t.Fatalf("filterSummaries() = %#v", summaries)
 	}
@@ -493,9 +493,9 @@ func TestFilterFlagsAreRepeatable(t *testing.T) {
 
 func TestAggregateVolumeSummaries(t *testing.T) {
 	summaries := []store.ParentSummary{
-		{Path: "/vol/finance/reports", SVMName: "svm-50", VolumeName: "finance", ChildCount: 3},
-		{Path: "/vol/finance/archive", SVMName: "svm-50", VolumeName: "finance", ChildCount: 4},
-		{Path: "/vol/home/users", SVMName: "svm-50", VolumeMSID: "2163258291", ChildCount: 2},
+		{Path: "/vol/finance/reports", SVMName: "svm-finance", VolumeName: "finance", ChildCount: 3},
+		{Path: "/vol/finance/archive", SVMName: "svm-finance", VolumeName: "finance", ChildCount: 4},
+		{Path: "/vol/home/users", SVMName: "svm-finance", VolumeMSID: "2163258291", ChildCount: 2},
 		{Path: "/vol/finance/shared", SVMID: "svm-9", VolumeName: "finance", ChildCount: 1},
 	}
 	volumes, err := aggregateVolumeSummaries(summaries, "*")
@@ -505,14 +505,14 @@ func TestAggregateVolumeSummaries(t *testing.T) {
 	if len(volumes) != 3 {
 		t.Fatalf("volumes = %#v", volumes)
 	}
-	if volumes[0].SVM != "svm-50" || volumes[0].Volume != "2163258291" || volumes[0].Changes != 2 {
+	if volumes[0].SVM != "svm-9" || volumes[0].Changes != 1 {
 		t.Fatalf("first volume = %#v", volumes[0])
 	}
-	if volumes[1].Volume != "finance" || volumes[1].Changes != 7 {
-		t.Fatalf("aggregated volume = %#v", volumes[1])
+	if volumes[1].SVM != "svm-finance" || volumes[1].Volume != "2163258291" || volumes[1].Changes != 2 {
+		t.Fatalf("MSID volume = %#v", volumes[1])
 	}
-	if volumes[2].SVM != "svm-9" || volumes[2].Changes != 1 {
-		t.Fatalf("unresolved SVM volume = %#v", volumes[2])
+	if volumes[2].Volume != "finance" || volumes[2].Changes != 7 {
+		t.Fatalf("aggregated volume = %#v", volumes[2])
 	}
 	filtered, err := aggregateVolumeSummaries(summaries, normalizePathSearch("fin"))
 	if err != nil {
@@ -525,7 +525,7 @@ func TestAggregateVolumeSummaries(t *testing.T) {
 
 func TestPrintVolumeSummaries(t *testing.T) {
 	var output bytes.Buffer
-	if err := printVolumeSummaries(&output, []volumeSummary{{SVM: "svm-50", Volume: "finance", Changes: 7}}, 100); err != nil {
+	if err := printVolumeSummaries(&output, []volumeSummary{{SVM: "svm-finance", Volume: "finance", Changes: 7}}, 100); err != nil {
 		t.Fatal(err)
 	}
 	if got := output.String(); !strings.Contains(got, "SVM") || !strings.Contains(got, "CNT") || !strings.Contains(got, "finance") || !strings.Contains(got, "7") || strings.Contains(got, "Parent") {
@@ -564,12 +564,12 @@ func TestCacheInventoryPersistsVerifiedConfiguration(t *testing.T) {
 	discovery := newFPolicyReceiverDiscovery(nil, nil, db, false)
 
 	discovery.cacheInventory(fpolicyDiscovery{
-		LIFs:    []fpolicyLIF{{Name: "finance_fpolicy", SVM: "svm-50", Node: "node-07", Address: "192.0.2.10"}},
-		Volumes: []cdotMapping{{ID: "2163258291", Name: "finance", Vserver: "svm-50"}, {ID: "", Name: "skipped"}},
+		LIFs:    []fpolicyLIF{{Name: "finance_fpolicy", SVM: "svm-finance", Node: "node-07", Address: "192.0.2.10"}},
+		Volumes: []cdotMapping{{ID: "2163258291", Name: "finance", Vserver: "svm-finance"}, {ID: "", Name: "skipped"}},
 	})
 
 	sender := db.senders["192.0.2.10"]
-	if sender.LIFName != "finance_fpolicy" || sender.SVMName != "svm-50" || sender.NodeName != "node-07" {
+	if sender.LIFName != "finance_fpolicy" || sender.SVMName != "svm-finance" || sender.NodeName != "node-07" {
 		t.Fatalf("cached sender = %#v", sender)
 	}
 	if sender.TotalEvents != 42 || sender.LocalPort != "9911" {
@@ -578,7 +578,7 @@ func TestCacheInventoryPersistsVerifiedConfiguration(t *testing.T) {
 	if sender.UpdatedAt.IsZero() {
 		t.Fatal("cached sender has no verification timestamp")
 	}
-	if db.volumes["2163258291"] != "finance" || db.volumeSVMs["2163258291"] != "svm-50" {
+	if db.volumes["2163258291"] != "finance" || db.volumeSVMs["2163258291"] != "svm-finance" {
 		t.Fatalf("cached volumes = %#v, svms = %#v", db.volumes, db.volumeSVMs)
 	}
 	if len(db.volumes) != 1 {
@@ -711,12 +711,12 @@ func TestMonitorAcceptsPathSearchArgument(t *testing.T) {
 }
 
 func TestMonitorJSONOutput(t *testing.T) {
-	event := store.Event{Path: "/vol/finance/report.csv", VolumeName: "finance", SVMName: "svm-50"}
+	event := store.Event{Path: "/vol/finance/report.csv", VolumeName: "finance", SVMName: "svm-finance"}
 	var output bytes.Buffer
 	if err := json.NewEncoder(&output).Encode(event); err != nil {
 		t.Fatal(err)
 	}
-	if got := output.String(); !strings.Contains(got, `"volume_name":"finance"`) || !strings.Contains(got, `"svm_name":"svm-50"`) {
+	if got := output.String(); !strings.Contains(got, `"volume_name":"finance"`) || !strings.Contains(got, `"svm_name":"svm-finance"`) {
 		t.Fatalf("unexpected monitor JSON: %s", got)
 	}
 }
@@ -787,7 +787,7 @@ func TestEngineSnapshotAndFormatting(t *testing.T) {
 		t.Fatalf("unexpected engine snapshot: %#v", engines)
 	}
 	engines[0].NodeName = "node-07"
-	engines[0].SVMName = "svm-50"
+	engines[0].SVMName = "svm-finance"
 	engines[0].FPolicy = "connected"
 	var output bytes.Buffer
 	if err := printEngines(&output, engines); err != nil {
@@ -947,20 +947,20 @@ func TestReachableLIFs(t *testing.T) {
 }
 
 func TestFilterLIFsBySVM(t *testing.T) {
-	records := []map[string]string{{"Vserver Name": "svm-80"}, {"Vserver Name": "svm-99"}}
-	filtered := filterLIFsBySVM(records, "80")
-	if len(filtered) != 1 || instanceField(filtered[0], "Vserver") != "svm-80" {
+	records := []map[string]string{{"Vserver Name": "svm-a"}, {"Vserver Name": "svm-b"}}
+	filtered := filterLIFsBySVM(records, "a")
+	if len(filtered) != 1 || instanceField(filtered[0], "Vserver") != "svm-a" {
 		t.Fatalf("filtered LIFs = %#v", filtered)
 	}
 }
 
 func TestFilterLIFs(t *testing.T) {
 	records := []map[string]string{
-		{"Vserver Name": "svm-80", "Current Node": "node-07", "Subnet Name": "data-80"},
-		{"Vserver Name": "svm-80", "Current Node": "node-08", "Subnet Name": "data-80"},
-		{"Vserver Name": "svm-99", "Current Node": "node-08", "Subnet Name": "data-99"},
+		{"Vserver Name": "svm-a", "Current Node": "node-07", "Subnet Name": "data-a"},
+		{"Vserver Name": "svm-a", "Current Node": "node-08", "Subnet Name": "data-a"},
+		{"Vserver Name": "svm-b", "Current Node": "node-08", "Subnet Name": "data-b"},
 	}
-	filtered := filterLIFs(records, "80", "07", "data-80")
+	filtered := filterLIFs(records, "a", "07", "data-a")
 	if len(filtered) != 1 || instanceField(filtered[0], "Current Node") != "node-07" {
 		t.Fatalf("filtered LIFs = %#v", filtered)
 	}
